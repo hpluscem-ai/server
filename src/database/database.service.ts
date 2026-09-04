@@ -1,4 +1,5 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,6 +9,7 @@ const CURRENT_SCHEMA_VERSION = 1;
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
   private readonly database: DatabaseSync;
+  readonly db: NodeSQLiteDatabase;
 
   constructor() {
     const configuredPath = process.env.DATABASE_PATH?.trim();
@@ -25,6 +27,7 @@ export class DatabaseService implements OnModuleDestroy {
     this.database = new DatabaseSync(databasePath, {
       enableForeignKeyConstraints: true,
     });
+    this.db = drizzle({ client: this.database });
 
     try {
       if (databasePath !== ':memory:') {
