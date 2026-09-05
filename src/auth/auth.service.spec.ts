@@ -4,6 +4,7 @@ import {
   LogisticsCompanyUnavailableError,
 } from './auth.repository';
 import { AuthService } from './auth.service';
+import { SolapiSmsService } from './solapi-sms.service';
 
 describe('AuthService', () => {
   it('rejects a simultaneous proof use and releases it after a correctable failure', async () => {
@@ -23,7 +24,10 @@ describe('AuthService', () => {
         return 'new-driver-id';
       },
     };
-    const service = new AuthService(repository as unknown as AuthRepository);
+    const service = new AuthService(
+      repository as unknown as AuthRepository,
+      new SolapiSmsService(),
+    );
     const input: SignUpRequestDto = {
       email: 'driver@example.com',
       logisticsCompanyId: '11111111-1111-4111-8111-111111111111',

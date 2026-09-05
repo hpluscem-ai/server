@@ -30,6 +30,77 @@ type CreateDriverInput = {
 export class AuthRepository {
   constructor(private readonly database: DatabaseService) {}
 
+  beginPhoneVerification(id: string, phone: string, codeHash: string): void {
+    this.database.db.transaction((transaction) => {
+      transaction
+        .update(phoneVerifications)
+        .set({ invalidatedAt: sql`CURRENT_TIMESTAMP` })
+        .where(
+          and(
+            eq(phoneVerifications.purpose, 'sign_up'),
+            eq(phoneVerifications.phone, phone),
+            isNull(phoneVerifications.consumedAt),
+            isNull(phoneVerifications.invalidatedAt),
+          ),
+        )
+        .run();
+
+      transaction
+        .insert(phoneVerifications)
+        .values({
+          id,
+          phone,
+          purpose: 'sign_up',
+          codeHash,
+          // Pending sends use the epoch so a small clock rollback cannot enable them.
+          expiresAt: '1970-01-01 00:00:00',
+        })
+        .run();
+    });
+  }
+
+  activatePhoneVerification(id: string): string | undefined {
+    const verification = this.database.db
+      .update(phoneVerifications)
+      .set({ expiresAt: sql`datetime('now', '+3 minutes')` })
+      .where(
+        and(
+          eq(phoneVerifications.id, id),
+          eq(phoneVerifications.purpose, 'sign_up'),
+          isNull(phoneVerifications.invalidatedAt),
+          isNull(phoneVerifications.verifiedAt),
+          isNull(phoneVerifications.consumedAt),
+        ),
+      )
+      .returning({ expiresAt: phoneVerifications.expiresAt })
+      .get();
+
+    return verification
+      ? `${verification.expiresAt.replace(' ', 'T')}Z`
+      : undefined;
+  }
+
+  findPendingPhoneVerification(id: string) {
+    return this.database.db
+      .select({ codeHash: phoneVerifications.codeHash })
+      .from(phoneVerifications)
+      .where(validPendingPhoneVerification(id))
+      .get();
+  }
+
+  confirmPhoneVerification(id: string, proofHash: string): string | undefined {
+    const verification = this.database.db
+      .update(phoneVerifications)
+      .set({ proofHash, verifiedAt: sql`CURRENT_TIMESTAMP` })
+      .where(validPendingPhoneVerification(id))
+      .returning({ expiresAt: phoneVerifications.expiresAt })
+      .get();
+
+    return verification
+      ? `${verification.expiresAt.replace(' ', 'T')}Z`
+      : undefined;
+  }
+
   async assertSignUpPrerequisites(
     email: string,
     logisticsCompanyId: string,
@@ -178,6 +249,17 @@ export class AuthRepository {
       throw new PhoneAlreadyExistsError();
     }
   }
+}
+
+function validPendingPhoneVerification(id: string) {
+  return and(
+    eq(phoneVerifications.id, id),
+    eq(phoneVerifications.purpose, 'sign_up'),
+    isNull(phoneVerifications.verifiedAt),
+    isNull(phoneVerifications.consumedAt),
+    isNull(phoneVerifications.invalidatedAt),
+    gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+  );
 }
 
 function validSignUpProof(phone: string, proofHash: string) {

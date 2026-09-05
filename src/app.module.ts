@@ -1,7 +1,12 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { AuthController, AuthRepository, AuthService } from './auth';
+import {
+  AuthController,
+  AuthRepository,
+  AuthService,
+  SolapiSmsService,
+} from './auth';
 import { DatabaseService } from './database/database.service';
 import {
   LogisticsCompaniesController,
@@ -25,6 +30,7 @@ import {
     LogisticsCompaniesService,
     AuthRepository,
     AuthService,
+    SolapiSmsService,
   ],
 })
 export class AppModule {}

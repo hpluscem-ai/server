@@ -2,3 +2,5 @@ node_modules/
 dist/
 coverage/
 data/*.sqlite*
+.env*
+!.env.example
