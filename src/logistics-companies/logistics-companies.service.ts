@@ -9,6 +9,7 @@ import {
 import {
   LogisticsCompanyInputDto,
   LogisticsCompanyResponseDto,
+  SignupLogisticsCompanyChoiceResponseDto,
 } from './logistics-company.dto';
 import {
   DuplicateLogisticsCompanyError,
@@ -23,6 +24,10 @@ export class LogisticsCompaniesService {
 
   findAll(): Promise<LogisticsCompanyResponseDto[]> {
     return this.logisticsCompanies.findAllActive();
+  }
+
+  findAllForSignup(): Promise<SignupLogisticsCompanyChoiceResponseDto[]> {
+    return this.logisticsCompanies.findAllActiveForSignup();
   }
 
   async findOne(id: string): Promise<LogisticsCompanyResponseDto> {

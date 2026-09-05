@@ -104,3 +104,11 @@ export class LogisticsCompanyResponseDto extends LogisticsCompanyInputDto {
   @ApiProperty({ description: '수정 일시', format: 'date-time' })
   updatedAt!: string;
 }
+
+export class SignupLogisticsCompanyChoiceResponseDto {
+  @ApiProperty({ description: '물류사 식별자', format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: '회원가입 시 선택할 물류사 사업자명' })
+  businessName!: string;
+}

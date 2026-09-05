@@ -29,6 +29,20 @@ export class LogisticsCompaniesRepository {
     return companies.map(normalizeTimestamps);
   }
 
+  async findAllActiveForSignup() {
+    return this.database.db
+      .select({
+        id: logisticsCompanies.id,
+        businessName: logisticsCompanies.businessName,
+      })
+      .from(logisticsCompanies)
+      .where(eq(logisticsCompanies.active, true))
+      .orderBy(
+        asc(logisticsCompanies.businessName),
+        asc(logisticsCompanies.id),
+      );
+  }
+
   async findActiveById(
     id: string,
   ): Promise<LogisticsCompanyRecord | undefined> {
