@@ -48,6 +48,59 @@ export class AuthRepository {
       .get();
   }
 
+  findDriverPassword(userId: string) {
+    return this.database.db
+      .select({ passwordHash: users.passwordHash })
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.role, 'driver')))
+      .get();
+  }
+
+  changeDriverPassword(input: {
+    userId: string;
+    tokenHash: string;
+    previousPasswordHash: string;
+    passwordHash: string;
+    now: Date;
+    idleCutoff: Date;
+  }): boolean {
+    return this.database.db.transaction((transaction) => {
+      // Argon2를 기다리는 동안 폐기·만료·소속·자격·비밀번호가 바뀌었는지 다시 확인한다.
+      const session = transaction
+        .select({ userId: users.id })
+        .from(authSessions)
+        .innerJoin(users, eq(authSessions.userId, users.id))
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            validDriverSession(input.tokenHash, input.now, input.idleCutoff),
+            eq(users.id, input.userId),
+            eq(users.passwordHash, input.previousPasswordHash),
+          ),
+        )
+        .get();
+      if (!session) return false;
+
+      transaction
+        .update(users)
+        .set({
+          passwordHash: input.passwordHash,
+          updatedAt: sql`CURRENT_TIMESTAMP`,
+        })
+        .where(eq(users.id, session.userId))
+        .run();
+      // 전체 기기의 세션 폐기가 실패하면 새 비밀번호 저장도 롤백한다.
+      transaction
+        .delete(authSessions)
+        .where(eq(authSessions.userId, session.userId))
+        .run();
+      return true;
+    });
+  }
+
   createLoginSession(input: CreateLoginSessionInput): void {
     this.database.db.transaction((transaction) => {
       // 비밀번호 검증을 기다리는 동안 계정·소속·비밀번호가 바뀔 수 있어 다시 확인한다.
@@ -103,16 +156,7 @@ export class AuthRepository {
           logisticsCompanies,
           eq(users.logisticsCompanyId, logisticsCompanies.id),
         )
-        .where(
-          and(
-            eq(authSessions.tokenHash, tokenHash),
-            gt(authSessions.expiresAt, now),
-            gt(authSessions.lastUsedAt, idleCutoff),
-            eq(users.role, 'driver'),
-            isNull(users.deactivatedAt),
-            eq(logisticsCompanies.active, true),
-          ),
-        )
+        .where(validDriverSession(tokenHash, now, idleCutoff))
         .get();
 
       if (!session) {
@@ -363,6 +407,17 @@ export class AuthRepository {
       throw new PhoneAlreadyExistsError();
     }
   }
+}
+
+function validDriverSession(tokenHash: string, now: Date, idleCutoff: Date) {
+  return and(
+    eq(authSessions.tokenHash, tokenHash),
+    gt(authSessions.expiresAt, now),
+    gt(authSessions.lastUsedAt, idleCutoff),
+    eq(users.role, 'driver'),
+    isNull(users.deactivatedAt),
+    eq(logisticsCompanies.active, true),
+  );
 }
 
 function validPendingPhoneVerification(id: string) {

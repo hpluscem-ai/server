@@ -33,6 +33,7 @@ import {
   SendPhoneVerificationResponseDto,
 } from './phone-verification.dto';
 import { SolapiSmsService } from './solapi-sms.service';
+import { ChangePasswordRequestDto } from './change-password.dto';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -113,6 +114,41 @@ export class AuthService {
 
   logout(tokenHash: string): void {
     this.authRepository.deleteSession(tokenHash);
+  }
+
+  async changePassword(
+    session: AuthenticatedSession,
+    input: ChangePasswordRequestDto,
+  ): Promise<void> {
+    const user = this.authRepository.findDriverPassword(session.user.id);
+    if (!user) this.throwSessionInvalid();
+    if (!(await argon2.verify(user.passwordHash, input.currentPassword))) {
+      throw new BadRequestException({
+        code: 'CURRENT_PASSWORD_MISMATCH',
+        message: '현재 비밀번호가 일치하지 않습니다.',
+      });
+    }
+
+    const passwordHash = await argon2.hash(input.newPassword, {
+      type: argon2.argon2id,
+    });
+    const now = new Date(Date.now());
+    const changed = this.authRepository.changeDriverPassword({
+      userId: session.user.id,
+      tokenHash: session.tokenHash,
+      previousPasswordHash: user.passwordHash,
+      passwordHash,
+      now,
+      idleCutoff: new Date(now.getTime() - SESSION_IDLE_TIMEOUT_MS),
+    });
+    if (!changed) this.throwSessionInvalid();
+  }
+
+  private throwSessionInvalid(): never {
+    throw new UnauthorizedException({
+      code: 'INVALID_SESSION',
+      message: '로그인이 만료되었거나 유효하지 않습니다. 다시 로그인해 주세요.',
+    });
   }
 
   async sendPhoneVerification(

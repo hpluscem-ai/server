@@ -34,6 +34,7 @@ import {
 } from './auth-session.guard';
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import { AuthService } from './auth.service';
+import { ChangePasswordRequestDto } from './change-password.dto';
 import {
   ConfirmPhoneVerificationRequestDto,
   ConfirmPhoneVerificationResponseDto,
@@ -117,6 +118,35 @@ export class AuthController {
   })
   logout(@Req() request: AuthenticatedRequest): void {
     this.authService.logout(request.authSession.tokenHash);
+  }
+
+  @Post('change-password')
+  @HttpCode(204)
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: '로그인한 기사의 비밀번호 변경',
+    description:
+      '현재 비밀번호를 확인하고 새 Argon2id 해시 저장과 모든 기기 세션 폐기를 함께 처리합니다. 성공하면 다시 로그인해야 합니다. 이메일 링크를 사용하는 비밀번호 찾기·재설정과 별개입니다.',
+  })
+  @ApiNoContentResponse({ description: '비밀번호 변경 및 전체 세션 폐기 완료' })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR | CURRENT_PASSWORD_MISMATCH',
+    type: ApiErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'INVALID_SESSION',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  changePassword(
+    @Req() request: AuthenticatedRequest,
+    @Body() input: ChangePasswordRequestDto,
+  ): Promise<void> {
+    return this.authService.changePassword(request.authSession, input);
   }
 
   @Post('phone-verifications')
