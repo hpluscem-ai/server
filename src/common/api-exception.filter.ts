@@ -66,10 +66,8 @@ export class ApiExceptionFilter implements ExceptionFilter {
         : HttpStatus.INTERNAL_SERVER_ERROR;
 
     if (!(exception instanceof HttpException)) {
-      this.logger.error(
-        'Unhandled exception',
-        exception instanceof Error ? exception.stack : undefined,
-      );
+      // DB 오류 원문에는 SQL 바인딩 값(개인정보·비밀번호 해시)이 포함될 수 있다.
+      this.logger.error('Unhandled exception');
     }
 
     const exceptionResponse =

@@ -8,6 +8,7 @@ import {
   SolapiSmsService,
 } from './auth';
 import { DatabaseService } from './database/database.service';
+import { UsersController, UsersRepository, UsersService } from './users';
 import {
   LogisticsCompaniesController,
   LogisticsCompaniesRepository,
@@ -22,6 +23,7 @@ import {
     LogisticsCompaniesController,
     SignupLogisticsCompaniesController,
     AuthController,
+    UsersController,
   ],
   providers: [
     AppService,
@@ -31,6 +33,8 @@ import {
     AuthRepository,
     AuthService,
     SolapiSmsService,
+    UsersRepository,
+    UsersService,
   ],
 })
 export class AppModule {}
