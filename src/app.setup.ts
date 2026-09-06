@@ -53,6 +53,12 @@ export function configureApp(app: INestApplication): void {
   const swaggerConfig = new DocumentBuilder()
     .setTitle('H Plus Eco API')
     .setVersion('1.0')
+    .addBearerAuth({
+      type: 'http',
+      scheme: 'bearer',
+      bearerFormat: 'opaque',
+      description: '기사 로그인 응답의 세션 토큰을 입력합니다.',
+    })
     .build();
 
   SwaggerModule.setup('docs', app, () =>

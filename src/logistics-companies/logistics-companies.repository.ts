@@ -1,8 +1,8 @@
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Injectable } from '@nestjs/common';
 
 import { DatabaseService } from '../database/database.service';
-import { logisticsCompanies } from '../database/schema';
+import { authSessions, logisticsCompanies, users } from '../database/schema';
 
 export class DuplicateLogisticsCompanyError extends Error {}
 
@@ -97,15 +97,38 @@ export class LogisticsCompaniesRepository {
     }
   }
 
-  async deactivateActive(id: string): Promise<boolean> {
-    const result = await this.database.db
-      .update(logisticsCompanies)
-      .set({ active: false, updatedAt: sql`CURRENT_TIMESTAMP` })
-      .where(
-        and(eq(logisticsCompanies.id, id), eq(logisticsCompanies.active, true)),
-      );
+  deactivateActive(id: string): boolean {
+    return this.database.db.transaction((transaction) => {
+      const result = transaction
+        .update(logisticsCompanies)
+        .set({ active: false, updatedAt: sql`CURRENT_TIMESTAMP` })
+        .where(
+          and(
+            eq(logisticsCompanies.id, id),
+            eq(logisticsCompanies.active, true),
+          ),
+        )
+        .run();
 
-    return result.changes > 0;
+      if (result.changes === 0) return false;
+
+      // 소속 비활성화와 해당 기사들의 세션 폐기를 함께 확정하거나 함께 롤백한다.
+      transaction
+        .delete(authSessions)
+        .where(
+          inArray(
+            authSessions.userId,
+            transaction
+              .select({ id: users.id })
+              .from(users)
+              .where(
+                and(eq(users.logisticsCompanyId, id), eq(users.role, 'driver')),
+              ),
+          ),
+        )
+        .run();
+      return true;
+    });
   }
 
   private throwIfDuplicate(error: unknown): void {

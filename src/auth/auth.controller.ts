@@ -1,18 +1,23 @@
 import {
   Body,
   Controller,
+  Get,
   Header,
   HttpCode,
   Param,
   Post,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import {
   ApiBadGatewayResponse,
   ApiBadRequestResponse,
+  ApiBearerAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
+  ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
   ApiServiceUnavailableResponse,
@@ -22,6 +27,11 @@ import {
 
 import { ApiErrorResponseDto } from '../common/api-error-response.dto';
 import { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
+import { CurrentUserResponseDto } from './auth-session.dto';
+import {
+  AuthSessionGuard,
+  type AuthenticatedRequest,
+} from './auth-session.guard';
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import { AuthService } from './auth.service';
 import {
@@ -43,7 +53,7 @@ export class AuthController {
   @ApiOperation({
     summary: '기사 로그인',
     description:
-      '이메일과 비밀번호를 확인하고 활성 기사·소속에만 세션을 발급합니다. 다중 기기 로그인을 허용하며 최대 만료 시각은 로그인 시점부터 30일입니다. 세션 검증·미사용 7일 만료·로그아웃은 다음 단계에서 구현합니다.',
+      '이메일과 비밀번호를 확인하고 활성 기사·소속에만 세션을 발급합니다. 다중 기기 로그인을 허용하며 로그인 시점부터 최대 30일 또는 미사용 7일 중 먼저 도달하는 시점에 만료됩니다. 보호된 기사 API는 Authorization: Bearer <token> 헤더를 사용합니다.',
   })
   @ApiOkResponse({ type: LoginResponseDto })
   @ApiBadRequestResponse({
@@ -64,6 +74,49 @@ export class AuthController {
   })
   login(@Body() input: LoginRequestDto): Promise<LoginResponseDto> {
     return this.authService.login(input);
+  }
+
+  @Get('me')
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: '현재 기사 세션 확인',
+    description:
+      '세션의 만료·기사·소속 상태를 확인하고 현재 기사 정보를 반환합니다. 정상 인증 시 마지막 사용 시각만 갱신하며 최대 만료 시각은 연장하지 않습니다.',
+  })
+  @ApiOkResponse({ type: CurrentUserResponseDto })
+  @ApiUnauthorizedResponse({
+    description: 'INVALID_SESSION',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  me(@Req() request: AuthenticatedRequest): CurrentUserResponseDto {
+    return request.authSession.user;
+  }
+
+  @Post('logout')
+  @HttpCode(204)
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: '현재 기사 세션 로그아웃',
+    description:
+      '헤더로 인증한 현재 세션만 폐기합니다. 다른 기기의 세션은 유지하며 이미 폐기되거나 만료된 세션으로 요청하면 401을 반환합니다.',
+  })
+  @ApiNoContentResponse({ description: '현재 세션 로그아웃 완료' })
+  @ApiUnauthorizedResponse({
+    description: 'INVALID_SESSION',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  logout(@Req() request: AuthenticatedRequest): void {
+    this.authService.logout(request.authSession.tokenHash);
   }
 
   @Post('phone-verifications')

@@ -18,6 +18,7 @@ import {
 } from '@nestjs/common';
 
 import { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
+import { CurrentUserResponseDto } from './auth-session.dto';
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import {
   AuthRepository,
@@ -34,10 +35,16 @@ import {
 import { SolapiSmsService } from './solapi-sms.service';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 // 계정이 없어도 Argon2 검증을 거쳐 빠른 실패로 존재 여부가 드러나는 것을 줄인다.
 // 무작위 값으로 만든 비교 전용 해시이며 실제 계정에는 저장하지 않는다.
 const MISSING_USER_PASSWORD_HASH =
   '$argon2id$v=19$m=65536,p=4,t=3$kTWM6+kUR5OE2n8VhX69EA$+GS0hW+JoVG8aFGxX+5n9BOXRYuA9JcJ01sFCOf45NA';
+
+export type AuthenticatedSession = {
+  tokenHash: string;
+  user: CurrentUserResponseDto;
+};
 
 @Injectable()
 export class AuthService {
@@ -86,6 +93,26 @@ export class AuthService {
     }
 
     return { token, expiresAt: expiresAt.toISOString() };
+  }
+
+  authenticateSession(
+    token: string | undefined,
+  ): AuthenticatedSession | undefined {
+    if (!token) return undefined;
+
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const now = new Date(Date.now());
+    const user = this.authRepository.useSession(
+      tokenHash,
+      now,
+      new Date(now.getTime() - SESSION_IDLE_TIMEOUT_MS),
+    );
+
+    return user ? { tokenHash, user } : undefined;
+  }
+
+  logout(tokenHash: string): void {
+    this.authRepository.deleteSession(tokenHash);
   }
 
   async sendPhoneVerification(

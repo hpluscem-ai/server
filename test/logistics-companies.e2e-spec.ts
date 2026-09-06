@@ -463,6 +463,7 @@ describe('Logistics companies (e2e)', () => {
       '204',
       '400',
       '404',
+      '500',
     ]);
     expect(item.delete.responses['204'].description).toContain('비활성화');
     expect(
@@ -489,7 +490,7 @@ describe('Logistics companies (e2e)', () => {
       [collection.post, ['400', '409']],
       [item.get, ['400', '404']],
       [item.put, ['400', '404', '409']],
-      [item.delete, ['400', '404']],
+      [item.delete, ['400', '404', '500']],
     ] as const) {
       for (const statusCode of statusCodes) {
         expect(

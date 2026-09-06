@@ -14,6 +14,7 @@ import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiInternalServerErrorResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -78,13 +79,17 @@ export class LogisticsCompaniesController {
   @ApiBadRequestResponse({ type: ApiErrorResponseDto })
   @ApiNoContentResponse({
     description:
-      '물류사를 비활성화합니다. 이후 상세 조회와 목록에서 반환되지 않습니다.',
+      '물류사를 비활성화하고 소속 기사의 모든 세션을 폐기합니다. 이후 상세 조회와 목록에서 반환되지 않습니다.',
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
   })
   @ApiNotFoundResponse({ type: ApiErrorResponseDto })
   @ApiParam({ description: '물류사 식별자', format: 'uuid', name: 'id' })
   deactivate(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): Promise<void> {
+  ): void {
     return this.logisticsCompanies.deactivate(id);
   }
 }

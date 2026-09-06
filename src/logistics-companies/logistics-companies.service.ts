@@ -69,8 +69,8 @@ export class LogisticsCompaniesService {
     }
   }
 
-  async deactivate(id: string): Promise<void> {
-    if (!(await this.logisticsCompanies.deactivateActive(id))) {
+  deactivate(id: string): void {
+    if (!this.logisticsCompanies.deactivateActive(id)) {
       this.throwNotFound();
     }
   }

@@ -85,6 +85,65 @@ export class AuthRepository {
     });
   }
 
+  useSession(tokenHash: string, now: Date, idleCutoff: Date) {
+    return this.database.db.transaction((transaction) => {
+      const session = transaction
+        .select({
+          user: {
+            id: users.id,
+            email: users.email,
+            name: users.name,
+            logisticsCompanyId: logisticsCompanies.id,
+          },
+          lastUsedAt: authSessions.lastUsedAt,
+        })
+        .from(authSessions)
+        .innerJoin(users, eq(authSessions.userId, users.id))
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            eq(authSessions.tokenHash, tokenHash),
+            gt(authSessions.expiresAt, now),
+            gt(authSessions.lastUsedAt, idleCutoff),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+            eq(logisticsCompanies.active, true),
+          ),
+        )
+        .get();
+
+      if (!session) {
+        transaction
+          .delete(authSessions)
+          .where(eq(authSessions.tokenHash, tokenHash))
+          .run();
+        return undefined;
+      }
+
+      transaction
+        .update(authSessions)
+        .set({
+          // 시계가 되돌아가도 마지막 사용 시각은 감소시키지 않는다.
+          lastUsedAt: new Date(
+            Math.max(now.getTime(), session.lastUsedAt.getTime()),
+          ),
+        })
+        .where(eq(authSessions.tokenHash, tokenHash))
+        .run();
+      return session.user;
+    });
+  }
+
+  deleteSession(tokenHash: string): void {
+    this.database.db
+      .delete(authSessions)
+      .where(eq(authSessions.tokenHash, tokenHash))
+      .run();
+  }
+
   beginPhoneVerification(id: string, phone: string, codeHash: string): void {
     this.database.db.transaction((transaction) => {
       transaction
