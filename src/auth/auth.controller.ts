@@ -11,13 +11,17 @@ import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
+  ApiInternalServerErrorResponse,
   ApiOkResponse,
   ApiOperation,
   ApiServiceUnavailableResponse,
   ApiTags,
+  ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 
 import { ApiErrorResponseDto } from '../common/api-error-response.dto';
+import { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import { AuthService } from './auth.service';
 import {
@@ -32,6 +36,35 @@ import {
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
+
+  @Post('login')
+  @HttpCode(200)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: '기사 로그인',
+    description:
+      '이메일과 비밀번호를 확인하고 활성 기사·소속에만 세션을 발급합니다. 다중 기기 로그인을 허용하며 최대 만료 시각은 로그인 시점부터 30일입니다. 세션 검증·미사용 7일 만료·로그아웃은 다음 단계에서 구현합니다.',
+  })
+  @ApiOkResponse({ type: LoginResponseDto })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'INVALID_CREDENTIALS',
+    type: ApiErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'ACCOUNT_UNAVAILABLE',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  login(@Body() input: LoginRequestDto): Promise<LoginResponseDto> {
+    return this.authService.login(input);
+  }
 
   @Post('phone-verifications')
   @Header('Cache-Control', 'no-store')

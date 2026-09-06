@@ -3,6 +3,7 @@ import { Injectable } from '@nestjs/common';
 
 import { DatabaseService } from '../database/database.service';
 import {
+  authSessions,
   logisticsCompanies,
   phoneVerifications,
   users,
@@ -10,6 +11,7 @@ import {
 
 export class EmailAlreadyExistsError extends Error {}
 export class LogisticsCompanyUnavailableError extends Error {}
+export class LoginUnavailableError extends Error {}
 export class PhoneAlreadyExistsError extends Error {}
 export class PhoneVerificationInvalidError extends Error {}
 
@@ -26,9 +28,62 @@ type CreateDriverInput = {
   serviceTerms: boolean;
 };
 
+type CreateLoginSessionInput = {
+  userId: string;
+  passwordHash: string;
+  tokenHash: string;
+  createdAt: Date;
+  expiresAt: Date;
+};
+
 @Injectable()
 export class AuthRepository {
   constructor(private readonly database: DatabaseService) {}
+
+  findDriverCredentials(email: string) {
+    return this.database.db
+      .select({ id: users.id, passwordHash: users.passwordHash })
+      .from(users)
+      .where(and(eq(users.email, email), eq(users.role, 'driver')))
+      .get();
+  }
+
+  createLoginSession(input: CreateLoginSessionInput): void {
+    this.database.db.transaction((transaction) => {
+      // 비밀번호 검증을 기다리는 동안 계정·소속·비밀번호가 바뀔 수 있어 다시 확인한다.
+      const user = transaction
+        .select({ passwordHash: users.passwordHash })
+        .from(users)
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            eq(users.id, input.userId),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+            eq(logisticsCompanies.active, true),
+          ),
+        )
+        .get();
+
+      if (!user || user.passwordHash !== input.passwordHash) {
+        throw new LoginUnavailableError();
+      }
+
+      transaction
+        .insert(authSessions)
+        .values({
+          tokenHash: input.tokenHash,
+          userId: input.userId,
+          createdAt: input.createdAt,
+          lastUsedAt: input.createdAt,
+          expiresAt: input.expiresAt,
+        })
+        .run();
+    });
+  }
 
   beginPhoneVerification(id: string, phone: string, codeHash: string): void {
     this.database.db.transaction((transaction) => {

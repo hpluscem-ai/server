@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
@@ -45,30 +45,38 @@ export class DatabaseService implements OnModuleDestroy {
       }
 
       if (schemaVersion < CURRENT_SCHEMA_VERSION) {
-        if (schemaVersion !== 0) {
+        if (schemaVersion !== 0 && schemaVersion !== 1) {
           throw new Error(
             `Database schema version ${schemaVersion} requires an explicit migration`,
           );
         }
 
-        const existingObject = this.database
-          .prepare(
-            `SELECT name
-            FROM sqlite_schema
-            WHERE name NOT LIKE 'sqlite_%'
-              AND type IN ('table', 'view', 'trigger')
-            LIMIT 1`,
-          )
-          .get();
+        if (schemaVersion === 0) {
+          const existingObject = this.database
+            .prepare(
+              `SELECT name
+              FROM sqlite_schema
+              WHERE name NOT LIKE 'sqlite_%'
+                AND type IN ('table', 'view', 'trigger')
+              LIMIT 1`,
+            )
+            .get();
 
-        if (existingObject) {
-          throw new Error(
-            'Unversioned database is not empty and requires an explicit migration',
-          );
+          if (existingObject) {
+            throw new Error(
+              'Unversioned database is not empty and requires an explicit migration',
+            );
+          }
+
+          const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
+          this.database.exec(schema);
         }
 
-        const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-        this.database.exec(schema);
+        const migration = readFileSync(
+          join(__dirname, '002-auth-sessions.sql'),
+          'utf8',
+        );
+        this.database.exec(migration);
       }
     } catch (error) {
       this.database.close();

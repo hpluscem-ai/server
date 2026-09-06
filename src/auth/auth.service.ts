@@ -11,15 +11,19 @@ import * as argon2 from 'argon2';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   ServiceUnavailableException,
+  UnauthorizedException,
 } from '@nestjs/common';
 
+import { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import {
   AuthRepository,
   EmailAlreadyExistsError,
   LogisticsCompanyUnavailableError,
+  LoginUnavailableError,
   PhoneAlreadyExistsError,
   PhoneVerificationInvalidError,
 } from './auth.repository';
@@ -28,6 +32,12 @@ import {
   SendPhoneVerificationResponseDto,
 } from './phone-verification.dto';
 import { SolapiSmsService } from './solapi-sms.service';
+
+const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+// 계정이 없어도 Argon2 검증을 거쳐 빠른 실패로 존재 여부가 드러나는 것을 줄인다.
+// 무작위 값으로 만든 비교 전용 해시이며 실제 계정에는 저장하지 않는다.
+const MISSING_USER_PASSWORD_HASH =
+  '$argon2id$v=19$m=65536,p=4,t=3$kTWM6+kUR5OE2n8VhX69EA$+GS0hW+JoVG8aFGxX+5n9BOXRYuA9JcJ01sFCOf45NA';
 
 @Injectable()
 export class AuthService {
@@ -38,6 +48,45 @@ export class AuthService {
     private readonly authRepository: AuthRepository,
     private readonly smsService: SolapiSmsService,
   ) {}
+
+  async login(input: LoginRequestDto): Promise<LoginResponseDto> {
+    const user = this.authRepository.findDriverCredentials(input.email);
+    const passwordMatches = await argon2.verify(
+      user?.passwordHash ?? MISSING_USER_PASSWORD_HASH,
+      input.password,
+    );
+
+    if (!user || !passwordMatches) {
+      throw new UnauthorizedException({
+        code: 'INVALID_CREDENTIALS',
+        message: '이메일 또는 비밀번호가 일치하지 않습니다.',
+      });
+    }
+
+    const token = randomBytes(32).toString('base64url');
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + SESSION_LIFETIME_MS);
+
+    try {
+      this.authRepository.createLoginSession({
+        userId: user.id,
+        passwordHash: user.passwordHash,
+        tokenHash: createHash('sha256').update(token).digest('hex'),
+        createdAt,
+        expiresAt,
+      });
+    } catch (error) {
+      if (error instanceof LoginUnavailableError) {
+        throw new ForbiddenException({
+          code: 'ACCOUNT_UNAVAILABLE',
+          message: '로그인할 수 없는 계정입니다. 관리자에게 문의해 주세요.',
+        });
+      }
+      throw error;
+    }
+
+    return { token, expiresAt: expiresAt.toISOString() };
+  }
 
   async sendPhoneVerification(
     phone: string,

@@ -1,7 +1,7 @@
 import { sql } from 'drizzle-orm';
 import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
-// Runtime query mappings only. schema.sql remains the versioned SQLite DDL source.
+// Runtime query mappings only. schema.sql and numbered migrations own SQLite DDL.
 export const logisticsCompanies = sqliteTable('logistics_companies', {
   id: text('id').primaryKey(),
   businessName: text('business_name').notNull(),
@@ -51,6 +51,21 @@ export const users = sqliteTable('users', {
   updatedAt: text('updated_at')
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const authSessions = sqliteTable('auth_sessions', {
+  // 인증 토큰 원문이 아닌 SHA-256 해시이자 세션 식별자
+  tokenHash: text('token_hash').primaryKey(),
+  // 로그인한 사용자
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  // 로그인한 시각: 최대 유지기간의 시작점
+  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+  // 마지막 정상 인증 요청 시각: 미사용 기간의 시작점
+  lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }).notNull(),
+  // 활동 여부와 관계없이 만료되는 시각
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 });
 
 export const phoneVerifications = sqliteTable('phone_verifications', {
