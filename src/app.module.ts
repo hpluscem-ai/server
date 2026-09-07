@@ -1,4 +1,10 @@
 import { Module } from '@nestjs/common';
+import {
+  AdminStationsController,
+  StationsController,
+  StationsRepository,
+  StationsService,
+} from './stations';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import {
@@ -29,6 +35,8 @@ import {
 @Module({
   imports: [],
   controllers: [
+    AdminStationsController,
+    StationsController,
     AppController,
     LogisticsCompaniesController,
     SignupLogisticsCompaniesController,
@@ -38,6 +46,8 @@ import {
     AdminAuthController,
   ],
   providers: [
+    StationsRepository,
+    StationsService,
     AppService,
     DatabaseService,
     LogisticsCompaniesRepository,

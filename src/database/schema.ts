@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
 // Runtime query mappings only. schema.sql and numbered migrations own SQLite DDL.
 export const logisticsCompanies = sqliteTable('logistics_companies', {
@@ -108,3 +108,43 @@ export const passwordResetTokens = sqliteTable('password_reset_tokens', {
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const installationSites = sqliteTable('installation_sites', {
+  id: text('id').primaryKey(),
+  pole: text('pole').notNull(),
+  businessName: text('business_name').notNull(),
+  area: text('area').notNull(),
+  roadAddress: text('road_address').notNull(),
+  siteType: text('site_type', { enum: ['station', 'direct_sales'] }).notNull(),
+  note: text('note'),
+  latitude: real('latitude'),
+  longitude: real('longitude'),
+  coordinateSource: text('coordinate_source'),
+  coordinateVerifiedAt: text('coordinate_verified_at'),
+  active: integer('active', { mode: 'boolean' }).notNull().default(true),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text('updated_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const installationSiteDevices = sqliteTable(
+  'installation_site_devices',
+  {
+    id: text('id').primaryKey(),
+    installationSiteId: text('installation_site_id')
+      .notNull()
+      .references(() => installationSites.id, { onDelete: 'cascade' }),
+    model: text('model').notNull(),
+    capacityLiters: integer('capacity_liters').notNull(),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    createdAt: text('created_at')
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text('updated_at')
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+  },
+);
