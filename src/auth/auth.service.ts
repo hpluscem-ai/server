@@ -37,13 +37,10 @@ import {
 import { SolapiSmsService } from './solapi-sms.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
 import { ResetPasswordRequestDto } from './reset-password.dto';
+import { MISSING_USER_PASSWORD_HASH } from './password.constants';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
-// 계정이 없어도 Argon2 검증을 거쳐 빠른 실패로 존재 여부가 드러나는 것을 줄인다.
-// 무작위 값으로 만든 비교 전용 해시이며 실제 계정에는 저장하지 않는다.
-const MISSING_USER_PASSWORD_HASH =
-  '$argon2id$v=19$m=65536,p=4,t=3$kTWM6+kUR5OE2n8VhX69EA$+GS0hW+JoVG8aFGxX+5n9BOXRYuA9JcJ01sFCOf45NA';
 
 export type AuthenticatedSession = {
   tokenHash: string;

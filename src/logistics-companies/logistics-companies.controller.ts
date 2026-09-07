@@ -9,6 +9,7 @@ import {
   ParseUUIDPipe,
   Post,
   Put,
+  UseGuards,
 } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
@@ -20,9 +21,12 @@ import {
   ApiOkResponse,
   ApiParam,
   ApiTags,
+  ApiBearerAuth,
+  ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 
 import { ApiErrorResponseDto } from '../common/api-error-response.dto';
+import { AdminSessionGuard } from '../admin-auth';
 import {
   LogisticsCompanyInputDto,
   LogisticsCompanyResponseDto,
@@ -30,6 +34,16 @@ import {
 import { LogisticsCompaniesService } from './logistics-companies.service';
 
 @ApiTags('Admin logistics companies')
+@UseGuards(AdminSessionGuard)
+@ApiBearerAuth('admin')
+@ApiUnauthorizedResponse({
+  type: ApiErrorResponseDto,
+  description: 'INVALID_ADMIN_SESSION',
+})
+@ApiInternalServerErrorResponse({
+  type: ApiErrorResponseDto,
+  description: 'INTERNAL_SERVER_ERROR',
+})
 @Controller('admin/logistics-companies')
 export class LogisticsCompaniesController {
   constructor(private readonly logisticsCompanies: LogisticsCompaniesService) {}

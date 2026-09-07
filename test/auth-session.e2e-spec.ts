@@ -14,6 +14,7 @@ import {
   users,
 } from '../src/database/schema';
 import { createTestApp } from './helpers/create-test-app';
+import { seedAdminSession } from './helpers/seed-admin-session';
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = Date.parse('2026-09-06T00:00:00.000Z');
@@ -320,11 +321,14 @@ describe('Auth sessions (e2e)', () => {
 
     await request(app.getHttpServer())
       .delete(`/api/v1/admin/logistics-companies/${companyId}`)
+      .set('Authorization', seedAdminSession(database))
       .expect(204);
     expect(database.db.select().from(authSessions).all()).toEqual([
       unrelated.row,
     ]);
-    expect(database.db.select().from(users).all()).toHaveLength(3);
+    expect(
+      database.db.select().from(users).where(eq(users.role, 'driver')).all(),
+    ).toHaveLength(3);
     const login = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
       .send({ email: `${userId}@example.com`, password: 'Password!1' })
@@ -358,6 +362,7 @@ describe('Auth sessions (e2e)', () => {
     try {
       const response = await request(app.getHttpServer())
         .delete(`/api/v1/admin/logistics-companies/${companyId}`)
+        .set('Authorization', seedAdminSession(database))
         .expect(500);
       expect(response.body).toMatchObject({ code: 'INTERNAL_SERVER_ERROR' });
       expect(

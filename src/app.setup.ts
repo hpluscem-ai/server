@@ -59,6 +59,16 @@ export function configureApp(app: INestApplication): void {
       bearerFormat: 'opaque',
       description: '기사 로그인 응답의 세션 토큰을 입력합니다.',
     })
+    .addBearerAuth(
+      {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'opaque',
+        description:
+          '관리자 로그인 응답의 별도 세션 토큰을 입력합니다. 기사 토큰은 허용하지 않습니다.',
+      },
+      'admin',
+    )
     .build();
 
   SwaggerModule.setup('docs', app, () =>

@@ -6,6 +6,7 @@ import { App } from 'supertest/types';
 
 import { DatabaseService } from '../src/database/database.service';
 import { createTestApp } from './helpers/create-test-app';
+import { seedAdminSession } from './helpers/seed-admin-session';
 
 const companyInput = {
   accountHolder: '김민수',
@@ -65,6 +66,7 @@ function expectCompanyResponse(
 describe('Logistics companies (e2e)', () => {
   let app: INestApplication<App>;
   let database: DatabaseService;
+  let adminAuthorization: string;
 
   beforeAll(async () => {
     app = await createTestApp();
@@ -72,7 +74,9 @@ describe('Logistics companies (e2e)', () => {
   });
 
   beforeEach(() => {
+    database.connection.exec('DELETE FROM users');
     database.connection.exec('DELETE FROM logistics_companies');
+    adminAuthorization = seedAdminSession(database);
   });
 
   function seedCompany(
@@ -124,6 +128,7 @@ describe('Logistics companies (e2e)', () => {
   it('creates, reads, replaces, and soft-deletes a logistics company', async () => {
     const createResponse = await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         businessName: `  ${companyInput.businessName}  `,
@@ -137,6 +142,7 @@ describe('Logistics companies (e2e)', () => {
 
     await request(app.getHttpServer())
       .get(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .expect(200)
       .expect(createdCompany);
 
@@ -152,6 +158,7 @@ describe('Logistics companies (e2e)', () => {
       .run(id);
     const updateResponse = await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .send(updatedInput)
       .expect(200);
     const updatedCompany = updateResponse.body as CompanyResponse;
@@ -162,6 +169,7 @@ describe('Logistics companies (e2e)', () => {
 
     await request(app.getHttpServer())
       .delete(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .expect(204)
       .expect('');
 
@@ -172,6 +180,7 @@ describe('Logistics companies (e2e)', () => {
     expect(storedCompany.active).toBe(0);
     await request(app.getHttpServer())
       .get(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .expect(404)
       .expect({
         code: 'LOGISTICS_COMPANY_NOT_FOUND',
@@ -180,14 +189,17 @@ describe('Logistics companies (e2e)', () => {
       });
     await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .send(updatedInput)
       .expect(404);
     await request(app.getHttpServer())
       .get('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .expect(200)
       .expect([]);
     await request(app.getHttpServer())
       .delete(`/api/v1/admin/logistics-companies/${id}`)
+      .set('Authorization', adminAuthorization)
       .expect(404);
     expect(
       database.connection
@@ -216,6 +228,7 @@ describe('Logistics companies (e2e)', () => {
 
     const response = await request(app.getHttpServer())
       .get('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .expect(200);
     const companies = response.body as CompanyResponse[];
 
@@ -230,6 +243,7 @@ describe('Logistics companies (e2e)', () => {
   it('rejects invalid and unknown fields', async () => {
     const response = await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         accountNumber: '계좌번호',
@@ -267,6 +281,7 @@ describe('Logistics companies (e2e)', () => {
 
     const tooLongResponse = await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         accountHolder: '가'.repeat(101),
@@ -294,6 +309,7 @@ describe('Logistics companies (e2e)', () => {
 
     const duplicateBusinessNumber = await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         corporateRegistrationNumber: '110111-0099999',
@@ -309,6 +325,7 @@ describe('Logistics companies (e2e)', () => {
 
     await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         businessNumber: '999-99-99999',
@@ -327,11 +344,13 @@ describe('Logistics companies (e2e)', () => {
 
     await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${first.id}`)
+      .set('Authorization', adminAuthorization)
       .send({ ...companyInput, businessNumber: second.businessNumber })
       .expect(409);
 
     await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${first.id}`)
+      .set('Authorization', adminAuthorization)
       .send({
         ...companyInput,
         corporateRegistrationNumber: second.corporateRegistrationNumber,
@@ -340,6 +359,7 @@ describe('Logistics companies (e2e)', () => {
 
     const response = await request(app.getHttpServer())
       .get(`/api/v1/admin/logistics-companies/${first.id}`)
+      .set('Authorization', adminAuthorization)
       .expect(200);
 
     expect(response.body as CompanyResponse).toMatchObject(companyInput);
@@ -349,6 +369,7 @@ describe('Logistics companies (e2e)', () => {
     const missingId = '00000000-0000-4000-8000-000000000000';
     const notFoundResponse = await request(app.getHttpServer())
       .get(`/api/v1/admin/logistics-companies/${missingId}`)
+      .set('Authorization', adminAuthorization)
       .expect(404)
       .expect({
         code: 'LOGISTICS_COMPANY_NOT_FOUND',
@@ -359,23 +380,28 @@ describe('Logistics companies (e2e)', () => {
 
     await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${missingId}`)
+      .set('Authorization', adminAuthorization)
       .send(companyInput)
       .expect(404)
       .expect(notFoundError);
     await request(app.getHttpServer())
       .delete(`/api/v1/admin/logistics-companies/${missingId}`)
+      .set('Authorization', adminAuthorization)
       .expect(404)
       .expect(notFoundError);
 
     await request(app.getHttpServer())
       .get('/api/v1/admin/logistics-companies/not-a-uuid')
+      .set('Authorization', adminAuthorization)
       .expect(400);
     await request(app.getHttpServer())
       .put('/api/v1/admin/logistics-companies/not-a-uuid')
+      .set('Authorization', adminAuthorization)
       .send(companyInput)
       .expect(400);
     await request(app.getHttpServer())
       .delete('/api/v1/admin/logistics-companies/not-a-uuid')
+      .set('Authorization', adminAuthorization)
       .expect(400);
   });
 
@@ -442,26 +468,37 @@ describe('Logistics companies (e2e)', () => {
 
     expect(Object.keys(collection).sort()).toEqual(['get', 'post']);
     expect(Object.keys(item).sort()).toEqual(['delete', 'get', 'put']);
-    expect(Object.keys(collection.get.responses)).toEqual(['200']);
+    expect(Object.keys(collection.get.responses).sort()).toEqual([
+      '200',
+      '401',
+      '500',
+    ]);
     expect(Object.keys(collection.post.responses).sort()).toEqual([
       '201',
       '400',
+      '401',
       '409',
+      '500',
     ]);
     expect(Object.keys(item.get.responses).sort()).toEqual([
       '200',
       '400',
+      '401',
       '404',
+      '500',
     ]);
     expect(Object.keys(item.put.responses).sort()).toEqual([
       '200',
       '400',
+      '401',
       '404',
       '409',
+      '500',
     ]);
     expect(Object.keys(item.delete.responses).sort()).toEqual([
       '204',
       '400',
+      '401',
       '404',
       '500',
     ]);

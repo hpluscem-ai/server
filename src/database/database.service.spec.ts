@@ -28,6 +28,7 @@ describe('DatabaseService', () => {
       .all() as { name: string }[];
 
     expect(tables.map(({ name }) => name)).toEqual([
+      'admin_sessions',
       'auth_sessions',
       'installation_site_devices',
       'installation_sites',
@@ -42,7 +43,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 2 });
+    ).toEqual({ user_version: 3 });
 
     expect(() => {
       databaseService.connection
@@ -426,12 +427,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 2,
+        user_version: 3,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name <> 'auth_sessions' ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('auth_sessions', 'admin_sessions') ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -513,6 +514,77 @@ describe('DatabaseService', () => {
     }
   });
 
+  it.each([false, true])(
+    'preserves v2 data during admin session migration (failure: %s)',
+    (fail) => {
+      const directory = mkdtempSync(
+        join(tmpdir(), 'hpluseco-admin-migration-'),
+      );
+      const path = join(directory, 'version-2.sqlite');
+      let connection: DatabaseSync | undefined = new DatabaseSync(path);
+      let upgraded: DatabaseService | undefined;
+      try {
+        connection.exec(readFileSync(join(__dirname, 'schema.sql'), 'utf8'));
+        connection.exec(
+          readFileSync(join(__dirname, '002-auth-sessions.sql'), 'utf8'),
+        );
+        connection.exec(
+          "INSERT INTO users (id, role, email, password_hash, name) VALUES ('existing', 'admin', 'existing@example.com', 'existing-hash', '관리자');",
+        );
+        connection
+          .prepare(
+            'INSERT INTO auth_sessions (token_hash, user_id, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?)',
+          )
+          .run('a'.repeat(64), 'existing', 1000, 1000, 2000);
+        if (fail)
+          connection.exec(
+            'CREATE INDEX admin_sessions_user_idx ON users (name)',
+          );
+        const originalUsers = connection.prepare('SELECT * FROM users').all();
+        const originalSessions = connection
+          .prepare('SELECT * FROM auth_sessions')
+          .all();
+        connection.close();
+        connection = undefined;
+        process.env.DATABASE_PATH = path;
+        if (fail) {
+          expect(() => new DatabaseService()).toThrow(
+            'index admin_sessions_user_idx already exists',
+          );
+          connection = new DatabaseSync(path);
+          expect(connection.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 2,
+          });
+          expect(
+            connection
+              .prepare(
+                "SELECT name FROM sqlite_schema WHERE name = 'admin_sessions'",
+              )
+              .get(),
+          ).toBeUndefined();
+        } else {
+          upgraded = new DatabaseService();
+          expect(
+            upgraded.connection.prepare('PRAGMA user_version').get(),
+          ).toEqual({ user_version: 3 });
+        }
+        const checked = upgraded?.connection ?? connection!;
+        expect(checked.prepare('SELECT * FROM users').all()).toEqual(
+          originalUsers,
+        );
+        expect(checked.prepare('SELECT * FROM auth_sessions').all()).toEqual(
+          originalSessions,
+        );
+        expect(checked.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally {
+        connection?.close();
+        upgraded?.onModuleDestroy();
+        process.env.DATABASE_PATH = ':memory:';
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('refuses a database created by a newer server schema', () => {
     const temporaryDirectory = mkdtempSync(
       join(tmpdir(), 'hpluseco-database-test-'),
@@ -524,13 +596,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 3;');
+    newerDatabase.exec('PRAGMA user_version = 4;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 3 is newer than supported version 2',
+        'Database schema version 4 is newer than supported version 3',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);

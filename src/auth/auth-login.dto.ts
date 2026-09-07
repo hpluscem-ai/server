@@ -45,7 +45,7 @@ export class LoginResponseDto {
 
   @ApiProperty({
     description:
-      '로그인 시점부터 30일 뒤의 최대 만료 시각. 미사용 만료 시각과 다릅니다.',
+      '서버가 정한 세션의 최대 만료 시각. 정상 인증 요청으로 연장되지 않습니다.',
     format: 'date-time',
   })
   expiresAt!: string;
