@@ -43,7 +43,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 3 });
+    ).toEqual({ user_version: 4 });
 
     expect(() => {
       databaseService.connection
@@ -370,7 +370,7 @@ describe('DatabaseService', () => {
     }).toThrow('completed settlement applications cannot be changed');
   });
 
-  it('upgrades a version 1 database without changing existing data or schema', () => {
+  it('upgrades version 1 while preserving rows and unrelated schema', () => {
     const temporaryDirectory = mkdtempSync(
       join(tmpdir(), 'hpluseco-session-migration-'),
     );
@@ -410,7 +410,9 @@ describe('DatabaseService', () => {
       `);
 
       const originalSchema = connection
-        .prepare('SELECT type, name, sql FROM sqlite_schema ORDER BY name')
+        .prepare(
+          "SELECT type, name, sql FROM sqlite_schema WHERE NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
+        )
         .all();
       const tables = [
         'logistics_companies',
@@ -419,7 +421,14 @@ describe('DatabaseService', () => {
         'phone_verifications',
       ];
       const originalRows = tables.map((table) =>
-        connection!.prepare(`SELECT * FROM ${table}`).all(),
+        connection!
+          .prepare(`SELECT * FROM ${table}`)
+          .all()
+          .map((row) =>
+            table === 'phone_verifications'
+              ? { ...row, scope_user_id: null }
+              : row,
+          ),
       );
       connection.close();
       connection = undefined;
@@ -427,12 +436,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 3,
+        user_version: 4,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('auth_sessions', 'admin_sessions') ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -566,7 +575,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 3 });
+          ).toEqual({ user_version: 4 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -596,13 +605,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 4;');
+    newerDatabase.exec('PRAGMA user_version = 5;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 4 is newer than supported version 3',
+        'Database schema version 5 is newer than supported version 4',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -620,4 +629,75 @@ describe('DatabaseService', () => {
       rmSync(temporaryDirectory, { force: true, recursive: true });
     }
   });
+
+  it.each([false, true])(
+    'preserves v3 verification rows during owner migration (failure: %s)',
+    (fail) => {
+      const directory = mkdtempSync(join(tmpdir(), 'hpluseco-phone-owner-'));
+      const path = join(directory, 'version-3.sqlite');
+      let connection: DatabaseSync | undefined = new DatabaseSync(path);
+      let upgraded: DatabaseService | undefined;
+      try {
+        for (const file of [
+          'schema.sql',
+          '002-auth-sessions.sql',
+          '003-admin-sessions.sql',
+        ])
+          connection.exec(readFileSync(join(__dirname, file), 'utf8'));
+        connection.exec(
+          "INSERT INTO phone_verifications (id, purpose, phone, code_hash, expires_at) VALUES ('legacy-proof', 'sign_up', '010-1234-5678', 'old-code-hash', '2026-09-08 00:00:00');",
+        );
+        if (fail)
+          connection.exec(
+            'ALTER TABLE phone_verifications ADD COLUMN scope_user_id TEXT',
+          );
+        connection.close();
+        connection = undefined;
+        process.env.DATABASE_PATH = path;
+        if (fail) {
+          expect(() => new DatabaseService()).toThrow(
+            'duplicate column name: scope_user_id',
+          );
+          connection = new DatabaseSync(path);
+          expect(connection.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 3,
+          });
+        } else {
+          upgraded = new DatabaseService();
+          expect(
+            upgraded.connection.prepare('PRAGMA user_version').get(),
+          ).toEqual({ user_version: 4 });
+          expect(() =>
+            upgraded!.connection.exec(
+              "UPDATE phone_verifications SET scope_user_id = 'missing-user'",
+            ),
+          ).toThrow();
+          upgraded.onModuleDestroy();
+          upgraded = new DatabaseService();
+        }
+        const checked = upgraded?.connection ?? connection!;
+        expect(
+          checked
+            .prepare(
+              'SELECT id, purpose, phone, code_hash, scope_user_id FROM phone_verifications',
+            )
+            .all(),
+        ).toEqual([
+          {
+            id: 'legacy-proof',
+            purpose: 'sign_up',
+            phone: '010-1234-5678',
+            code_hash: 'old-code-hash',
+            scope_user_id: null,
+          },
+        ]);
+        expect(checked.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally {
+        connection?.close();
+        upgraded?.onModuleDestroy();
+        process.env.DATABASE_PATH = ':memory:';
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });

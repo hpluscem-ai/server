@@ -30,7 +30,7 @@ import {
 } from './auth.repository';
 import {
   ConfirmPhoneVerificationResponseDto,
-  PublicVerificationPurpose,
+  VerificationPurpose,
   SendPhoneVerificationRequestDto,
   SendPhoneVerificationResponseDto,
 } from './phone-verification.dto';
@@ -38,6 +38,7 @@ import { SolapiSmsService } from './solapi-sms.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
 import { ResetPasswordRequestDto } from './reset-password.dto';
 import { MISSING_USER_PASSWORD_HASH } from './password.constants';
+import { ChangePhoneRequestDto } from './change-phone.dto';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -188,6 +189,27 @@ export class AuthService {
         message: '비밀번호 찾기 목적에서만 이메일을 함께 입력해 주세요.',
       });
     }
+    return this.sendVerification(phone, purpose, email);
+  }
+
+  sendPhoneChangeVerification(
+    session: AuthenticatedSession,
+    phone: string,
+  ): Promise<SendPhoneVerificationResponseDto> {
+    return this.sendVerification(
+      phone,
+      'change_phone',
+      undefined,
+      session.user.id,
+    );
+  }
+
+  private async sendVerification(
+    phone: string,
+    purpose: VerificationPurpose,
+    email?: string,
+    userId?: string,
+  ): Promise<SendPhoneVerificationResponseDto> {
     const verificationId = randomUUID();
     const code = randomInt(1_000_000).toString().padStart(6, '0');
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
@@ -198,11 +220,13 @@ export class AuthService {
       codeHash,
       purpose,
       email,
+      userId,
     );
     await this.smsService.sendVerificationCode(phone, code);
     const expiresAt = this.authRepository.activatePhoneVerification(
       verificationId,
       purpose,
+      userId,
     );
 
     if (!expiresAt) {
@@ -219,12 +243,14 @@ export class AuthService {
   confirmPhoneVerification(
     verificationId: string,
     code: string,
-    purpose: PublicVerificationPurpose,
+    purpose: VerificationPurpose,
+    userId?: string,
   ): ConfirmPhoneVerificationResponseDto {
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
     const pending = this.authRepository.findPendingPhoneVerification(
       verificationId,
       purpose,
+      userId,
     );
 
     if (!pending) {
@@ -251,6 +277,7 @@ export class AuthService {
       verificationId,
       proofHash,
       purpose,
+      userId,
     );
 
     if (!expiresAt) {
@@ -258,6 +285,29 @@ export class AuthService {
     }
 
     return { verificationProof, expiresAt };
+  }
+
+  changePhone(
+    session: AuthenticatedSession,
+    input: ChangePhoneRequestDto,
+  ): void {
+    const now = new Date(Date.now());
+    try {
+      const changed = this.authRepository.changeDriverPhone({
+        userId: session.user.id,
+        tokenHash: session.tokenHash,
+        phone: input.phone,
+        proofHash: createHash('sha256')
+          .update(input.verificationProof)
+          .digest('hex'),
+        now,
+        idleCutoff: new Date(now.getTime() - SESSION_IDLE_TIMEOUT_MS),
+      });
+      if (!changed) this.throwSessionInvalid();
+    } catch (error) {
+      this.throwIfDomainError(error);
+      throw error;
+    }
   }
 
   async signUp(input: SignUpRequestDto): Promise<SignUpResponseDto> {
@@ -334,7 +384,7 @@ export class AuthService {
   private hashVerificationCode(
     verificationId: string,
     code: string,
-    purpose: PublicVerificationPurpose,
+    purpose: VerificationPurpose,
   ): string {
     const secret = process.env.PHONE_VERIFICATION_SECRET?.trim();
     if (!secret || Buffer.byteLength(secret) < 32) {

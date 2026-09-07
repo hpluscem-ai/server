@@ -82,6 +82,9 @@ export const phoneVerifications = sqliteTable('phone_verifications', {
   purpose: text('purpose').notNull(),
   phone: text('phone').notNull(),
   scopeEmail: text('scope_email'),
+  scopeUserId: text('scope_user_id').references(() => users.id, {
+    onDelete: 'cascade',
+  }),
   codeHash: text('code_hash').notNull(),
   proofHash: text('proof_hash').unique(),
   expiresAt: text('expires_at').notNull(),

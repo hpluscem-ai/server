@@ -1,10 +1,16 @@
-import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { INestApplication, Logger } from '@nestjs/common';
+import type { OpenAPIObject } from '@nestjs/swagger';
 import request from 'supertest';
 import { App } from 'supertest/types';
 
 import { DatabaseService } from '../src/database/database.service';
+import {
+  authSessions,
+  logisticsCompanies,
+  users,
+} from '../src/database/schema';
 import { createTestApp } from './helpers/create-test-app';
 
 const phone = '010-1234-5678';
@@ -109,6 +115,284 @@ describe('SOLAPI phone verification (e2e)', () => {
       marketingTerms: false,
     });
   }
+
+  describe('authenticated phone change', () => {
+    const path = '/api/v1/auth/phone-change/verifications';
+    let userId: string;
+    let authorization: string;
+    beforeEach(() => {
+      const companyId = randomUUID();
+      database.db
+        .insert(logisticsCompanies)
+        .values({
+          id: companyId,
+          businessName: '물류사',
+          businessNumber: '123-45-67890',
+          corporateRegistrationNumber: '123456-1234567',
+          businessAddress: '서울시',
+          managerName: '담당자',
+          managerPhone: '010-1234-5678',
+          bankCode: '19',
+          accountNumber: '12345',
+          accountHolder: '물류사',
+        })
+        .run();
+      userId = randomUUID();
+      database.db
+        .insert(users)
+        .values({
+          id: userId,
+          role: 'driver',
+          email: 'driver@example.com',
+          passwordHash: 'test-only-unused-hash',
+          name: '기사',
+          phone: '010-8888-9999',
+          logisticsCompanyId: companyId,
+          serviceTermsConsent: true,
+          privacyTermsConsent: true,
+        })
+        .run();
+      authorization = session(userId);
+    });
+    afterEach(() =>
+      database.connection.exec('DROP TRIGGER IF EXISTS fail_phone_change'),
+    );
+    function session(id: string) {
+      const token = randomBytes(32).toString('base64url');
+      const now = new Date();
+      database.db
+        .insert(authSessions)
+        .values({
+          tokenHash: createHash('sha256').update(token).digest('hex'),
+          userId: id,
+          createdAt: now,
+          lastUsedAt: now,
+          expiresAt: new Date(now.getTime() + 600000),
+        })
+        .run();
+      return `Bearer ${token}`;
+    }
+    function sendChange(to = phone, auth = authorization) {
+      return request(app.getHttpServer())
+        .post(path)
+        .set('Authorization', auth)
+        .send({ phone: to });
+    }
+    function confirmChange(id: string, code: string, auth = authorization) {
+      return request(app.getHttpServer())
+        .post(`${path}/${id}/confirm`)
+        .set('Authorization', auth)
+        .send({ code });
+    }
+    async function proof(to = phone) {
+      const response = await sendChange(to).expect(201);
+      const id = (response.body as SentVerification).verificationId;
+      const result = await confirmChange(id, sentCode()).expect(200);
+      return {
+        id,
+        value: (result.body as ConfirmedVerification).verificationProof,
+      };
+    }
+    function change(value: string, to = phone, auth = authorization) {
+      return request(app.getHttpServer())
+        .post('/api/v1/auth/change-phone')
+        .set('Authorization', auth)
+        .send({ phone: to, verificationProof: value });
+    }
+    function savedPhone() {
+      return database.connection
+        .prepare('SELECT phone FROM users WHERE id = ?')
+        .get(userId);
+    }
+
+    it('changes only the authenticated driver phone and consumes the owner-bound proof once', async () => {
+      const verified = await proof();
+      expect(row(verified.id)).toMatchObject({
+        purpose: 'change_phone',
+        scope_user_id: userId,
+        phone,
+      });
+      await change(verified.value)
+        .expect(204)
+        .expect('')
+        .expect('Cache-Control', 'no-store');
+      expect(savedPhone()).toEqual({ phone });
+      expect(row(verified.id).consumed_at).not.toBeNull();
+      await change(verified.value).expect(400);
+      await request(app.getHttpServer())
+        .get('/api/v1/users/me')
+        .set('Authorization', authorization)
+        .expect(200)
+        .expect(({ body }: { body: { phone: string } }) =>
+          expect(body.phone).toBe(phone),
+        );
+    });
+
+    it('requires authentication for sending, confirming and saving and rejects scope overrides', async () => {
+      await sendChange(phone, '').expect(401);
+      await confirmChange(randomUUID(), '123456', '').expect(401);
+      await change('proof', phone, '').expect(401);
+      await request(app.getHttpServer())
+        .post(path)
+        .set('Authorization', authorization)
+        .send({ phone, userId: randomUUID() })
+        .expect(400);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects another owner or changed phone without consuming the proof', async () => {
+      const verified = await proof();
+      const otherId = randomUUID();
+      database.connection
+        .prepare(
+          `INSERT INTO users (id, role, email, password_hash, name, phone, logistics_company_id, service_terms_consent, privacy_terms_consent)
+        SELECT ?, role, 'other@example.com', password_hash, name, '010-3333-4444', logistics_company_id, 1, 1 FROM users WHERE id = ?`,
+        )
+        .run(otherId, userId);
+      await change(verified.value, phone, session(otherId))
+        .expect(400)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
+        );
+      await change(verified.value, '010-5555-6666').expect(400);
+      expect(row(verified.id).consumed_at).toBeNull();
+      await sendChange(phone, session(otherId)).expect(201);
+      expect(row(verified.id).invalidated_at).toBeNull();
+      const next = await sendChange().expect(201);
+      const id = (next.body as SentVerification).verificationId;
+      await confirmChange(id, sentCode(), session(otherId)).expect(400);
+      await confirmChange(id, sentCode()).expect(200);
+    });
+
+    it('keeps purposes isolated and invalidates old owner proofs even when the new phone changes', async () => {
+      const signup = await send();
+      const signupProof = (
+        await confirm(signup.verificationId, sentCode()).expect(200)
+      ).body as ConfirmedVerification;
+      await change(signupProof.verificationProof).expect(400);
+      const first = await proof();
+      await signUp(first.value)
+        .expect(400)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
+        );
+      await sendChange('010-5555-6666').expect(201);
+      expect(row(first.id).invalidated_at).not.toBeNull();
+      await change(first.value).expect(400);
+    });
+
+    it('rejects duplicate phones without consuming the proof', async () => {
+      database.db
+        .insert(users)
+        .values({
+          id: randomUUID(),
+          role: 'admin',
+          email: 'taken@example.com',
+          name: '다른 계정',
+          passwordHash: 'test-only',
+          phone,
+        })
+        .run();
+      const verified = await proof();
+      await change(verified.value)
+        .expect(409)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('PHONE_ALREADY_EXISTS'),
+        );
+      expect(row(verified.id).consumed_at).toBeNull();
+      expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+    });
+
+    it.each(['expired-proof', 'revoked-session', 'inactive-company'])(
+      'rejects %s before saving',
+      async (state) => {
+        const verified = await proof();
+        if (state === 'expired-proof')
+          database.connection
+            .prepare(
+              'UPDATE phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = ?',
+            )
+            .run(verified.id);
+        if (state === 'revoked-session') database.db.delete(authSessions).run();
+        if (state === 'inactive-company')
+          database.db.update(logisticsCompanies).set({ active: false }).run();
+        await change(verified.value).expect(
+          state === 'expired-proof' ? 400 : 401,
+        );
+        expect(row(verified.id).consumed_at).toBeNull();
+        expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+      },
+    );
+
+    it('allows only one concurrent proof use', async () => {
+      const verified = await proof();
+      const result = await Promise.all([
+        change(verified.value),
+        change(verified.value),
+      ]);
+      expect(result.map(({ status }) => status).sort()).toEqual([204, 400]);
+    });
+
+    it.each(['proof-consume', 'phone-write'])(
+      'rolls back proof and phone on %s failure',
+      async (point) => {
+        const verified = await proof();
+        jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        const operation =
+          point === 'proof-consume'
+            ? 'AFTER UPDATE OF consumed_at ON phone_verifications'
+            : 'AFTER UPDATE OF phone ON users';
+        database.connection.exec(
+          `CREATE TRIGGER fail_phone_change ${operation} BEGIN SELECT RAISE(FAIL, 'private-failure'); END;`,
+        );
+        await change(verified.value).expect(500);
+        expect(row(verified.id).consumed_at).toBeNull();
+        expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+      },
+    );
+
+    it('documents protected phone-change routes and reuses validated fields only', async () => {
+      const result = await request(app.getHttpServer())
+        .get('/docs-json')
+        .expect(200);
+      const document = result.body as OpenAPIObject;
+      for (const endpoint of [
+        path,
+        `${path}/{verificationId}/confirm`,
+        '/api/v1/auth/change-phone',
+      ]) {
+        expect(document.paths[endpoint]?.post?.security).toEqual([
+          { bearer: [] },
+        ]);
+        expect(document.paths[endpoint]?.post?.responses['401']).toBeDefined();
+        expect(document.paths[endpoint]?.post?.responses['500']).toBeDefined();
+      }
+      const schema = document.components?.schemas?.ChangePhoneRequestDto;
+      expect(
+        schema && 'properties' in schema && schema.properties,
+      ).toMatchObject({
+        phone: { description: expect.stringMatching(/[가-힣]/) as unknown },
+        verificationProof: {
+          description: expect.stringMatching(/[가-힣]/) as unknown,
+        },
+      });
+      const verified = await proof();
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/change-phone')
+        .set('Authorization', authorization)
+        .send({
+          phone,
+          verificationProof: verified.value,
+          email: 'other@example.com',
+        })
+        .expect(400);
+      await change('', phone).expect(400);
+      await change(verified.value, 'invalid').expect(400);
+      expect(row(verified.id).consumed_at).toBeNull();
+    });
+  });
 
   it.each(['find_email', 'reset_password'])(
     'binds %s proofs to their purpose and input, never signup',

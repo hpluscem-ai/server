@@ -37,6 +37,11 @@ import { AuthService } from './auth.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
 import { ResetPasswordRequestDto } from './reset-password.dto';
 import {
+  ChangePhoneRequestDto,
+  ConfirmPhoneChangeVerificationDto,
+  SendPhoneChangeVerificationDto,
+} from './change-phone.dto';
+import {
   ConfirmPhoneVerificationRequestDto,
   ConfirmPhoneVerificationResponseDto,
   PhoneVerificationParamsDto,
@@ -245,5 +250,121 @@ export class AuthController {
   @ApiCreatedResponse({ type: SignUpResponseDto })
   signUp(@Body() input: SignUpRequestDto): Promise<SignUpResponseDto> {
     return this.authService.signUp(input);
+  }
+
+  @Post('phone-change/verifications')
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: '본인 연락처 변경용 SMS 발송',
+    description:
+      '기사 세션의 본인과 새 연락처에 인증을 묶습니다. 같은 기사가 재발송하면 새 번호가 달라도 이전 변경 증명을 무효화합니다. 기존 SMS의 3분 만료·6자리·횟수 제한 없음 정책을 사용합니다.',
+  })
+  @ApiCreatedResponse({ type: SendPhoneVerificationResponseDto })
+  @ApiBadRequestResponse({
+    type: ApiErrorResponseDto,
+    description: 'VALIDATION_ERROR',
+  })
+  @ApiUnauthorizedResponse({
+    type: ApiErrorResponseDto,
+    description: 'INVALID_SESSION',
+  })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'PHONE_VERIFICATION_SUPERSEDED',
+  })
+  @ApiBadGatewayResponse({
+    type: ApiErrorResponseDto,
+    description: 'SMS_SEND_FAILED',
+  })
+  @ApiServiceUnavailableResponse({
+    type: ApiErrorResponseDto,
+    description: 'SMS_NOT_CONFIGURED | PHONE_VERIFICATION_NOT_CONFIGURED',
+  })
+  @ApiInternalServerErrorResponse({
+    type: ApiErrorResponseDto,
+    description: 'INTERNAL_SERVER_ERROR',
+  })
+  sendPhoneChangeVerification(
+    @Req() request: AuthenticatedRequest,
+    @Body() input: SendPhoneChangeVerificationDto,
+  ): Promise<SendPhoneVerificationResponseDto> {
+    return this.authService.sendPhoneChangeVerification(
+      request.authSession,
+      input.phone,
+    );
+  }
+
+  @Post('phone-change/verifications/:verificationId/confirm')
+  @HttpCode(200)
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: '본인 연락처 변경용 SMS 확인',
+    description:
+      '같은 기사가 발송한 미사용 인증만 확인합니다. 발송 시의 만료 시각은 연장하지 않습니다.',
+  })
+  @ApiOkResponse({ type: ConfirmPhoneVerificationResponseDto })
+  @ApiBadRequestResponse({
+    type: ApiErrorResponseDto,
+    description:
+      'VALIDATION_ERROR | PHONE_VERIFICATION_INVALID | PHONE_VERIFICATION_CODE_MISMATCH',
+  })
+  @ApiUnauthorizedResponse({
+    type: ApiErrorResponseDto,
+    description: 'INVALID_SESSION',
+  })
+  @ApiServiceUnavailableResponse({
+    type: ApiErrorResponseDto,
+    description: 'PHONE_VERIFICATION_NOT_CONFIGURED',
+  })
+  @ApiInternalServerErrorResponse({
+    type: ApiErrorResponseDto,
+    description: 'INTERNAL_SERVER_ERROR',
+  })
+  confirmPhoneChangeVerification(
+    @Req() request: AuthenticatedRequest,
+    @Param() params: PhoneVerificationParamsDto,
+    @Body() input: ConfirmPhoneChangeVerificationDto,
+  ): ConfirmPhoneVerificationResponseDto {
+    return this.authService.confirmPhoneVerification(
+      params.verificationId,
+      input.code,
+      'change_phone',
+      request.authSession.user.id,
+    );
+  }
+
+  @Post('change-phone')
+  @HttpCode(204)
+  @UseGuards(AuthSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'SMS 인증 후 본인 연락처 변경',
+    description:
+      '본인·새 연락처·변경 목적에 묶인 증명을 한 번 소비하고 연락처를 같은 트랜잭션에서 저장합니다. 이메일·소속·비밀번호를 변경하지 않으며 추가 비밀번호 재인증이나 세션 폐기 정책은 적용하지 않습니다.',
+  })
+  @ApiNoContentResponse({ description: '연락처 변경 완료' })
+  @ApiBadRequestResponse({
+    type: ApiErrorResponseDto,
+    description: 'VALIDATION_ERROR | PHONE_VERIFICATION_INVALID',
+  })
+  @ApiUnauthorizedResponse({
+    type: ApiErrorResponseDto,
+    description: 'INVALID_SESSION',
+  })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'PHONE_ALREADY_EXISTS',
+  })
+  @ApiInternalServerErrorResponse({
+    type: ApiErrorResponseDto,
+    description: 'INTERNAL_SERVER_ERROR',
+  })
+  changePhone(
+    @Req() request: AuthenticatedRequest,
+    @Body() input: ChangePhoneRequestDto,
+  ): void {
+    this.authService.changePhone(request.authSession, input);
   }
 }

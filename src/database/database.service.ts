@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
@@ -45,7 +45,7 @@ export class DatabaseService implements OnModuleDestroy {
       }
 
       if (schemaVersion < CURRENT_SCHEMA_VERSION) {
-        if (![0, 1, 2].includes(schemaVersion)) {
+        if (![0, 1, 2, 3].includes(schemaVersion)) {
           throw new Error(
             `Database schema version ${schemaVersion} requires an explicit migration`,
           );
@@ -77,8 +77,16 @@ export class DatabaseService implements OnModuleDestroy {
             readFileSync(join(__dirname, '002-auth-sessions.sql'), 'utf8'),
           );
         }
+        if (schemaVersion < 3) {
+          this.database.exec(
+            readFileSync(join(__dirname, '003-admin-sessions.sql'), 'utf8'),
+          );
+        }
         this.database.exec(
-          readFileSync(join(__dirname, '003-admin-sessions.sql'), 'utf8'),
+          readFileSync(
+            join(__dirname, '004-phone-verification-owner.sql'),
+            'utf8',
+          ),
         );
       }
     } catch (error) {

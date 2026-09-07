@@ -13,6 +13,8 @@ import {
 export type PublicVerificationPurpose =
   'sign_up' | 'find_email' | 'reset_password';
 
+export type VerificationPurpose = PublicVerificationPurpose | 'change_phone';
+
 class PublicVerificationPurposeDto {
   @ApiPropertyOptional({
     description: '인증 목적. 생략 시 기존 회원가입 계약을 유지합니다.',

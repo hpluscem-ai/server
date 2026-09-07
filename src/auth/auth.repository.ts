@@ -1,8 +1,8 @@
-import { and, eq, gt, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, eq, gt, isNotNull, isNull, ne, sql } from 'drizzle-orm';
 import { Injectable } from '@nestjs/common';
 
 import { DatabaseService } from '../database/database.service';
-import { PublicVerificationPurpose } from './phone-verification.dto';
+import { VerificationPurpose } from './phone-verification.dto';
 import {
   authSessions,
   logisticsCompanies,
@@ -264,9 +264,12 @@ export class AuthRepository {
     id: string,
     phone: string,
     codeHash: string,
-    purpose: PublicVerificationPurpose,
+    purpose: VerificationPurpose,
     email?: string,
+    userId?: string,
   ): void {
+    if (purpose === 'change_phone' && !userId)
+      throw new Error('Phone change requires an owner');
     this.database.db.transaction((transaction) => {
       transaction
         .update(phoneVerifications)
@@ -274,7 +277,9 @@ export class AuthRepository {
         .where(
           and(
             eq(phoneVerifications.purpose, purpose),
-            eq(phoneVerifications.phone, phone),
+            purpose === 'change_phone'
+              ? verificationOwner(userId)
+              : eq(phoneVerifications.phone, phone),
             isNull(phoneVerifications.consumedAt),
             isNull(phoneVerifications.invalidatedAt),
           ),
@@ -288,6 +293,7 @@ export class AuthRepository {
           phone,
           purpose,
           scopeEmail: email,
+          scopeUserId: userId,
           codeHash,
           // Pending sends use the epoch so a small clock rollback cannot enable them.
           expiresAt: '1970-01-01 00:00:00',
@@ -298,7 +304,8 @@ export class AuthRepository {
 
   activatePhoneVerification(
     id: string,
-    purpose: PublicVerificationPurpose,
+    purpose: VerificationPurpose,
+    userId?: string,
   ): string | undefined {
     const verification = this.database.db
       .update(phoneVerifications)
@@ -307,6 +314,7 @@ export class AuthRepository {
         and(
           eq(phoneVerifications.id, id),
           eq(phoneVerifications.purpose, purpose),
+          verificationOwner(userId),
           isNull(phoneVerifications.invalidatedAt),
           isNull(phoneVerifications.verifiedAt),
           isNull(phoneVerifications.consumedAt),
@@ -320,23 +328,28 @@ export class AuthRepository {
       : undefined;
   }
 
-  findPendingPhoneVerification(id: string, purpose: PublicVerificationPurpose) {
+  findPendingPhoneVerification(
+    id: string,
+    purpose: VerificationPurpose,
+    userId?: string,
+  ) {
     return this.database.db
       .select({ codeHash: phoneVerifications.codeHash })
       .from(phoneVerifications)
-      .where(validPendingPhoneVerification(id, purpose))
+      .where(validPendingPhoneVerification(id, purpose, userId))
       .get();
   }
 
   confirmPhoneVerification(
     id: string,
     proofHash: string,
-    purpose: PublicVerificationPurpose,
+    purpose: VerificationPurpose,
+    userId?: string,
   ): string | undefined {
     const verification = this.database.db
       .update(phoneVerifications)
       .set({ proofHash, verifiedAt: sql`CURRENT_TIMESTAMP` })
-      .where(validPendingPhoneVerification(id, purpose))
+      .where(validPendingPhoneVerification(id, purpose, userId))
       .returning({ expiresAt: phoneVerifications.expiresAt })
       .get();
 
@@ -474,6 +487,69 @@ export class AuthRepository {
     }
   }
 
+  changeDriverPhone(input: {
+    userId: string;
+    tokenHash: string;
+    phone: string;
+    proofHash: string;
+    now: Date;
+    idleCutoff: Date;
+  }): boolean {
+    try {
+      return this.database.db.transaction((transaction) => {
+        const session = transaction
+          .select({ id: users.id })
+          .from(authSessions)
+          .innerJoin(users, eq(authSessions.userId, users.id))
+          .innerJoin(
+            logisticsCompanies,
+            eq(users.logisticsCompanyId, logisticsCompanies.id),
+          )
+          .where(
+            and(
+              validDriverSession(input.tokenHash, input.now, input.idleCutoff),
+              eq(users.id, input.userId),
+            ),
+          )
+          .get();
+        if (!session) return false;
+        const proof = transaction
+          .update(phoneVerifications)
+          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
+          .where(
+            and(
+              eq(phoneVerifications.purpose, 'change_phone'),
+              eq(phoneVerifications.scopeUserId, input.userId),
+              eq(phoneVerifications.phone, input.phone),
+              eq(phoneVerifications.proofHash, input.proofHash),
+              isNotNull(phoneVerifications.verifiedAt),
+              isNull(phoneVerifications.invalidatedAt),
+              isNull(phoneVerifications.consumedAt),
+              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+            ),
+          )
+          .returning({ id: phoneVerifications.id })
+          .get();
+        if (!proof) throw new PhoneVerificationInvalidError();
+        const duplicate = transaction
+          .select({ id: users.id })
+          .from(users)
+          .where(and(eq(users.phone, input.phone), ne(users.id, input.userId)))
+          .get();
+        if (duplicate) throw new PhoneAlreadyExistsError();
+        transaction
+          .update(users)
+          .set({ phone: input.phone, updatedAt: sql`CURRENT_TIMESTAMP` })
+          .where(eq(users.id, input.userId))
+          .run();
+        return true;
+      });
+    } catch (error) {
+      this.throwIfDuplicate(error);
+      throw error;
+    }
+  }
+
   private throwIfDuplicate(error: unknown): void {
     const cause = getDatabaseCause(error);
     const message =
@@ -519,11 +595,13 @@ function validPasswordReset(tokenHash: string) {
 
 function validPendingPhoneVerification(
   id: string,
-  purpose: PublicVerificationPurpose,
+  purpose: VerificationPurpose,
+  userId?: string,
 ) {
   return and(
     eq(phoneVerifications.id, id),
     eq(phoneVerifications.purpose, purpose),
+    verificationOwner(userId),
     isNull(phoneVerifications.verifiedAt),
     isNull(phoneVerifications.consumedAt),
     isNull(phoneVerifications.invalidatedAt),
@@ -541,6 +619,12 @@ function validSignUpProof(phone: string, proofHash: string) {
     isNull(phoneVerifications.invalidatedAt),
     gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
   );
+}
+
+function verificationOwner(userId?: string) {
+  return userId === undefined
+    ? isNull(phoneVerifications.scopeUserId)
+    : eq(phoneVerifications.scopeUserId, userId);
 }
 
 function getDatabaseCause(error: unknown): unknown {
