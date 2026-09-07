@@ -2,6 +2,7 @@ import { and, eq, gt, isNotNull, isNull, sql } from 'drizzle-orm';
 import { Injectable } from '@nestjs/common';
 
 import { DatabaseService } from '../database/database.service';
+import { PublicVerificationPurpose } from './phone-verification.dto';
 import {
   authSessions,
   logisticsCompanies,
@@ -188,14 +189,20 @@ export class AuthRepository {
       .run();
   }
 
-  beginPhoneVerification(id: string, phone: string, codeHash: string): void {
+  beginPhoneVerification(
+    id: string,
+    phone: string,
+    codeHash: string,
+    purpose: PublicVerificationPurpose,
+    email?: string,
+  ): void {
     this.database.db.transaction((transaction) => {
       transaction
         .update(phoneVerifications)
         .set({ invalidatedAt: sql`CURRENT_TIMESTAMP` })
         .where(
           and(
-            eq(phoneVerifications.purpose, 'sign_up'),
+            eq(phoneVerifications.purpose, purpose),
             eq(phoneVerifications.phone, phone),
             isNull(phoneVerifications.consumedAt),
             isNull(phoneVerifications.invalidatedAt),
@@ -208,7 +215,8 @@ export class AuthRepository {
         .values({
           id,
           phone,
-          purpose: 'sign_up',
+          purpose,
+          scopeEmail: email,
           codeHash,
           // Pending sends use the epoch so a small clock rollback cannot enable them.
           expiresAt: '1970-01-01 00:00:00',
@@ -217,14 +225,17 @@ export class AuthRepository {
     });
   }
 
-  activatePhoneVerification(id: string): string | undefined {
+  activatePhoneVerification(
+    id: string,
+    purpose: PublicVerificationPurpose,
+  ): string | undefined {
     const verification = this.database.db
       .update(phoneVerifications)
       .set({ expiresAt: sql`datetime('now', '+3 minutes')` })
       .where(
         and(
           eq(phoneVerifications.id, id),
-          eq(phoneVerifications.purpose, 'sign_up'),
+          eq(phoneVerifications.purpose, purpose),
           isNull(phoneVerifications.invalidatedAt),
           isNull(phoneVerifications.verifiedAt),
           isNull(phoneVerifications.consumedAt),
@@ -238,19 +249,23 @@ export class AuthRepository {
       : undefined;
   }
 
-  findPendingPhoneVerification(id: string) {
+  findPendingPhoneVerification(id: string, purpose: PublicVerificationPurpose) {
     return this.database.db
       .select({ codeHash: phoneVerifications.codeHash })
       .from(phoneVerifications)
-      .where(validPendingPhoneVerification(id))
+      .where(validPendingPhoneVerification(id, purpose))
       .get();
   }
 
-  confirmPhoneVerification(id: string, proofHash: string): string | undefined {
+  confirmPhoneVerification(
+    id: string,
+    proofHash: string,
+    purpose: PublicVerificationPurpose,
+  ): string | undefined {
     const verification = this.database.db
       .update(phoneVerifications)
       .set({ proofHash, verifiedAt: sql`CURRENT_TIMESTAMP` })
-      .where(validPendingPhoneVerification(id))
+      .where(validPendingPhoneVerification(id, purpose))
       .returning({ expiresAt: phoneVerifications.expiresAt })
       .get();
 
@@ -420,10 +435,13 @@ function validDriverSession(tokenHash: string, now: Date, idleCutoff: Date) {
   );
 }
 
-function validPendingPhoneVerification(id: string) {
+function validPendingPhoneVerification(
+  id: string,
+  purpose: PublicVerificationPurpose,
+) {
   return and(
     eq(phoneVerifications.id, id),
-    eq(phoneVerifications.purpose, 'sign_up'),
+    eq(phoneVerifications.purpose, purpose),
     isNull(phoneVerifications.verifiedAt),
     isNull(phoneVerifications.consumedAt),
     isNull(phoneVerifications.invalidatedAt),

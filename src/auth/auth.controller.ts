@@ -152,9 +152,9 @@ export class AuthController {
   @Post('phone-verifications')
   @Header('Cache-Control', 'no-store')
   @ApiOperation({
-    summary: '회원가입용 SMS 인증번호 발송',
+    summary: '회원가입·이메일 찾기·비밀번호 찾기 SMS 인증번호 발송',
     description:
-      'SOLAPI 접수 성공 후 3분간 유효합니다. 재발송 요청 시 이전 인증번호와 증명을 즉시 무효화하며, 발송 실패 시에도 복구하지 않습니다. 다른 인증 목적은 아직 지원하지 않습니다.',
+      'SOLAPI 접수 성공 후 3분간 유효합니다. 같은 목적·휴대폰의 재발송은 이메일 변경 여부와 관계없이 이전 인증번호와 증명을 즉시 무효화하며 발송 실패 시에도 복구하지 않습니다. 비밀번호 찾기는 이메일·휴대폰 조합에 묶습니다. 이 API는 계정 존재 여부를 조회하지 않습니다. 이메일 찾기 결과·재설정 메일 발송은 미제공입니다.',
   })
   @ApiCreatedResponse({ type: SendPhoneVerificationResponseDto })
   @ApiBadRequestResponse({
@@ -176,16 +176,16 @@ export class AuthController {
   sendPhoneVerification(
     @Body() input: SendPhoneVerificationRequestDto,
   ): Promise<SendPhoneVerificationResponseDto> {
-    return this.authService.sendPhoneVerification(input.phone);
+    return this.authService.sendPhoneVerification(input);
   }
 
   @Post('phone-verifications/:verificationId/confirm')
   @HttpCode(200)
   @Header('Cache-Control', 'no-store')
   @ApiOperation({
-    summary: '회원가입용 SMS 인증번호 확인',
+    summary: '목적별 SMS 인증번호 확인',
     description:
-      '확인 성공 시 일회용 가입 증명을 발급합니다. 원래 3분 만료 시각은 연장하지 않으며 같은 인증번호를 다시 확인할 수 없습니다.',
+      '발송 목적이 일치할 때 해당 목적·입력 범위에 묶인 일회용 증명을 발급합니다. 원래 3분 만료 시각은 연장하지 않으며 같은 인증번호를 다시 확인할 수 없습니다.',
   })
   @ApiOkResponse({ type: ConfirmPhoneVerificationResponseDto })
   @ApiBadRequestResponse({
@@ -204,6 +204,7 @@ export class AuthController {
     return this.authService.confirmPhoneVerification(
       params.verificationId,
       input.code,
+      input.purpose,
     );
   }
 

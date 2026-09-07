@@ -110,6 +110,80 @@ describe('SOLAPI phone verification (e2e)', () => {
     });
   }
 
+  it.each(['find_email', 'reset_password'])(
+    'binds %s proofs to their purpose and input, never signup',
+    async (purpose) => {
+      const input = {
+        phone,
+        purpose,
+        ...(purpose === 'reset_password'
+          ? { email: ' Driver@Example.com ' }
+          : {}),
+      };
+      const sent = await request(app.getHttpServer())
+        .post(basePath)
+        .send(input)
+        .expect(201);
+      const id = (sent.body as SentVerification).verificationId;
+      const code = sentCode();
+      await confirm(id, code).expect(400);
+      const result = await request(app.getHttpServer())
+        .post(`${basePath}/${id}/confirm`)
+        .send({ code, purpose })
+        .expect(200);
+      expect(row(id)).toMatchObject({
+        purpose,
+        phone,
+        scope_email: purpose === 'reset_password' ? 'driver@example.com' : null,
+      });
+      await signUp((result.body as ConfirmedVerification).verificationProof)
+        .expect(400)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
+        );
+      expect(row(id).consumed_at).toBeNull();
+      await request(app.getHttpServer())
+        .post(`${basePath}/${id}/confirm`)
+        .send({ code, purpose })
+        .expect(400);
+    },
+  );
+
+  it('invalidates the previous reset scope when its email changes without invalidating signup', async () => {
+    const signup = await send();
+    const signupCode = sentCode();
+    const first = await request(app.getHttpServer())
+      .post(basePath)
+      .send({ phone, purpose: 'reset_password', email: 'first@example.com' })
+      .expect(201);
+    const firstId = (first.body as SentVerification).verificationId;
+    const code = sentCode();
+    await request(app.getHttpServer())
+      .post(`${basePath}/${firstId}/confirm`)
+      .send({ code, purpose: 'reset_password' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .post(basePath)
+      .send({ phone, purpose: 'reset_password', email: 'second@example.com' })
+      .expect(201);
+    expect(row(firstId).invalidated_at).not.toBeNull();
+    await confirm(signup.verificationId, signupCode).expect(200);
+  });
+
+  it.each([
+    { phone, purpose: null },
+    { phone, purpose: 'change_phone' },
+    { phone, purpose: 'reset_password' },
+    { phone, purpose: 'reset_password', email: null },
+    { phone, purpose: 'reset_password', email: 'invalid' },
+    { phone, purpose: 'find_email', email: 'driver@example.com' },
+    { phone, email: 'driver@example.com' },
+    { phone, scopeUserId: randomUUID() },
+  ])('rejects mismatched public authentication inputs: %j', async (input) => {
+    await request(app.getHttpServer()).post(basePath).send(input).expect(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('signs one SMS request, stores only its HMAC and starts a 3-minute expiry after acceptance', async () => {
     const sent = await send(` ${phone} `);
     const code = sentCode();

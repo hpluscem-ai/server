@@ -1,10 +1,31 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsString, IsUUID, Matches } from 'class-validator';
+import {
+  IsEmail,
+  IsIn,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  ValidateIf,
+} from 'class-validator';
 
-export class SendPhoneVerificationRequestDto {
+export type PublicVerificationPurpose =
+  'sign_up' | 'find_email' | 'reset_password';
+
+class PublicVerificationPurposeDto {
+  @ApiPropertyOptional({
+    description: '인증 목적. 생략 시 기존 회원가입 계약을 유지합니다.',
+    enum: ['sign_up', 'find_email', 'reset_password'],
+    default: 'sign_up',
+  })
+  @IsIn(['sign_up', 'find_email', 'reset_password'])
+  purpose: PublicVerificationPurpose = 'sign_up';
+}
+
+export class SendPhoneVerificationRequestDto extends PublicVerificationPurposeDto {
   @ApiProperty({
-    description: '회원가입 인증번호를 받을 휴대폰 번호',
+    description: '인증번호를 받을 휴대폰 번호',
     example: '010-1234-5678',
   })
   @Transform(({ value }: { value: unknown }) =>
@@ -13,6 +34,19 @@ export class SendPhoneVerificationRequestDto {
   @IsString()
   @Matches(/^010-\d{4}-\d{4}$/)
   phone!: string;
+
+  @ApiPropertyOptional({
+    description:
+      '비밀번호 찾기 목적에서만 반드시 필요한 이메일. 다른 목적에서는 보내지 않습니다.',
+  })
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value,
+  )
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsString()
+  @IsEmail()
+  @MaxLength(254)
+  email?: string;
 }
 
 export class PhoneVerificationParamsDto {
@@ -24,7 +58,7 @@ export class PhoneVerificationParamsDto {
   verificationId!: string;
 }
 
-export class ConfirmPhoneVerificationRequestDto {
+export class ConfirmPhoneVerificationRequestDto extends PublicVerificationPurposeDto {
   @ApiProperty({ description: '문자로 받은 6자리 인증번호', example: '012345' })
   @IsString()
   @Matches(/^\d{6}$/)
@@ -46,7 +80,10 @@ export class SendPhoneVerificationResponseDto {
 }
 
 export class ConfirmPhoneVerificationResponseDto {
-  @ApiProperty({ description: '회원가입에 한 번만 사용할 휴대폰 인증 증명' })
+  @ApiProperty({
+    description:
+      '발송 목적과 입력 범위에 묶인 일회용 휴대폰 인증 증명. 이메일 찾기 결과·재설정 메일 발송은 아직 제공하지 않습니다.',
+  })
   verificationProof!: string;
 
   @ApiProperty({

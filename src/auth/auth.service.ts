@@ -30,6 +30,8 @@ import {
 } from './auth.repository';
 import {
   ConfirmPhoneVerificationResponseDto,
+  PublicVerificationPurpose,
+  SendPhoneVerificationRequestDto,
   SendPhoneVerificationResponseDto,
 } from './phone-verification.dto';
 import { SolapiSmsService } from './solapi-sms.service';
@@ -152,16 +154,33 @@ export class AuthService {
   }
 
   async sendPhoneVerification(
-    phone: string,
+    input: SendPhoneVerificationRequestDto,
   ): Promise<SendPhoneVerificationResponseDto> {
+    const { phone, purpose, email } = input;
+    if (
+      purpose === 'reset_password' ? email === undefined : email !== undefined
+    ) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: '비밀번호 찾기 목적에서만 이메일을 함께 입력해 주세요.',
+      });
+    }
     const verificationId = randomUUID();
     const code = randomInt(1_000_000).toString().padStart(6, '0');
-    const codeHash = this.hashVerificationCode(verificationId, code);
+    const codeHash = this.hashVerificationCode(verificationId, code, purpose);
 
-    this.authRepository.beginPhoneVerification(verificationId, phone, codeHash);
+    this.authRepository.beginPhoneVerification(
+      verificationId,
+      phone,
+      codeHash,
+      purpose,
+      email,
+    );
     await this.smsService.sendVerificationCode(phone, code);
-    const expiresAt =
-      this.authRepository.activatePhoneVerification(verificationId);
+    const expiresAt = this.authRepository.activatePhoneVerification(
+      verificationId,
+      purpose,
+    );
 
     if (!expiresAt) {
       throw new ConflictException({
@@ -177,10 +196,13 @@ export class AuthService {
   confirmPhoneVerification(
     verificationId: string,
     code: string,
+    purpose: PublicVerificationPurpose,
   ): ConfirmPhoneVerificationResponseDto {
-    const codeHash = this.hashVerificationCode(verificationId, code);
-    const pending =
-      this.authRepository.findPendingPhoneVerification(verificationId);
+    const codeHash = this.hashVerificationCode(verificationId, code, purpose);
+    const pending = this.authRepository.findPendingPhoneVerification(
+      verificationId,
+      purpose,
+    );
 
     if (!pending) {
       this.throwPhoneVerificationInvalid();
@@ -205,6 +227,7 @@ export class AuthService {
     const expiresAt = this.authRepository.confirmPhoneVerification(
       verificationId,
       proofHash,
+      purpose,
     );
 
     if (!expiresAt) {
@@ -285,7 +308,11 @@ export class AuthService {
     }
   }
 
-  private hashVerificationCode(verificationId: string, code: string): string {
+  private hashVerificationCode(
+    verificationId: string,
+    code: string,
+    purpose: PublicVerificationPurpose,
+  ): string {
     const secret = process.env.PHONE_VERIFICATION_SECRET?.trim();
     if (!secret || Buffer.byteLength(secret) < 32) {
       throw new ServiceUnavailableException({
@@ -295,7 +322,7 @@ export class AuthService {
     }
 
     return createHmac('sha256', secret)
-      .update(`sign_up:${verificationId}:${code}`)
+      .update(`${purpose}:${verificationId}:${code}`)
       .digest('hex');
   }
 
