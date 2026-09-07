@@ -83,3 +83,16 @@ export const phoneVerifications = sqliteTable('phone_verifications', {
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const passwordResetTokens = sqliteTable('password_reset_tokens', {
+  id: text('id').primaryKey(),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: text('expires_at').notNull(),
+  usedAt: text('used_at'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});

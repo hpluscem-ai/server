@@ -7,6 +7,7 @@ import {
   authSessions,
   logisticsCompanies,
   phoneVerifications,
+  passwordResetTokens,
   users,
 } from '../database/schema';
 
@@ -97,6 +98,76 @@ export class AuthRepository {
       transaction
         .delete(authSessions)
         .where(eq(authSessions.userId, session.userId))
+        .run();
+      transaction
+        .update(passwordResetTokens)
+        .set({ usedAt: sql`CURRENT_TIMESTAMP` })
+        .where(
+          and(
+            eq(passwordResetTokens.userId, session.userId),
+            isNull(passwordResetTokens.usedAt),
+          ),
+        )
+        .run();
+      return true;
+    });
+  }
+
+  findPasswordReset(tokenHash: string) {
+    return this.database.db
+      .select({ userId: users.id, passwordHash: users.passwordHash })
+      .from(passwordResetTokens)
+      .innerJoin(users, eq(passwordResetTokens.userId, users.id))
+      .innerJoin(
+        logisticsCompanies,
+        eq(users.logisticsCompanyId, logisticsCompanies.id),
+      )
+      .where(validPasswordReset(tokenHash))
+      .get();
+  }
+
+  resetDriverPassword(
+    tokenHash: string,
+    previousPasswordHash: string,
+    passwordHash: string,
+  ): boolean {
+    return this.database.db.transaction((transaction) => {
+      // 해시 생성 중 토큰 소비·만료 또는 계정 자격/비밀번호 변경을 다시 검사한다.
+      const user = transaction
+        .select({ id: users.id })
+        .from(passwordResetTokens)
+        .innerJoin(users, eq(passwordResetTokens.userId, users.id))
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            validPasswordReset(tokenHash),
+            eq(users.passwordHash, previousPasswordHash),
+          ),
+        )
+        .get();
+      if (!user) return false;
+      transaction
+        .update(users)
+        .set({ passwordHash, updatedAt: sql`CURRENT_TIMESTAMP` })
+        .where(eq(users.id, user.id))
+        .run();
+      // 이전 비밀번호에 대한 다른 미사용 링크도 재사용할 수 없게 함께 소비한다.
+      transaction
+        .update(passwordResetTokens)
+        .set({ usedAt: sql`CURRENT_TIMESTAMP` })
+        .where(
+          and(
+            eq(passwordResetTokens.userId, user.id),
+            isNull(passwordResetTokens.usedAt),
+          ),
+        )
+        .run();
+      transaction
+        .delete(authSessions)
+        .where(eq(authSessions.userId, user.id))
         .run();
       return true;
     });
@@ -429,6 +500,17 @@ function validDriverSession(tokenHash: string, now: Date, idleCutoff: Date) {
     eq(authSessions.tokenHash, tokenHash),
     gt(authSessions.expiresAt, now),
     gt(authSessions.lastUsedAt, idleCutoff),
+    eq(users.role, 'driver'),
+    isNull(users.deactivatedAt),
+    eq(logisticsCompanies.active, true),
+  );
+}
+
+function validPasswordReset(tokenHash: string) {
+  return and(
+    eq(passwordResetTokens.tokenHash, tokenHash),
+    isNull(passwordResetTokens.usedAt),
+    gt(sql`julianday(${passwordResetTokens.expiresAt})`, sql`julianday('now')`),
     eq(users.role, 'driver'),
     isNull(users.deactivatedAt),
     eq(logisticsCompanies.active, true),

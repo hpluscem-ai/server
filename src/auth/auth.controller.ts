@@ -35,6 +35,7 @@ import {
 import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import { AuthService } from './auth.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
+import { ResetPasswordRequestDto } from './reset-password.dto';
 import {
   ConfirmPhoneVerificationRequestDto,
   ConfirmPhoneVerificationResponseDto,
@@ -177,6 +178,29 @@ export class AuthController {
     @Body() input: SendPhoneVerificationRequestDto,
   ): Promise<SendPhoneVerificationResponseDto> {
     return this.authService.sendPhoneVerification(input);
+  }
+
+  @Post('reset-password')
+  @HttpCode(204)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: '일회용 토큰으로 기사 비밀번호 재설정',
+    description:
+      'DB에 저장된 유효한 토큰을 소비하고 새 Argon2id 비밀번호·본인 전체 세션 폐기·다른 기존 링크 무효화를 원자적으로 처리합니다. 토큰 발급·메일 전송은 미제공이며, 토큰 유효기간을 임의로 정하지 않고 저장된 만료 시각을 검증합니다. 회원가입·SMS 인증 증명과 기사/관리자 세션 토큰은 사용할 수 없습니다.',
+  })
+  @ApiNoContentResponse({
+    description: '비밀번호 재설정·기존 링크 무효화·전체 세션 폐기 완료',
+  })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR | PASSWORD_RESET_INVALID',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  resetPassword(@Body() input: ResetPasswordRequestDto): Promise<void> {
+    return this.authService.resetPassword(input);
   }
 
   @Post('phone-verifications/:verificationId/confirm')

@@ -36,6 +36,7 @@ import {
 } from './phone-verification.dto';
 import { SolapiSmsService } from './solapi-sms.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
+import { ResetPasswordRequestDto } from './reset-password.dto';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -150,6 +151,31 @@ export class AuthService {
     throw new UnauthorizedException({
       code: 'INVALID_SESSION',
       message: '로그인이 만료되었거나 유효하지 않습니다. 다시 로그인해 주세요.',
+    });
+  }
+
+  async resetPassword(input: ResetPasswordRequestDto): Promise<void> {
+    const tokenHash = createHash('sha256').update(input.token).digest('hex');
+    const user = this.authRepository.findPasswordReset(tokenHash);
+    if (!user) this.throwPasswordResetInvalid();
+    const passwordHash = await argon2.hash(input.newPassword, {
+      type: argon2.argon2id,
+    });
+    if (
+      !this.authRepository.resetDriverPassword(
+        tokenHash,
+        user.passwordHash,
+        passwordHash,
+      )
+    ) {
+      this.throwPasswordResetInvalid();
+    }
+  }
+
+  private throwPasswordResetInvalid(): never {
+    throw new BadRequestException({
+      code: 'PASSWORD_RESET_INVALID',
+      message: '비밀번호 재설정 링크가 만료되었거나 유효하지 않습니다.',
     });
   }
 

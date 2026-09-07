@@ -118,6 +118,257 @@ describe('Driver password change (e2e)', () => {
       .set('Authorization', `Bearer ${authToken}`);
   }
 
+  describe('one-use reset token consumer', () => {
+    const resetPath = '/api/v1/auth/reset-password';
+    function seedReset(forUser = userId) {
+      const value = randomBytes(32).toString('base64url');
+      database.connection
+        .prepare(
+          `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+        VALUES (?, ?, ?, datetime('now', '+1 minute'))`,
+        )
+        .run(
+          randomUUID(),
+          forUser,
+          createHash('sha256').update(value).digest('hex'),
+        );
+      return value;
+    }
+    function reset(value: unknown, password = NEXT) {
+      return request(app.getHttpServer())
+        .post(resetPath)
+        .send({ token: value, newPassword: password });
+    }
+    function unused() {
+      return database.connection
+        .prepare(
+          'SELECT COUNT(*) AS count FROM password_reset_tokens WHERE used_at IS NULL',
+        )
+        .get();
+    }
+
+    it('atomically changes the password, consumes own links and revokes all own sessions', async () => {
+      const link = seedReset();
+      const secondLink = seedReset();
+      const secondSession = seedSession(userId);
+      const other = seedDriver('010-9999-8888');
+      const otherSession = seedSession(other);
+      const otherLink = seedReset(other);
+      await reset(link)
+        .expect(204)
+        .expect('')
+        .expect('Cache-Control', 'no-store');
+      expect(savedPassword()).toMatch(/^\$argon2id\$/);
+      expect(await argon2.verify(savedPassword(), NEXT)).toBe(true);
+      await me(token).expect(401);
+      await me(secondSession).expect(401);
+      await me(otherSession).expect(200);
+      await reset(link).expect(400);
+      await reset(secondLink).expect(400);
+      expect(unused()).toEqual({ count: 1 });
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/login')
+        .send({ email: `${userId}@example.com`, password: NEXT })
+        .expect(200);
+      await reset(otherLink).expect(204);
+    });
+
+    it('invalidates existing reset links when a logged-in password change succeeds', async () => {
+      const link = seedReset();
+      await change().expect(204);
+      expect(unused()).toEqual({ count: 0 });
+      await reset(link).expect(400);
+    });
+
+    it.each([null, '', 'invalid', 123, 'a'.repeat(43)])(
+      'rejects malformed or unknown tokens: %p',
+      async (value) => {
+        await reset(value).expect(400);
+        expect(savedPassword()).toBe(oldHash);
+        await me(token).expect(200);
+      },
+    );
+
+    it('rejects invalid new passwords and client-selected user identities without consuming the token', async () => {
+      const link = seedReset();
+      await reset(link, 'short').expect(400);
+      await request(app.getHttpServer())
+        .post(resetPath)
+        .send({ token: link, newPassword: NEXT, userId })
+        .expect(400);
+      expect(unused()).toEqual({ count: 1 });
+    });
+
+    it.each(['expired', 'used', 'admin', 'deactivated', 'company'])(
+      'rejects unavailable %s tokens or accounts',
+      async (state) => {
+        const link = seedReset();
+        if (state === 'expired')
+          database.connection.exec(
+            'UPDATE password_reset_tokens SET expires_at = CURRENT_TIMESTAMP',
+          );
+        if (state === 'used')
+          database.connection.exec(
+            'UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP',
+          );
+        if (state === 'admin')
+          database.db.update(users).set({ role: 'admin' }).run();
+        if (state === 'deactivated')
+          database.db
+            .update(users)
+            .set({ deactivatedAt: '2026-09-08 00:00:00' })
+            .run();
+        if (state === 'company')
+          database.db.update(logisticsCompanies).set({ active: false }).run();
+        await reset(link)
+          .expect(400)
+          .expect(({ body }: { body: { code: string } }) =>
+            expect(body.code).toBe('PASSWORD_RESET_INVALID'),
+          );
+        expect(savedPassword()).toBe(oldHash);
+      },
+    );
+
+    it.each([false, true])(
+      'allows only one concurrent token consumption (different links: %s)',
+      async (different) => {
+        const link = seedReset();
+        const responses = await Promise.all([
+          reset(link),
+          reset(different ? seedReset() : link, 'OtherPassword!3'),
+        ]);
+        expect(responses.map(({ status }) => status).sort()).toEqual([
+          204, 400,
+        ]);
+        expect(unused()).toEqual({ count: 0 });
+        expect(
+          await argon2.verify(
+            savedPassword(),
+            responses[0].status === 204 ? NEXT : 'OtherPassword!3',
+          ),
+        ).toBe(true);
+      },
+    );
+
+    it.each(['expired', 'used', 'admin', 'deactivated', 'company', 'password'])(
+      'rechecks %s during reset hashing',
+      async (state) => {
+        const link = seedReset();
+        const repository = app.get(AuthRepository);
+        const find = repository.findPasswordReset.bind(repository);
+        jest
+          .spyOn(repository, 'findPasswordReset')
+          .mockImplementationOnce((hash) => {
+            const snapshot = find(hash);
+            if (state === 'expired')
+              database.connection.exec(
+                'UPDATE password_reset_tokens SET expires_at = CURRENT_TIMESTAMP',
+              );
+            if (state === 'used')
+              database.connection.exec(
+                'UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP',
+              );
+            if (state === 'admin')
+              database.db.update(users).set({ role: 'admin' }).run();
+            if (state === 'deactivated')
+              database.db
+                .update(users)
+                .set({ deactivatedAt: '2026-09-08 00:00:00' })
+                .run();
+            if (state === 'company')
+              database.db
+                .update(logisticsCompanies)
+                .set({ active: false })
+                .run();
+            if (state === 'password')
+              database.db
+                .update(users)
+                .set({ passwordHash: 'concurrently-changed' })
+                .run();
+            return snapshot;
+          });
+        await reset(link)
+          .expect(400)
+          .expect(({ body }: { body: { code: string } }) =>
+            expect(body.code).toBe('PASSWORD_RESET_INVALID'),
+          );
+        expect(savedPassword()).toBe(
+          state === 'password' ? 'concurrently-changed' : oldHash,
+        );
+        expect(database.db.select().from(authSessions).all()).toHaveLength(1);
+      },
+    );
+
+    it('does not accept a session as a reset token or consume a link on hashing failure', async () => {
+      await reset(token).expect(400);
+      const link = seedReset();
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      jest
+        .spyOn(jest.requireActual<typeof argon2>('argon2'), 'hash')
+        .mockRejectedValueOnce(new Error('hash unavailable'));
+      await reset(link).expect(500);
+      expect(unused()).toEqual({ count: 1 });
+      expect(savedPassword()).toBe(oldHash);
+      await me(token).expect(200);
+    });
+
+    it('rolls back logged-in password change if existing link invalidation fails', async () => {
+      seedReset();
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      database.connection.exec(
+        "CREATE TRIGGER fail_password_change AFTER UPDATE ON password_reset_tokens BEGIN SELECT RAISE(FAIL, 'private-failure'); END;",
+      );
+      await change().expect(500);
+      expect(unused()).toEqual({ count: 1 });
+      expect(savedPassword()).toBe(oldHash);
+      await me(token).expect(200);
+    });
+
+    it.each(['password-write', 'token-consume', 'session-delete'])(
+      'rolls everything back on %s failure',
+      async (point) => {
+        const link = seedReset();
+        seedSession(userId);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        const operation =
+          point === 'password-write'
+            ? 'AFTER UPDATE OF password_hash ON users'
+            : point === 'token-consume'
+              ? 'AFTER UPDATE ON password_reset_tokens'
+              : 'AFTER DELETE ON auth_sessions';
+        database.connection.exec(
+          `CREATE TRIGGER fail_password_change ${operation} BEGIN SELECT RAISE(FAIL, 'private-failure'); END;`,
+        );
+        await reset(link).expect(500);
+        expect(savedPassword()).toBe(oldHash);
+        expect(unused()).toEqual({ count: 1 });
+        expect(database.db.select().from(authSessions).all()).toHaveLength(2);
+        expect(JSON.stringify(log.mock.calls)).not.toContain(link);
+        expect(JSON.stringify(log.mock.calls)).not.toContain(NEXT);
+      },
+    );
+
+    it('documents the partial consumer without pretending to issue reset emails', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/docs-json')
+        .expect(200);
+      const document = response.body as OpenAPIObject;
+      const operation = document.paths[resetPath]?.post;
+      for (const code of ['204', '400', '500'])
+        expect(operation?.responses[code]).toBeDefined();
+      expect(operation?.description).toContain('미제공');
+      const schema = document.components?.schemas?.ResetPasswordRequestDto;
+      expect(
+        schema && 'properties' in schema && schema.properties,
+      ).toMatchObject({
+        token: { writeOnly: true },
+        newPassword: { writeOnly: true },
+      });
+    });
+  });
+
   it('saves Argon2id, preserves password whitespace, revokes all own sessions, and allows only the new password', async () => {
     const second = seedSession(userId);
     const otherId = seedDriver('010-9999-8888');
