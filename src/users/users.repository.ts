@@ -1,8 +1,9 @@
 import { Injectable } from '@nestjs/common';
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, lt, sql } from 'drizzle-orm';
 
 import { DatabaseService } from '../database/database.service';
 import { logisticsCompanies, users } from '../database/schema';
+import { AdminDriverListQueryDto } from './admin-driver.dto';
 
 const profileFields = {
   email: users.email,
@@ -16,6 +17,52 @@ type ProfileChanges = { name?: string; marketingConsent?: boolean };
 @Injectable()
 export class UsersRepository {
   constructor(private readonly database: DatabaseService) {}
+
+  findDrivers(query: AdminDriverListQueryDto) {
+    const rows = this.database.db
+      .select({
+        id: users.id,
+        logisticsCompanyId: logisticsCompanies.id,
+        logisticsCompanyName: logisticsCompanies.businessName,
+        name: users.name,
+        phone: users.phone,
+        email: users.email,
+        joinedAt: users.createdAt,
+      })
+      .from(users)
+      .innerJoin(
+        logisticsCompanies,
+        eq(users.logisticsCompanyId, logisticsCompanies.id),
+      )
+      .where(
+        and(
+          eq(users.role, 'driver'),
+          isNull(users.deactivatedAt),
+          query.logisticsCompanyId
+            ? eq(users.logisticsCompanyId, query.logisticsCompanyId)
+            : undefined,
+          query.createdFrom
+            ? gte(
+                sql`julianday(${users.createdAt})`,
+                sql`julianday(${query.createdFrom})`,
+              )
+            : undefined,
+          query.createdBefore
+            ? lt(
+                sql`julianday(${users.createdAt})`,
+                sql`julianday(${query.createdBefore})`,
+              )
+            : undefined,
+        ),
+      )
+      .orderBy(desc(users.createdAt), asc(users.id))
+      .all();
+    // ponytail: Unicode contains search scans the selected rows; add indexed search when volume warrants it.
+    const name = query.nameQuery?.toLocaleLowerCase('ko-KR');
+    return name
+      ? rows.filter((row) => row.name.toLocaleLowerCase('ko-KR').includes(name))
+      : rows;
+  }
 
   findProfile(userId: string) {
     return this.database.db

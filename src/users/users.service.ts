@@ -9,10 +9,58 @@ import {
   UpdateDriverProfileDto,
 } from './driver-profile.dto';
 import { UsersRepository } from './users.repository';
+import {
+  AdminDriverListQueryDto,
+  AdminDriverResponseDto,
+} from './admin-driver.dto';
 
 @Injectable()
 export class UsersService {
   constructor(private readonly users: UsersRepository) {}
+
+  findDrivers(query: AdminDriverListQueryDto): AdminDriverResponseDto[] {
+    const from =
+      query.createdFrom === undefined
+        ? undefined
+        : Date.parse(query.createdFrom);
+    const before =
+      query.createdBefore === undefined
+        ? undefined
+        : Date.parse(query.createdBefore);
+    if (
+      [from, before].some(
+        (value) => value !== undefined && !Number.isFinite(value),
+      )
+    ) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: '유효한 조회 시각을 입력해 주세요.',
+      });
+    }
+    if (from !== undefined && before !== undefined && from >= before) {
+      throw new BadRequestException({
+        code: 'INVALID_DATE_RANGE',
+        message: '조회 시작 시각은 끝 시각보다 빨라야 합니다.',
+      });
+    }
+    return this.users
+      .findDrivers({
+        ...query,
+        createdFrom:
+          from === undefined ? undefined : new Date(from).toISOString(),
+        createdBefore:
+          before === undefined ? undefined : new Date(before).toISOString(),
+      })
+      .map((row) => {
+        if (row.phone === null)
+          throw new Error('Driver phone invariant violated');
+        return {
+          ...row,
+          phone: row.phone,
+          joinedAt: `${row.joinedAt.replace(' ', 'T')}Z`,
+        };
+      });
+  }
 
   findProfile(userId: string): DriverProfileResponseDto {
     return this.requireProfile(this.users.findProfile(userId));

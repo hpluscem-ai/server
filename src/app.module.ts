@@ -8,7 +8,12 @@ import {
   SolapiSmsService,
 } from './auth';
 import { DatabaseService } from './database/database.service';
-import { UsersController, UsersRepository, UsersService } from './users';
+import {
+  AdminDriversController,
+  UsersController,
+  UsersRepository,
+  UsersService,
+} from './users';
 import {
   AdminAuthController,
   AdminAuthRepository,
@@ -29,6 +34,7 @@ import {
     SignupLogisticsCompaniesController,
     AuthController,
     UsersController,
+    AdminDriversController,
     AdminAuthController,
   ],
   providers: [
