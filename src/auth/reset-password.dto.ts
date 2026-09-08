@@ -1,7 +1,29 @@
-import { ApiProperty, PickType } from '@nestjs/swagger';
+import { ApiProperty, IntersectionType, PickType } from '@nestjs/swagger';
 import { IsString, Matches } from 'class-validator';
 
 import { ChangePasswordRequestDto } from './change-password.dto';
+import { FindEmailRequestDto } from './find-email.dto';
+import { SignUpRequestDto } from './auth-signup.dto';
+
+export class RequestPasswordResetEmailDto extends IntersectionType(
+  FindEmailRequestDto,
+  PickType(SignUpRequestDto, ['email'] as const),
+) {}
+
+export class PasswordResetEmailResponseDto {
+  @ApiProperty({
+    description:
+      '계정 존재 여부를 노출하지 않는 공통 접수 안내. 메일 배달 완료를 보장하지 않습니다.',
+  })
+  message!: string;
+}
+
+export class MyPasswordResetEmailResponseDto {
+  @ApiProperty({
+    description: 'SMS 재인증 후 재설정 메일 발송이 접수된 본인의 이메일',
+  })
+  email!: string;
+}
 
 export class ResetPasswordRequestDto extends PickType(
   ChangePasswordRequestDto,

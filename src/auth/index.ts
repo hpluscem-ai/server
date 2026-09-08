@@ -6,5 +6,6 @@ export {
   type AuthenticatedRequest,
 } from './auth-session.guard';
 export { SolapiSmsService } from './solapi-sms.service';
+export { PostmarkEmailService } from './postmark-email.service';
 export { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
 export { MISSING_USER_PASSWORD_HASH } from './password.constants';

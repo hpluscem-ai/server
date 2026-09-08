@@ -37,7 +37,11 @@ import {
 } from './phone-verification.dto';
 import { SolapiSmsService } from './solapi-sms.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
-import { ResetPasswordRequestDto } from './reset-password.dto';
+import {
+  RequestPasswordResetEmailDto,
+  ResetPasswordRequestDto,
+} from './reset-password.dto';
+import { PostmarkEmailService } from './postmark-email.service';
 import { MISSING_USER_PASSWORD_HASH } from './password.constants';
 import { ChangePhoneRequestDto } from './change-phone.dto';
 import { FindEmailRequestDto, FindEmailResponseDto } from './find-email.dto';
@@ -58,6 +62,7 @@ export class AuthService {
   constructor(
     private readonly authRepository: AuthRepository,
     private readonly smsService: SolapiSmsService,
+    private readonly emailService: PostmarkEmailService,
   ) {}
 
   async login(input: LoginRequestDto): Promise<LoginResponseDto> {
@@ -196,6 +201,58 @@ export class AuthService {
     ) {
       this.throwPasswordResetInvalid();
     }
+  }
+
+  async requestPasswordResetEmail(
+    input: RequestPasswordResetEmailDto,
+    session?: AuthenticatedSession,
+  ): Promise<void> {
+    const configuration = this.emailService.getResetConfiguration();
+    let recipient: ReturnType<AuthRepository['claimPasswordResetEmail']>;
+    try {
+      recipient = this.authRepository.claimPasswordResetEmail(
+        session?.user.email ?? input.email,
+        input.phone,
+        createHash('sha256').update(input.verificationProof).digest('hex'),
+        this.resetEmailSession(session),
+      );
+    } catch (error) {
+      if (error instanceof LoginUnavailableError) this.throwSessionInvalid();
+      this.throwIfDomainError(error);
+      throw error;
+    }
+    if (!recipient) return;
+    const token = randomBytes(32).toString('base64url');
+    await this.emailService.sendPasswordReset(
+      configuration,
+      recipient.email,
+      token,
+    );
+    if (
+      !this.authRepository.activatePasswordResetEmail(
+        recipient,
+        createHash('sha256').update(token).digest('hex'),
+        randomUUID(),
+        this.resetEmailSession(session),
+      )
+    ) {
+      throw new BadRequestException({
+        code: 'PASSWORD_RESET_REQUEST_INVALID',
+        message:
+          '계정 정보나 로그인 상태가 변경되었습니다. 휴대폰 인증 후 다시 요청해 주세요.',
+      });
+    }
+  }
+
+  private resetEmailSession(session?: AuthenticatedSession) {
+    if (!session) return undefined;
+    const now = new Date(Date.now());
+    return {
+      userId: session.user.id,
+      tokenHash: session.tokenHash,
+      now,
+      idleCutoff: new Date(now.getTime() - SESSION_IDLE_TIMEOUT_MS),
+    };
   }
 
   private throwPasswordResetInvalid(): never {

@@ -350,7 +350,7 @@ describe('Driver password change (e2e)', () => {
       },
     );
 
-    it('documents the partial consumer without pretending to issue reset emails', async () => {
+    it('documents the consumer and the separately implemented email issuer', async () => {
       const response = await request(app.getHttpServer())
         .get('/docs-json')
         .expect(200);
@@ -358,7 +358,10 @@ describe('Driver password change (e2e)', () => {
       const operation = document.paths[resetPath]?.post;
       for (const code of ['204', '400', '500'])
         expect(operation?.responses[code]).toBeDefined();
-      expect(operation?.description).toContain('미제공');
+      expect(operation?.description).toContain('30분');
+      expect(
+        document.paths['/api/v1/auth/password-reset-emails']?.post,
+      ).toBeDefined();
       const schema = document.components?.schemas?.ResetPasswordRequestDto;
       expect(
         schema && 'properties' in schema && schema.properties,

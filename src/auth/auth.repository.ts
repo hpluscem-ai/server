@@ -38,6 +38,20 @@ type CreateLoginSessionInput = {
   expiresAt: Date;
 };
 
+type ResetEmailSession = {
+  userId: string;
+  tokenHash: string;
+  now: Date;
+  idleCutoff: Date;
+};
+
+type ResetEmailRecipient = {
+  id: string;
+  email: string;
+  phone: string;
+  passwordHash: string;
+};
+
 @Injectable()
 export class AuthRepository {
   constructor(private readonly database: DatabaseService) {}
@@ -124,6 +138,166 @@ export class AuthRepository {
       )
       .where(validPasswordReset(tokenHash))
       .get();
+  }
+
+  claimPasswordResetEmail(
+    email: string,
+    phone: string,
+    proofHash: string,
+    session?: ResetEmailSession,
+  ): ResetEmailRecipient | undefined {
+    return this.database.db.transaction(
+      (transaction) => {
+        const proof = transaction
+          .update(phoneVerifications)
+          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
+          .where(
+            and(
+              eq(phoneVerifications.purpose, 'reset_password'),
+              eq(phoneVerifications.scopeEmail, email.toLowerCase()),
+              eq(phoneVerifications.phone, phone),
+              eq(phoneVerifications.proofHash, proofHash),
+              isNull(phoneVerifications.scopeUserId),
+              isNotNull(phoneVerifications.verifiedAt),
+              isNull(phoneVerifications.consumedAt),
+              isNull(phoneVerifications.invalidatedAt),
+              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+            ),
+          )
+          .returning({ id: phoneVerifications.id })
+          .get();
+        if (!proof) throw new PhoneVerificationInvalidError();
+        const candidate = transaction
+          .select({
+            id: users.id,
+            email: users.email,
+            passwordHash: users.passwordHash,
+          })
+          .from(users)
+          .innerJoin(
+            logisticsCompanies,
+            eq(users.logisticsCompanyId, logisticsCompanies.id),
+          )
+          .where(
+            and(
+              eq(users.phone, phone),
+              eq(users.role, 'driver'),
+              isNull(users.deactivatedAt),
+              eq(logisticsCompanies.active, true),
+              session ? eq(users.id, session.userId) : undefined,
+            ),
+          )
+          .get();
+        // SMS와 같은 소문자 비교를 사용한다. SQLite NOCASE는 비ASCII 문자를 접지 못한다.
+        // 고유 연락처로 한 계정만 조회하며 발송·재검사용 이메일은 DB 원문을 보존한다.
+        const user =
+          candidate?.email.toLowerCase() === email.toLowerCase()
+            ? candidate
+            : undefined;
+        if (session) {
+          const validSession = transaction
+            .select({ id: users.id })
+            .from(authSessions)
+            .innerJoin(users, eq(authSessions.userId, users.id))
+            .innerJoin(
+              logisticsCompanies,
+              eq(users.logisticsCompanyId, logisticsCompanies.id),
+            )
+            .where(
+              and(
+                validDriverSession(
+                  session.tokenHash,
+                  session.now,
+                  session.idleCutoff,
+                ),
+                eq(users.id, session.userId),
+              ),
+            )
+            .get();
+          if (!validSession) throw new LoginUnavailableError();
+          if (!user) throw new PhoneVerificationInvalidError();
+        }
+        // 계정 불일치도 같은 접수 응답을 반환하지만 증명은 재사용할 수 없다.
+        return user ? { ...user, phone } : undefined;
+      },
+      { behavior: 'immediate' },
+    );
+  }
+
+  activatePasswordResetEmail(
+    recipient: ResetEmailRecipient,
+    tokenHash: string,
+    id: string,
+    session?: ResetEmailSession,
+  ): boolean {
+    return this.database.db.transaction(
+      (transaction) => {
+        const user = transaction
+          .select({ id: users.id })
+          .from(users)
+          .innerJoin(
+            logisticsCompanies,
+            eq(users.logisticsCompanyId, logisticsCompanies.id),
+          )
+          .where(
+            and(
+              eq(users.id, recipient.id),
+              eq(users.email, recipient.email),
+              eq(users.phone, recipient.phone),
+              eq(users.passwordHash, recipient.passwordHash),
+              eq(users.role, 'driver'),
+              isNull(users.deactivatedAt),
+              eq(logisticsCompanies.active, true),
+            ),
+          )
+          .get();
+        if (!user) return false;
+        if (session) {
+          const validSession = transaction
+            .select({ id: users.id })
+            .from(authSessions)
+            .innerJoin(users, eq(authSessions.userId, users.id))
+            .innerJoin(
+              logisticsCompanies,
+              eq(users.logisticsCompanyId, logisticsCompanies.id),
+            )
+            .where(
+              and(
+                validDriverSession(
+                  session.tokenHash,
+                  session.now,
+                  session.idleCutoff,
+                ),
+                eq(users.id, session.userId),
+              ),
+            )
+            .get();
+          if (!validSession || session.userId !== recipient.id) return false;
+        }
+        // 메일 ACK 전에 토큰을 저장하지 않는다. 새 저장 실패 시 기존 링크 무효화도 롤백된다.
+        transaction
+          .update(passwordResetTokens)
+          .set({ usedAt: sql`CURRENT_TIMESTAMP` })
+          .where(
+            and(
+              eq(passwordResetTokens.userId, user.id),
+              isNull(passwordResetTokens.usedAt),
+            ),
+          )
+          .run();
+        transaction
+          .insert(passwordResetTokens)
+          .values({
+            id,
+            userId: user.id,
+            tokenHash,
+            expiresAt: sql`datetime('now', '+30 minutes')`,
+          })
+          .run();
+        return true;
+      },
+      { behavior: 'immediate' },
+    );
   }
 
   resetDriverPassword(
