@@ -1,5 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, gte, lt, lte, or, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  lt,
+  lte,
+  or,
+  sql,
+} from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
 import { installationSites, installationSiteDevices } from '../database/schema';
@@ -15,10 +26,7 @@ export type StationRecord = typeof installationSites.$inferSelect & {
 };
 export class StationNotFoundError extends Error {}
 export class StationDevicesConflictError extends Error {
-  constructor(
-    readonly reason:
-      'UNKNOWN_DEVICE' | 'DUPLICATE_DEVICE_ID' | 'DEVICE_REMOVAL_NOT_SUPPORTED',
-  ) {
+  constructor(readonly reason: 'UNKNOWN_DEVICE' | 'DUPLICATE_DEVICE_ID') {
     super(reason);
   }
 }
@@ -144,6 +152,16 @@ export class StationsRepository {
     );
   }
 
+  remove(id: string): boolean {
+    // FK ON DELETE CASCADE removes only this station's devices in the same statement.
+    return (
+      this.database.db
+        .delete(installationSites)
+        .where(eq(installationSites.id, id))
+        .run().changes > 0
+    );
+  }
+
   update(id: string, input: UpdateStationDto): StationRecord {
     return this.database.db.transaction(
       (tx) => {
@@ -167,8 +185,9 @@ export class StationsRepository {
         const existingIds = new Set(existing.map((device) => device.id));
         if (submittedIds.some((deviceId) => !existingIds.has(deviceId)))
           throw new StationDevicesConflictError('UNKNOWN_DEVICE');
-        if (existing.some((device) => !uniqueIds.has(device.id)))
-          throw new StationDevicesConflictError('DEVICE_REMOVAL_NOT_SUPPORTED');
+        const removedIds = existing
+          .filter((device) => !uniqueIds.has(device.id))
+          .map((device) => device.id);
 
         const { devices: inputs, note, ...fields } = input;
         const locationChanged =
@@ -188,6 +207,16 @@ export class StationsRepository {
           .where(eq(installationSites.id, id))
           .returning()
           .get();
+        if (removedIds.length) {
+          tx.delete(installationSiteDevices)
+            .where(
+              and(
+                eq(installationSiteDevices.installationSiteId, id),
+                inArray(installationSiteDevices.id, removedIds),
+              ),
+            )
+            .run();
+        }
         const devices = inputs.map((device) =>
           device.id === undefined
             ? tx

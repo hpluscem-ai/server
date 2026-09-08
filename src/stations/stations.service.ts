@@ -27,13 +27,13 @@ export class StationsService {
   findAdminList(query: AdminStationListQueryDto): StationResponseDto[] {
     return this.stations
       .findAll({ ...query, ...normalizeDateRange(query) })
-      .map((station) => this.present(station, false));
+      .map((station) => this.present(station));
   }
 
   findAppList(): StationResponseDto[] {
     return this.stations
       .findAll({}, true)
-      .map((station) => this.present(station, true));
+      .map((station) => this.present(station));
   }
 
   findMap(bounds: StationBoundsQueryDto): StationResponseDto[] {
@@ -44,32 +44,28 @@ export class StationsService {
       });
     return this.stations
       .findAll({}, true, bounds)
-      .map((station) => this.present(station, true))
-      .filter((station) => station.coordinateVerified);
+      .map((station) => this.present(station));
   }
 
   findOne(id: string, appOnly: boolean): StationResponseDto {
     const station = this.stations.findOne(id, appOnly);
     if (!station) throw this.notFound();
-    return this.present(station, appOnly);
+    return this.present(station);
   }
 
   create(input: CreateStationDto): StationResponseDto {
-    return this.present(this.stations.create(input), false);
+    return this.present(this.stations.create(input));
   }
 
   update(id: string, input: UpdateStationDto): StationResponseDto {
     try {
-      return this.present(this.stations.update(id, input), false);
+      return this.present(this.stations.update(id, input));
     } catch (error) {
       if (error instanceof StationNotFoundError) throw this.notFound();
       if (error instanceof StationDevicesConflictError)
         throw new ConflictException({
           code: error.reason,
-          message:
-            error.reason === 'DEVICE_REMOVAL_NOT_SUPPORTED'
-              ? '기존 기기를 모두 포함해 주세요. 기기 제거는 아직 지원하지 않습니다.'
-              : '이 주유소의 기기 식별자를 중복 없이 입력해 주세요.',
+          message: '이 주유소의 기기 식별자를 중복 없이 입력해 주세요.',
         });
       throw error;
     }
@@ -82,10 +78,11 @@ export class StationsService {
     });
   }
 
-  private present(
-    station: StationRecord,
-    appOnly: boolean,
-  ): StationResponseDto {
+  remove(id: string): void {
+    if (!this.stations.remove(id)) throw this.notFound();
+  }
+
+  private present(station: StationRecord): StationResponseDto {
     const verifiedAt =
       station.coordinateVerifiedAt === null
         ? null
@@ -95,7 +92,6 @@ export class StationsService {
       station.longitude !== null &&
       Boolean(station.coordinateSource?.trim()) &&
       verifiedAt !== null;
-    const hideCoordinates = appOnly && !coordinateVerified;
     const createdAt = isoTimestamp(station.createdAt);
     const updatedAt = isoTimestamp(station.updatedAt);
     if (createdAt === null || updatedAt === null)
@@ -111,11 +107,11 @@ export class StationsService {
       active: station.active,
       createdAt,
       updatedAt,
-      latitude: hideCoordinates ? null : station.latitude,
-      longitude: hideCoordinates ? null : station.longitude,
+      latitude: station.latitude,
+      longitude: station.longitude,
       coordinateVerified,
-      coordinateSource: hideCoordinates ? null : station.coordinateSource,
-      coordinateVerifiedAt: hideCoordinates ? null : verifiedAt,
+      coordinateSource: station.coordinateSource,
+      coordinateVerifiedAt: verifiedAt,
       devices: station.devices.map(({ id, model, capacityLiters, active }) => ({
         id,
         model,

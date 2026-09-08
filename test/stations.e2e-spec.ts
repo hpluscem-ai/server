@@ -109,6 +109,11 @@ describe('Stations (e2e)', () => {
       .set('Authorization', auth)
       .send(body);
   }
+  function remove(id: string, auth = authorization) {
+    return request(app.getHttpServer())
+      .delete(`${ADMIN_PATH}/${id}`)
+      .set('Authorization', auth);
+  }
   function list(query: object = {}) {
     return request(app.getHttpServer())
       .get(ADMIN_PATH)
@@ -290,12 +295,11 @@ describe('Stations (e2e)', () => {
     },
   );
 
-  it('rejects missing, foreign and duplicate existing device ids without any mutation', async () => {
+  it('rejects foreign and duplicate existing device ids without any mutation', async () => {
     const station = await saved();
     const other = await saved({ ...input, businessName: '다른 주유소' });
     const before = snapshot();
     for (const [devices, code] of [
-      [[{ ...input.devices[0] }], 'DEVICE_REMOVAL_NOT_SUPPORTED'],
       [[{ ...input.devices[0], id: other.devices[0].id }], 'UNKNOWN_DEVICE'],
       [[{ ...input.devices[0], id: randomUUID() }], 'UNKNOWN_DEVICE'],
       [
@@ -387,7 +391,7 @@ describe('Stations (e2e)', () => {
     },
   );
 
-  it('keeps concurrent parent/device edits coherent and rejects implicit removal of a concurrently added device', async () => {
+  it('keeps concurrent full replacements of parent and devices coherent', async () => {
     const station = await saved();
     const responses = await Promise.all(
       ['A', 'B'].map((label) =>
@@ -414,9 +418,14 @@ describe('Stations (e2e)', () => {
       ),
     );
     expect(additions.map((response) => response.status).sort()).toEqual([
-      200, 409,
+      200, 200,
     ]);
     expect(snapshot().devices).toHaveLength(2);
+    const final = snapshot();
+    const addition = final.devices.find(
+      (device) => device.id !== station.devices[0].id,
+    )!;
+    expect(final.stations[0].business_name).toBe(addition.model);
   });
 
   it.each(['roadAddress', 'latitude', 'longitude'])(
@@ -438,7 +447,15 @@ describe('Stations (e2e)', () => {
       );
       expect(snapshot().stations[0].coordinate_source).toBeNull();
       expect(snapshot().stations[0].coordinate_verified_at).toBeNull();
-      await appGet(`${APP_PATH}/map`, bounds).expect(200).expect([]);
+      await appGet(`${APP_PATH}/map`, bounds)
+        .expect(200)
+        .expect(({ body }: { body: StationResponseDto[] }) => {
+          expect(body).toHaveLength(1);
+          expect(body[0].coordinateVerified).toBe(false);
+          expect(body[0].latitude).toBe(
+            field === 'latitude' ? changes.latitude : input.latitude,
+          );
+        });
     },
   );
 
@@ -511,7 +528,7 @@ describe('Stations (e2e)', () => {
       await list(query).expect(400);
   });
 
-  it('shows active unverified stations without usable app coordinates and groups all devices', async () => {
+  it('provides entered coordinates without marking them verified and groups all devices', async () => {
     const station = await saved({
       ...input,
       devices: [input.devices[0], { model: '두번째', capacityLiters: 4000 }],
@@ -525,12 +542,19 @@ describe('Stations (e2e)', () => {
           ? (response.body as StationResponseDto[])[0]
           : response.body
       ) as StationResponseDto;
-      expect(result.latitude).toBeNull();
-      expect(result.longitude).toBeNull();
+      expect(result.latitude).toBe(input.latitude);
+      expect(result.longitude).toBe(input.longitude);
       expect(result.coordinateVerified).toBe(false);
       expect(result.devices).toHaveLength(2);
     }
-    await appGet(`${APP_PATH}/map`, bounds).expect(200).expect([]);
+    await appGet(`${APP_PATH}/map`, bounds)
+      .expect(200)
+      .expect(({ body }: { body: StationResponseDto[] }) => {
+        expect(body).toHaveLength(1);
+        expect(body[0].coordinateVerified).toBe(false);
+        expect(body[0].coordinateSource).toBeNull();
+        expect(body[0].coordinateVerifiedAt).toBeNull();
+      });
     database.db
       .update(installationSites)
       .set({ latitude: null, longitude: null })
@@ -541,6 +565,7 @@ describe('Stations (e2e)', () => {
       .expect(({ body }: { body: StationResponseDto }) =>
         expect(body.coordinateVerified).toBe(false),
       );
+    await appGet(`${APP_PATH}/map`, bounds).expect(200).expect([]);
   });
 
   it('maps only active stations with trusted coordinates inside inclusive bounds', async () => {
@@ -590,12 +615,17 @@ describe('Stations (e2e)', () => {
         .set(changes)
         .where(eq(installationSites.id, station.id))
         .run();
-      await appGet(`${APP_PATH}/map`, bounds).expect(200).expect([]);
+      await appGet(`${APP_PATH}/map`, bounds)
+        .expect(200)
+        .expect(({ body }: { body: StationResponseDto[] }) => {
+          expect(body).toHaveLength(1);
+          expect(body[0].coordinateVerified).toBe(false);
+        });
       await appGet(`${APP_PATH}/${station.id}`)
         .expect(200)
         .expect(({ body }: { body: StationResponseDto }) => {
           expect(body.coordinateVerified).toBe(false);
-          expect(body.latitude).toBeNull();
+          expect(body.latitude).toBe(input.latitude);
         });
     },
   );
@@ -662,7 +692,7 @@ describe('Stations (e2e)', () => {
     await appGet().expect(401);
   });
 
-  it('returns missing-resource errors and exposes no deletion or standalone device mutation', async () => {
+  it('returns missing-resource errors and exposes no standalone device mutation', async () => {
     const missing = randomUUID();
     await update(missing, input).expect(404);
     await request(app.getHttpServer())
@@ -686,7 +716,6 @@ describe('Stations (e2e)', () => {
     const station = await saved();
     const before = snapshot();
     for (const path of [
-      `${ADMIN_PATH}/${station.id}`,
       `${ADMIN_PATH}/${station.id}/devices/${station.devices[0].id}`,
     ])
       await request(app.getHttpServer())
@@ -732,7 +761,14 @@ describe('Stations (e2e)', () => {
     expect(document.paths[`${APP_PATH}/map`]?.get?.description).toContain(
       '미제공',
     );
-    expect(document.paths[`${ADMIN_PATH}/{id}`]?.delete).toBeUndefined();
+    expect(document.paths[`${ADMIN_PATH}/{id}`]?.delete?.security).toEqual([
+      { admin: [] },
+    ]);
+    expect(
+      Object.keys(
+        document.paths[`${ADMIN_PATH}/{id}`].delete!.responses,
+      ).sort(),
+    ).toEqual(['204', '400', '401', '404', '500']);
     const invalidIdResponse =
       document.paths[`${ADMIN_PATH}/{id}`]?.put?.responses?.['400'];
     expect(
@@ -767,4 +803,123 @@ describe('Stations (e2e)', () => {
         );
     }
   });
+
+  it('hard-deletes only the selected station and all its devices', async () => {
+    const station = await saved({
+      ...input,
+      devices: [input.devices[0], { model: 'extra', capacityLiters: 100 }],
+    });
+    const other = await saved();
+    const originalUsers = database.db.select().from(users).all();
+    await remove(station.id).expect(204).expect('Cache-Control', 'no-store');
+    expect(snapshot().stations.map((row) => row.id)).toEqual([other.id]);
+    expect(snapshot().devices.map((row) => row.id)).toEqual(
+      other.devices.map((device) => device.id),
+    );
+    expect(database.db.select().from(users).all()).toEqual(originalUsers);
+    await remove(station.id).expect(404);
+    await request(app.getHttpServer())
+      .get(`${ADMIN_PATH}/${station.id}`)
+      .set('Authorization', authorization)
+      .expect(404);
+    await appGet(`${APP_PATH}/${station.id}`).expect(404);
+    await appGet(`${APP_PATH}/map`, bounds)
+      .expect(200)
+      .expect(({ body }: { body: StationResponseDto[] }) =>
+        expect(body.map((row) => row.id)).toEqual([other.id]),
+      );
+    expect(
+      database.connection.prepare('PRAGMA foreign_key_check').all(),
+    ).toEqual([]);
+  });
+
+  it('only permits admin deletion and validates IDs without modifying data', async () => {
+    const station = await saved();
+    const before = snapshot();
+    for (const auth of ['', driverAuthorization, 'Bearer expired'])
+      await remove(station.id, auth).expect(401);
+    await remove('invalid').expect(400);
+    await remove(randomUUID()).expect(404);
+    expect(snapshot()).toEqual(before);
+  });
+
+  it.each(['installation_sites', 'installation_site_devices'])(
+    'rolls back station cascade deletion when %s storage fails',
+    async (table) => {
+      const station = await saved({
+        ...input,
+        devices: [input.devices[0], { model: 'extra', capacityLiters: 100 }],
+      });
+      const before = snapshot();
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      database.connection.exec(
+        `CREATE TRIGGER fail_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, 'test-only failure'); END;`,
+      );
+      try {
+        await remove(station.id).expect(500);
+        expect(snapshot()).toEqual(before);
+      } finally {
+        database.connection.exec('DROP TRIGGER fail_delete');
+      }
+    },
+  );
+
+  it('allows only one simultaneous delete and no update can resurrect the station', async () => {
+    const station = await saved();
+    const results = await Promise.all([remove(station.id), remove(station.id)]);
+    expect(results.map((result) => result.status).sort()).toEqual([204, 404]);
+    await update(station.id, editBody(station)).expect(404);
+    expect(snapshot()).toEqual({ stations: [], devices: [] });
+  });
+
+  it('removes omitted devices within the full station update, preserving retained IDs and unrelated stations', async () => {
+    const station = await saved({
+      ...input,
+      devices: [input.devices[0], { model: 'remove', capacityLiters: 100 }],
+    });
+    const other = await saved();
+    const retained = station.devices[0];
+    const response = await update(station.id, {
+      ...editBody(station),
+      businessName: '변경',
+      devices: [
+        { id: retained.id, model: '유지', capacityLiters: 500 },
+        { model: '신규', capacityLiters: 800 },
+      ],
+    }).expect(200);
+    const result = response.body as StationResponseDto;
+    expect(result.devices).toHaveLength(2);
+    expect(result.devices[0].id).toBe(retained.id);
+    expect(
+      snapshot().devices.some((row) => row.id === station.devices[1].id),
+    ).toBe(false);
+    expect(
+      snapshot().devices.some((row) => row.id === other.devices[0].id),
+    ).toBe(true);
+    const before = snapshot();
+    await update(station.id, { ...editBody(result), devices: [] }).expect(400);
+    expect(snapshot()).toEqual(before);
+  });
+
+  it.each(['delete', 'insert'])(
+    'rolls back removed devices and parent changes when device %s fails',
+    async (operation) => {
+      const station = await saved();
+      const before = snapshot();
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      database.connection.exec(
+        `CREATE TRIGGER fail_replace BEFORE ${operation.toUpperCase()} ON installation_site_devices BEGIN SELECT RAISE(ABORT, 'test-only failure'); END;`,
+      );
+      try {
+        await update(station.id, {
+          ...input,
+          businessName: '실패',
+          devices: [{ model: 'replacement', capacityLiters: 100 }],
+        }).expect(500);
+        expect(snapshot()).toEqual(before);
+      } finally {
+        database.connection.exec('DROP TRIGGER fail_replace');
+      }
+    },
+  );
 });

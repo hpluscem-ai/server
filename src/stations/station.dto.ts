@@ -141,7 +141,7 @@ export class UpdateStationDto extends OmitType(CreateStationDto, [
 ] as const) {
   @ApiProperty({
     description:
-      '기존 기기 전체(ID 포함)와 추가 기기(ID 생략). 기존 기기 생략·제거는 미지원',
+      '저장할 기기 전체: 기존 기기는 ID 포함, 추가 기기는 ID 생략. 빠진 기존 기기는 실제 삭제. 최소 1개 필수',
     type: [UpdateStationDeviceDto],
     minItems: 1,
   })
@@ -179,14 +179,16 @@ export class StationResponseDto extends OmitType(CreateStationDto, [
   note!: string | null;
 
   @ApiProperty({
-    description: 'WGS84 위도. 기사 조회에서는 미검증 좌표를 null로 반환',
+    description:
+      '입력된 WGS84 위도. 별도 검수 없이 제공하며 실제 좌표가 없으면 null',
     type: Number,
     nullable: true,
   })
   latitude!: number | null;
 
   @ApiProperty({
-    description: 'WGS84 경도. 기사 조회에서는 미검증 좌표를 null로 반환',
+    description:
+      '입력된 WGS84 경도. 별도 검수 없이 제공하며 실제 좌표가 없으면 null',
     type: Number,
     nullable: true,
   })
