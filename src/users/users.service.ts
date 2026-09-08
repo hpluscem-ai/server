@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 
@@ -38,6 +39,15 @@ export class UsersService {
 
   findProfile(userId: string): DriverProfileResponseDto {
     return this.requireProfile(this.users.findProfile(userId));
+  }
+
+  withdrawDriver(userId: string): void {
+    if (!this.users.withdrawDriver(userId)) {
+      throw new NotFoundException({
+        code: 'DRIVER_NOT_FOUND',
+        message: '탈퇴 처리할 기사를 찾을 수 없습니다.',
+      });
+    }
   }
 
   updateProfile(

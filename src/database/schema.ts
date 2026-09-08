@@ -27,10 +27,10 @@ export const logisticsCompanies = sqliteTable('logistics_companies', {
 export const users = sqliteTable('users', {
   id: text('id').primaryKey(),
   role: text('role').notNull(),
-  email: text('email').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
+  email: text('email').notNull(),
+  passwordHash: text('password_hash'),
   name: text('name').notNull(),
-  phone: text('phone').unique(),
+  phone: text('phone'),
   logisticsCompanyId: text('logistics_company_id').references(
     () => logisticsCompanies.id,
     { onDelete: 'restrict' },

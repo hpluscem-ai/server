@@ -43,7 +43,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 4 });
+    ).toEqual({ user_version: 5 });
 
     expect(() => {
       databaseService.connection
@@ -411,7 +411,7 @@ describe('DatabaseService', () => {
 
       const originalSchema = connection
         .prepare(
-          "SELECT type, name, sql FROM sqlite_schema WHERE NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
+          "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name <> 'users' AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
         )
         .all();
       const tables = [
@@ -436,12 +436,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 4,
+        user_version: 5,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -575,7 +575,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 4 });
+          ).toEqual({ user_version: 5 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -605,13 +605,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 5;');
+    newerDatabase.exec('PRAGMA user_version = 6;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 5 is newer than supported version 4',
+        'Database schema version 6 is newer than supported version 5',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -629,6 +629,121 @@ describe('DatabaseService', () => {
       rmSync(temporaryDirectory, { force: true, recursive: true });
     }
   });
+
+  it.each([false, true])(
+    'preserves v4 data and references when rebuilding users (failure: %s)',
+    (fail) => {
+      const directory = mkdtempSync(
+        join(tmpdir(), 'hpluseco-withdrawal-migration-'),
+      );
+      const path = join(directory, 'version-4.sqlite');
+      let connection: DatabaseSync | undefined = new DatabaseSync(path);
+      let upgraded: DatabaseService | undefined;
+      try {
+        for (const file of [
+          'schema.sql',
+          '002-auth-sessions.sql',
+          '003-admin-sessions.sql',
+          '004-phone-verification-owner.sql',
+        ])
+          connection.exec(readFileSync(join(__dirname, file), 'utf8'));
+        connection.exec(`
+        INSERT INTO logistics_companies (id, business_name, business_number, corporate_registration_number,
+          business_address, manager_name, manager_phone, bank_code, account_number, account_holder)
+        VALUES ('company', '기존 물류', '123', '456', '서울시', '담당자', '010-0000-0000', '19', '1234', '물류');
+        INSERT INTO users (id, role, email, password_hash, name, phone, logistics_company_id, service_terms_consent, privacy_terms_consent)
+        VALUES ('driver', 'driver', 'Existing@Example.com', 'existing-hash', '기존 기사', '010-1234-5678', 'company', 1, 1);
+        INSERT INTO users (id, role, email, password_hash, name)
+        VALUES ('admin', 'admin', 'admin@example.com', 'admin-hash', '관리자');
+        INSERT INTO settlements (id, logistics_company_id, settlement_month) VALUES ('settlement', 'company', '2026-08');
+        INSERT INTO mileage_applications (id, user_id, logistics_company_id, idempotency_key)
+        VALUES ('application', 'driver', 'company', 'request');
+        INSERT INTO mileage_application_photos (id, mileage_application_id, kind, storage_key, content_type, byte_size)
+        VALUES ('receipt', 'application', 'receipt', 'receipt-key', 'image/jpeg', 100),
+          ('meter', 'application', 'meter', 'meter-key', 'image/jpeg', 100);
+        UPDATE mileage_applications SET approval_status = 'approved', final_amount = 1000, mileage_amount = 20,
+          decided_at = CURRENT_TIMESTAMP, settlement_id = 'settlement' WHERE id = 'application';
+        UPDATE settlements SET transfer_status = 'completed', transferred_at = CURRENT_TIMESTAMP WHERE id = 'settlement';
+        INSERT INTO phone_verifications (id, purpose, phone, code_hash, expires_at, scope_user_id)
+        VALUES ('proof', 'change_phone', '010-1111-2222', 'code-hash', '2099-01-01', 'driver');
+        INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+        VALUES ('reset', 'driver', 'reset-hash', '2099-01-01');
+        CREATE INDEX custom_users_name_idx ON users (name);
+      `);
+        connection
+          .prepare('INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?)')
+          .run('a'.repeat(64), 'driver', 1000, 1000, 2000);
+        connection
+          .prepare('INSERT INTO admin_sessions VALUES (?, ?, ?, ?)')
+          .run('b'.repeat(64), 'admin', 1000, 2000);
+        if (fail)
+          connection.exec(
+            'CREATE INDEX users_registered_email_idx ON logistics_companies (business_name)',
+          );
+        const tables = (
+          connection
+            .prepare(
+              "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+            )
+            .all() as { name: string }[]
+        ).map((row) => row.name);
+        const original = tables.map((table) =>
+          connection!.prepare(`SELECT * FROM ${table}`).all(),
+        );
+        connection.close();
+        connection = undefined;
+        process.env.DATABASE_PATH = path;
+        if (fail) {
+          expect(() => new DatabaseService()).toThrow(
+            'index users_registered_email_idx already exists',
+          );
+          connection = new DatabaseSync(path);
+          expect(connection.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 4,
+          });
+        } else {
+          upgraded = new DatabaseService();
+          expect(
+            upgraded.connection.prepare('PRAGMA user_version').get(),
+          ).toEqual({ user_version: 5 });
+          expect(
+            upgraded.connection.prepare('PRAGMA foreign_keys').get(),
+          ).toEqual({ foreign_keys: 1 });
+          expect(() =>
+            upgraded!.connection.exec(
+              "UPDATE mileage_applications SET user_id = 'admin' WHERE id = 'application'",
+            ),
+          ).toThrow();
+          upgraded.onModuleDestroy();
+          upgraded = new DatabaseService();
+        }
+        const checked = upgraded?.connection ?? connection!;
+        expect(
+          tables.map((table) =>
+            checked.prepare(`SELECT * FROM ${table}`).all(),
+          ),
+        ).toEqual(original);
+        expect(checked.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+        expect(
+          checked
+            .prepare(
+              "SELECT name FROM sqlite_schema WHERE name = 'custom_users_name_idx'",
+            )
+            .get(),
+        ).toBeDefined();
+        expect(
+          checked
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 'users_v5'")
+            .get(),
+        ).toBeUndefined();
+      } finally {
+        connection?.close();
+        upgraded?.onModuleDestroy();
+        process.env.DATABASE_PATH = ':memory:';
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([false, true])(
     'preserves v3 verification rows during owner migration (failure: %s)',
@@ -666,7 +781,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 4 });
+          ).toEqual({ user_version: 5 });
           expect(() =>
             upgraded!.connection.exec(
               "UPDATE phone_verifications SET scope_user_id = 'missing-user'",

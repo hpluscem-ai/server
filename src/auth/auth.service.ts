@@ -72,7 +72,7 @@ export class AuthService {
       input.password,
     );
 
-    if (!user || !passwordMatches) {
+    if (!user?.passwordHash || !passwordMatches) {
       throw new UnauthorizedException({
         code: 'INVALID_CREDENTIALS',
         message: '이메일 또는 비밀번호가 일치하지 않습니다.',
@@ -155,7 +155,7 @@ export class AuthService {
     input: ChangePasswordRequestDto,
   ): Promise<void> {
     const user = this.authRepository.findDriverPassword(session.user.id);
-    if (!user) this.throwSessionInvalid();
+    if (!user?.passwordHash) this.throwSessionInvalid();
     if (!(await argon2.verify(user.passwordHash, input.currentPassword))) {
       throw new BadRequestException({
         code: 'CURRENT_PASSWORD_MISMATCH',
@@ -188,7 +188,7 @@ export class AuthService {
   async resetPassword(input: ResetPasswordRequestDto): Promise<void> {
     const tokenHash = createHash('sha256').update(input.token).digest('hex');
     const user = this.authRepository.findPasswordReset(tokenHash);
-    if (!user) this.throwPasswordResetInvalid();
+    if (!user?.passwordHash) this.throwPasswordResetInvalid();
     const passwordHash = await argon2.hash(input.newPassword, {
       type: argon2.argon2id,
     });
@@ -299,14 +299,19 @@ export class AuthService {
     const code = randomInt(1_000_000).toString().padStart(6, '0');
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
 
-    this.authRepository.beginPhoneVerification(
-      verificationId,
-      phone,
-      codeHash,
-      purpose,
-      email,
-      userId,
-    );
+    try {
+      this.authRepository.beginPhoneVerification(
+        verificationId,
+        phone,
+        codeHash,
+        purpose,
+        email,
+        userId,
+      );
+    } catch (error) {
+      if (error instanceof LoginUnavailableError) this.throwSessionInvalid();
+      throw error;
+    }
     await this.smsService.sendVerificationCode(phone, code);
     const expiresAt = this.authRepository.activatePhoneVerification(
       verificationId,

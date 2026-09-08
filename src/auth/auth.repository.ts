@@ -1,4 +1,4 @@
-import { and, eq, gt, isNotNull, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, gt, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import { Injectable } from '@nestjs/common';
 
 import { DatabaseService } from '../database/database.service';
@@ -60,7 +60,13 @@ export class AuthRepository {
     return this.database.db
       .select({ id: users.id, passwordHash: users.passwordHash })
       .from(users)
-      .where(and(eq(users.email, email), eq(users.role, 'driver')))
+      .where(
+        and(
+          eq(users.email, email),
+          eq(users.role, 'driver'),
+          isNull(users.deactivatedAt),
+        ),
+      )
       .get();
   }
 
@@ -68,7 +74,13 @@ export class AuthRepository {
     return this.database.db
       .select({ passwordHash: users.passwordHash })
       .from(users)
-      .where(and(eq(users.id, userId), eq(users.role, 'driver')))
+      .where(
+        and(
+          eq(users.id, userId),
+          eq(users.role, 'driver'),
+          isNull(users.deactivatedAt),
+        ),
+      )
       .get();
   }
 
@@ -218,7 +230,11 @@ export class AuthRepository {
           if (!user) throw new PhoneVerificationInvalidError();
         }
         // 계정 불일치도 같은 접수 응답을 반환하지만 증명은 재사용할 수 없다.
-        return user ? { ...user, phone } : undefined;
+        if (user && user.passwordHash === null)
+          throw new Error('Active driver password invariant violated');
+        return user?.passwordHash
+          ? { ...user, passwordHash: user.passwordHash, phone }
+          : undefined;
       },
       { behavior: 'immediate' },
     );
@@ -484,6 +500,27 @@ export class AuthRepository {
     if (purpose === 'change_phone' && !userId)
       throw new Error('Phone change requires an owner');
     this.database.db.transaction((transaction) => {
+      if (
+        userId &&
+        !transaction
+          .select({ id: users.id })
+          .from(users)
+          .innerJoin(
+            logisticsCompanies,
+            eq(users.logisticsCompanyId, logisticsCompanies.id),
+          )
+          .where(
+            and(
+              eq(users.id, userId),
+              eq(users.role, 'driver'),
+              isNull(users.deactivatedAt),
+              eq(logisticsCompanies.active, true),
+            ),
+          )
+          .get()
+      ) {
+        throw new LoginUnavailableError();
+      }
       transaction
         .update(phoneVerifications)
         .set({ invalidatedAt: sql`CURRENT_TIMESTAMP` })
@@ -605,7 +642,7 @@ export class AuthRepository {
     const [emailDuplicate] = await this.database.db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.email, email))
+      .where(and(eq(users.email, email), registeredIdentity()))
       .limit(1);
 
     if (emailDuplicate) {
@@ -615,7 +652,7 @@ export class AuthRepository {
     const [phoneDuplicate] = await this.database.db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.phone, phone))
+      .where(and(eq(users.phone, phone), registeredIdentity()))
       .limit(1);
 
     if (phoneDuplicate) {
@@ -656,7 +693,7 @@ export class AuthRepository {
         const [emailDuplicate] = transaction
           .select({ id: users.id })
           .from(users)
-          .where(eq(users.email, input.email))
+          .where(and(eq(users.email, input.email), registeredIdentity()))
           .limit(1)
           .all();
 
@@ -667,7 +704,7 @@ export class AuthRepository {
         const [phoneDuplicate] = transaction
           .select({ id: users.id })
           .from(users)
-          .where(eq(users.phone, input.phone))
+          .where(and(eq(users.phone, input.phone), registeredIdentity()))
           .limit(1)
           .all();
 
@@ -747,7 +784,13 @@ export class AuthRepository {
         const duplicate = transaction
           .select({ id: users.id })
           .from(users)
-          .where(and(eq(users.phone, input.phone), ne(users.id, input.userId)))
+          .where(
+            and(
+              eq(users.phone, input.phone),
+              ne(users.id, input.userId),
+              registeredIdentity(),
+            ),
+          )
           .get();
         if (duplicate) throw new PhoneAlreadyExistsError();
         transaction
@@ -782,6 +825,10 @@ export class AuthRepository {
       throw new PhoneAlreadyExistsError();
     }
   }
+}
+
+function registeredIdentity() {
+  return or(isNull(users.deactivatedAt), eq(users.role, 'admin'));
 }
 
 function validDriverSession(tokenHash: string, now: Date, idleCutoff: Date) {

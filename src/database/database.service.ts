@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
@@ -45,7 +45,7 @@ export class DatabaseService implements OnModuleDestroy {
       }
 
       if (schemaVersion < CURRENT_SCHEMA_VERSION) {
-        if (![0, 1, 2, 3].includes(schemaVersion)) {
+        if (![0, 1, 2, 3, 4].includes(schemaVersion)) {
           throw new Error(
             `Database schema version ${schemaVersion} requires an explicit migration`,
           );
@@ -82,12 +82,15 @@ export class DatabaseService implements OnModuleDestroy {
             readFileSync(join(__dirname, '003-admin-sessions.sql'), 'utf8'),
           );
         }
-        this.database.exec(
-          readFileSync(
-            join(__dirname, '004-phone-verification-owner.sql'),
-            'utf8',
-          ),
-        );
+        if (schemaVersion < 4) {
+          this.database.exec(
+            readFileSync(
+              join(__dirname, '004-phone-verification-owner.sql'),
+              'utf8',
+            ),
+          );
+        }
+        this.migrateDriverWithdrawal();
       }
     } catch (error) {
       this.database.close();
@@ -97,6 +100,33 @@ export class DatabaseService implements OnModuleDestroy {
 
   get connection() {
     return this.database;
+  }
+
+  private migrateDriverWithdrawal() {
+    // Rebuild users without cascading deletes or retargeting its existing references.
+    this.database.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      const objects = this.database
+        .prepare(
+          "SELECT sql FROM sqlite_schema WHERE tbl_name = 'users' AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+        )
+        .all() as { sql: string }[];
+      this.database.exec(
+        readFileSync(join(__dirname, '005-driver-withdrawal.sql'), 'utf8'),
+      );
+      for (const object of objects) this.database.exec(object.sql);
+      if (this.database.prepare('PRAGMA foreign_key_check').all().length) {
+        throw new Error(
+          'Driver withdrawal migration violates foreign key constraints',
+        );
+      }
+      this.database.exec('COMMIT;');
+    } catch (error) {
+      this.database.exec('ROLLBACK;');
+      throw error;
+    } finally {
+      this.database.exec('PRAGMA foreign_keys = ON;');
+    }
   }
 
   onModuleDestroy() {

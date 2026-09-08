@@ -204,6 +204,6 @@ describe('Admin driver list (e2e)', () => {
     await request(app.getHttpServer())
       .delete(`${PATH}/${userId}`)
       .set('Authorization', authorization)
-      .expect(404);
+      .expect(204);
   });
 });

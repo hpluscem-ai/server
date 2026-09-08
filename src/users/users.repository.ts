@@ -1,8 +1,26 @@
 import { Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, gte, inArray, isNull, lt, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  lt,
+  or,
+  sql,
+} from 'drizzle-orm';
 
 import { DatabaseService } from '../database/database.service';
-import { logisticsCompanies, users } from '../database/schema';
+import {
+  adminSessions,
+  authSessions,
+  logisticsCompanies,
+  passwordResetTokens,
+  phoneVerifications,
+  users,
+} from '../database/schema';
 import { AdminDriverListQueryDto } from './admin-driver.dto';
 
 const profileFields = {
@@ -70,6 +88,64 @@ export class UsersRepository {
       .from(users)
       .where(this.activeDriver(userId))
       .get();
+  }
+
+  withdrawDriver(userId: string) {
+    return this.database.db.transaction(
+      (tx) => {
+        const driver = tx
+          .select({ email: users.email, phone: users.phone })
+          .from(users)
+          .where(
+            and(
+              eq(users.id, userId),
+              eq(users.role, 'driver'),
+              isNull(users.deactivatedAt),
+            ),
+          )
+          .get();
+        if (!driver) return false;
+        if (driver.phone === null)
+          throw new Error('Driver phone invariant violated');
+
+        tx.update(users)
+          .set({
+            passwordHash: null,
+            deactivatedAt: sql`CURRENT_TIMESTAMP`,
+            updatedAt: sql`CURRENT_TIMESTAMP`,
+          })
+          .where(eq(users.id, userId))
+          .run();
+        tx.delete(authSessions).where(eq(authSessions.userId, userId)).run();
+        tx.delete(adminSessions).where(eq(adminSessions.userId, userId)).run();
+        tx.delete(passwordResetTokens)
+          .where(eq(passwordResetTokens.userId, userId))
+          .run();
+        // Pending SMS sends are removed too, so a late provider response cannot revive them.
+        tx.delete(phoneVerifications)
+          .where(
+            or(
+              eq(phoneVerifications.scopeUserId, userId),
+              and(
+                isNull(phoneVerifications.scopeUserId),
+                or(
+                  eq(phoneVerifications.phone, driver.phone),
+                  and(
+                    eq(phoneVerifications.purpose, 'reset_password'),
+                    eq(
+                      phoneVerifications.scopeEmail,
+                      driver.email.toLowerCase(),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          )
+          .run();
+        return true;
+      },
+      { behavior: 'immediate' },
+    );
   }
 
   updateProfile(userId: string, changes: ProfileChanges) {

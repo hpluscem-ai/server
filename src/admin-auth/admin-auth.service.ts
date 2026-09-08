@@ -36,7 +36,7 @@ export class AdminAuthService {
       user?.passwordHash ?? MISSING_USER_PASSWORD_HASH,
       input.password,
     );
-    if (!user || !matches) this.throwCredentialsInvalid();
+    if (!user?.passwordHash || !matches) this.throwCredentialsInvalid();
     const token = randomBytes(32).toString('base64url');
     const createdAt = new Date(Date.now());
     const expiresAt = new Date(createdAt.getTime() + lifetime);

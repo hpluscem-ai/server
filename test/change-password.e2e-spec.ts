@@ -101,7 +101,7 @@ describe('Driver password change (e2e)', () => {
       .select({ passwordHash: users.passwordHash })
       .from(users)
       .where(eq(users.id, userId))
-      .get()!.passwordHash;
+      .get()!.passwordHash!;
   }
   function change(
     input: unknown = { currentPassword: OLD, newPassword: NEXT },

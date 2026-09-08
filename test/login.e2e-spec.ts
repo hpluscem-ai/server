@@ -164,7 +164,7 @@ describe('Login (e2e)', () => {
   });
 
   it.each(['user', 'company'])(
-    'blocks a deactivated %s after password verification',
+    'blocks a deactivated %s without issuing a session',
     async (target) => {
       if (target === 'user') {
         database.db
@@ -189,11 +189,9 @@ describe('Login (e2e)', () => {
       const response = await request(app.getHttpServer())
         .post('/api/v1/auth/login')
         .send(credentials)
-        .expect(403);
-      expect(response.body).toEqual({
-        statusCode: 403,
-        code: 'ACCOUNT_UNAVAILABLE',
-        message: '로그인할 수 없는 계정입니다. 관리자에게 문의해 주세요.',
+        .expect(target === 'user' ? 401 : 403);
+      expect(response.body).toMatchObject({
+        code: target === 'user' ? 'INVALID_CREDENTIALS' : 'ACCOUNT_UNAVAILABLE',
       });
       expect(database.db.select().from(authSessions).all()).toHaveLength(0);
     },

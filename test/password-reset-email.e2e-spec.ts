@@ -233,8 +233,9 @@ describe('Postmark password reset email (e2e)', () => {
       .from(users)
       .where(eq(users.id, userId))
       .get()!;
-    expect(await argon2.verify(saved.passwordHash, newPassword)).toBe(true);
-    expect(await argon2.verify(saved.passwordHash, oldPassword)).toBe(false);
+    expect(saved.passwordHash).not.toBeNull();
+    expect(await argon2.verify(saved.passwordHash!, newPassword)).toBe(true);
+    expect(await argon2.verify(saved.passwordHash!, oldPassword)).toBe(false);
   });
 
   it('returns only the current user email for an authenticated SMS-proven request', async () => {
