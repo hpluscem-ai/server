@@ -18,6 +18,7 @@ import {
   ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
   ApiNoContentResponse,
+  ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
   ApiServiceUnavailableResponse,
@@ -36,6 +37,7 @@ import { SignUpRequestDto, SignUpResponseDto } from './auth-signup.dto';
 import { AuthService } from './auth.service';
 import { ChangePasswordRequestDto } from './change-password.dto';
 import { ResetPasswordRequestDto } from './reset-password.dto';
+import { FindEmailRequestDto, FindEmailResponseDto } from './find-email.dto';
 import {
   ChangePhoneRequestDto,
   ConfirmPhoneChangeVerificationDto,
@@ -160,7 +162,7 @@ export class AuthController {
   @ApiOperation({
     summary: '회원가입·이메일 찾기·비밀번호 찾기 SMS 인증번호 발송',
     description:
-      'SOLAPI 접수 성공 후 3분간 유효합니다. 같은 목적·휴대폰의 재발송은 이메일 변경 여부와 관계없이 이전 인증번호와 증명을 즉시 무효화하며 발송 실패 시에도 복구하지 않습니다. 비밀번호 찾기는 이메일·휴대폰 조합에 묶습니다. 이 API는 계정 존재 여부를 조회하지 않습니다. 이메일 찾기 결과·재설정 메일 발송은 미제공입니다.',
+      'SOLAPI 접수 성공 후 3분간 유효합니다. 같은 목적·휴대폰의 재발송은 이메일 변경 여부와 관계없이 이전 인증번호와 증명을 즉시 무효화하며 발송 실패 시에도 복구하지 않습니다. 비밀번호 찾기는 이메일·휴대폰 조합에 묶습니다. 이 API는 계정 존재 여부를 조회하지 않습니다. 이메일 찾기는 find-email에서 증명을 소비하며 재설정 메일 발송은 미제공입니다.',
   })
   @ApiCreatedResponse({ type: SendPhoneVerificationResponseDto })
   @ApiBadRequestResponse({
@@ -206,6 +208,31 @@ export class AuthController {
   })
   resetPassword(@Body() input: ResetPasswordRequestDto): Promise<void> {
     return this.authService.resetPassword(input);
+  }
+
+  @Post('find-email')
+  @HttpCode(200)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: 'SMS 인증 후 기사 이메일 찾기',
+    description:
+      'find_email 목적·휴대폰에 묶인 유효한 증명을 한 번 소비하고 마스킹한 이메일과 연락처 끝 4자리만 반환합니다. 미가입·탈퇴·관리자 계정은 동일한 미가입 안내를 반환하며 증명을 소비합니다. 소속 비활성화는 로그인 제한이며 이 조회를 막지 않습니다.',
+  })
+  @ApiOkResponse({ type: FindEmailResponseDto })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR | PHONE_VERIFICATION_INVALID',
+    type: ApiErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: 'ACCOUNT_NOT_FOUND',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  findEmail(@Body() input: FindEmailRequestDto): FindEmailResponseDto {
+    return this.authService.findEmail(input);
   }
 
   @Post('phone-verifications/:verificationId/confirm')

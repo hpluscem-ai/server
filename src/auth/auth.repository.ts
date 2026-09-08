@@ -260,6 +260,45 @@ export class AuthRepository {
       .run();
   }
 
+  findEmailWithProof(phone: string, proofHash: string): string | undefined {
+    return this.database.db.transaction(
+      (transaction) => {
+        const proof = transaction
+          .update(phoneVerifications)
+          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
+          .where(
+            and(
+              eq(phoneVerifications.purpose, 'find_email'),
+              eq(phoneVerifications.phone, phone),
+              eq(phoneVerifications.proofHash, proofHash),
+              isNull(phoneVerifications.scopeEmail),
+              isNull(phoneVerifications.scopeUserId),
+              isNotNull(phoneVerifications.verifiedAt),
+              isNull(phoneVerifications.consumedAt),
+              isNull(phoneVerifications.invalidatedAt),
+              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+            ),
+          )
+          .returning({ id: phoneVerifications.id })
+          .get();
+        if (!proof) throw new PhoneVerificationInvalidError();
+        // 결과가 없어도 본인 확인 증명을 한 번 소비한다. DB 실패는 소비까지 롤백한다.
+        return transaction
+          .select({ email: users.email })
+          .from(users)
+          .where(
+            and(
+              eq(users.phone, phone),
+              eq(users.role, 'driver'),
+              isNull(users.deactivatedAt),
+            ),
+          )
+          .get()?.email;
+      },
+      { behavior: 'immediate' },
+    );
+  }
+
   beginPhoneVerification(
     id: string,
     phone: string,

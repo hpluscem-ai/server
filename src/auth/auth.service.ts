@@ -13,6 +13,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -39,6 +40,7 @@ import { ChangePasswordRequestDto } from './change-password.dto';
 import { ResetPasswordRequestDto } from './reset-password.dto';
 import { MISSING_USER_PASSWORD_HASH } from './password.constants';
 import { ChangePhoneRequestDto } from './change-phone.dto';
+import { FindEmailRequestDto, FindEmailResponseDto } from './find-email.dto';
 
 const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -115,6 +117,32 @@ export class AuthService {
 
   logout(tokenHash: string): void {
     this.authRepository.deleteSession(tokenHash);
+  }
+
+  findEmail(input: FindEmailRequestDto): FindEmailResponseDto {
+    let email: string | undefined;
+    try {
+      email = this.authRepository.findEmailWithProof(
+        input.phone,
+        createHash('sha256').update(input.verificationProof).digest('hex'),
+      );
+    } catch (error) {
+      this.throwIfDomainError(error);
+      throw error;
+    }
+    if (email === undefined) {
+      throw new NotFoundException({
+        code: 'ACCOUNT_NOT_FOUND',
+        message: '일치하는 회원정보를 찾을 수 없습니다.',
+      });
+    }
+    const at = email.lastIndexOf('@');
+    const local = Array.from(email.slice(0, at));
+    const visible = local.length > 2 ? local.slice(0, 2).join('') : '';
+    return {
+      maskedEmail: `${visible}${'*'.repeat(local.length - (local.length > 2 ? 2 : 0))}${email.slice(at)}`,
+      phoneLastFour: input.phone.slice(-4),
+    };
   }
 
   async changePassword(

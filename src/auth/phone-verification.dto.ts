@@ -84,7 +84,7 @@ export class SendPhoneVerificationResponseDto {
 export class ConfirmPhoneVerificationResponseDto {
   @ApiProperty({
     description:
-      '발송 목적과 입력 범위에 묶인 일회용 휴대폰 인증 증명. 이메일 찾기 결과·재설정 메일 발송은 아직 제공하지 않습니다.',
+      '발송 목적과 입력 범위에 묶인 일회용 휴대폰 인증 증명. 이메일 찾기는 find-email에서 소비하며 재설정 메일 발송은 아직 제공하지 않습니다.',
   })
   verificationProof!: string;
 
