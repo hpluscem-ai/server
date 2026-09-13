@@ -511,9 +511,7 @@ describe('Auth sessions (e2e)', () => {
       .get('/api/v1/auth/me')
       .set('Cookie', `${cookie}; ${cookie}`)
       .expect(401);
-    expect(String(duplicate.headers['set-cookie'])).toContain(
-      'hpluseco_driver_session=;',
-    );
+    expect(duplicate.headers['set-cookie']).toBeUndefined();
     await request(app.getHttpServer())
       .get('/api/v1/admin/auth/me')
       .set('Cookie', cookie)
@@ -541,18 +539,41 @@ describe('Auth sessions (e2e)', () => {
     },
   );
 
-  it('clears an expired cookie but preserves cookies when the database fails', async () => {
+  it('does not clear a newer login cookie when an expired-session response arrives', async () => {
+    jest.spyOn(Date, 'now').mockRestore();
     const expired = seedSession({
-      createdAt: new Date(NOW - 10 * DAY),
-      lastUsedAt: new Date(NOW - 7 * DAY),
+      createdAt: new Date(Date.now() - 10 * DAY),
+      lastUsedAt: new Date(Date.now() - 8 * DAY),
     });
+    const browser = request.agent(app.getHttpServer());
+    await browser
+      .post('/api/v1/auth/web/login')
+      .set('Origin', 'http://localhost:8081')
+      .send({ email: `${userId}@example.com`, password: 'Password!1' })
+      .expect(200);
+    await browser.get('/api/v1/auth/me').expect(200);
+
+    // This response belongs to a request carrying the previous session cookie.
     const expiredResponse = await request(app.getHttpServer())
       .get('/api/v1/auth/me')
       .set('Cookie', `hpluseco_driver_session=${expired.token}`)
-      .expect(401);
-    expect(String(expiredResponse.headers['set-cookie'])).toContain(
+      .expect(401)
+      .expect('Cache-Control', 'no-store')
+      .expect(invalidSession);
+    expect(expiredResponse.headers['set-cookie']).toBeUndefined();
+    await browser.get('/api/v1/auth/me').expect(200);
+
+    const logout = await browser
+      .post('/api/v1/auth/logout')
+      .set('Origin', 'http://localhost:8081')
+      .expect(204);
+    expect(String(logout.headers['set-cookie'])).toContain(
       'Expires=Thu, 01 Jan 1970',
     );
+    await browser.get('/api/v1/auth/me').expect(401);
+  });
+
+  it('preserves cookies when the database fails', async () => {
     const current = seedSession();
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     database.connection

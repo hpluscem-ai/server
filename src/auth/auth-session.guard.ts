@@ -7,11 +7,7 @@ import {
 import type { Request, Response } from 'express';
 
 import { AuthService, type AuthenticatedSession } from './auth.service';
-import {
-  assertWebOrigin,
-  clearWebSession,
-  readWebSession,
-} from './auth-web-session';
+import { assertWebOrigin, readWebSession } from './auth-web-session';
 
 export type AuthenticatedRequest = Request & {
   authSession: AuthenticatedSession;
@@ -46,7 +42,7 @@ export class AuthSessionGuard implements CanActivate {
     const session = this.authService.authenticateSession(token);
 
     if (!session) {
-      if (request.authMethod === 'cookie') clearWebSession(response);
+      // A late 401 must not delete the cookie issued by a newer login.
       response.setHeader('WWW-Authenticate', 'Bearer');
       throw new UnauthorizedException({
         code: 'INVALID_SESSION',
