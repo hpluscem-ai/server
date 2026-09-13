@@ -185,6 +185,13 @@ export class AuthService {
     });
   }
 
+  validatePasswordReset(token: string): void {
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    if (!this.authRepository.findPasswordReset(tokenHash)?.passwordHash) {
+      this.throwPasswordResetInvalid();
+    }
+  }
+
   async resetPassword(input: ResetPasswordRequestDto): Promise<void> {
     const tokenHash = createHash('sha256').update(input.token).digest('hex');
     const user = this.authRepository.findPasswordReset(tokenHash);

@@ -139,6 +139,11 @@ describe('Driver password change (e2e)', () => {
         .post(resetPath)
         .send({ token: value, newPassword: password });
     }
+    function validate(value: unknown) {
+      return request(app.getHttpServer())
+        .post(`${resetPath}/validate`)
+        .send({ token: value });
+    }
     function unused() {
       return database.connection
         .prepare(
@@ -146,6 +151,53 @@ describe('Driver password change (e2e)', () => {
         )
         .get();
     }
+
+    it('validates repeatedly without changing tokens, passwords or sessions', async () => {
+      const link = seedReset();
+      const links = () =>
+        database.connection
+          .prepare('SELECT * FROM password_reset_tokens')
+          .all();
+      const before = links();
+      const sessions = database.db.select().from(authSessions).all();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await validate(link)
+          .expect(204)
+          .expect('')
+          .expect('Cache-Control', 'no-store');
+      }
+      expect(links()).toEqual(before);
+      expect(savedPassword()).toBe(oldHash);
+      expect(database.db.select().from(authSessions).all()).toEqual(sessions);
+      await validate(token).expect(400);
+      await request(app.getHttpServer())
+        .post(`${resetPath}/validate`)
+        .send({ token: link, newPassword: NEXT })
+        .expect(400);
+      await reset(link).expect(204);
+      await validate(link).expect(400);
+    });
+
+    it('returns a server error without consuming the link when validation lookup fails', async () => {
+      const link = seedReset();
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      jest
+        .spyOn(app.get(AuthRepository), 'findPasswordReset')
+        .mockImplementationOnce(() => {
+          throw new Error('private database failure');
+        });
+      await validate(link)
+        .expect(500)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('INTERNAL_SERVER_ERROR'),
+        );
+      expect(unused()).toEqual({ count: 1 });
+      expect(savedPassword()).toBe(oldHash);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(link);
+      await validate(link).expect(204);
+    });
 
     it('atomically changes the password, consumes own links and revokes all own sessions', async () => {
       const link = seedReset();
@@ -183,6 +235,7 @@ describe('Driver password change (e2e)', () => {
     it.each([null, '', 'invalid', 123, 'a'.repeat(43)])(
       'rejects malformed or unknown tokens: %p',
       async (value) => {
+        await validate(value).expect(400);
         await reset(value).expect(400);
         expect(savedPassword()).toBe(oldHash);
         await me(token).expect(200);
@@ -203,6 +256,7 @@ describe('Driver password change (e2e)', () => {
       'rejects unavailable %s tokens or accounts',
       async (state) => {
         const link = seedReset();
+        await validate(link).expect(204);
         if (state === 'expired')
           database.connection.exec(
             'UPDATE password_reset_tokens SET expires_at = CURRENT_TIMESTAMP',
@@ -220,6 +274,11 @@ describe('Driver password change (e2e)', () => {
             .run();
         if (state === 'company')
           database.db.update(logisticsCompanies).set({ active: false }).run();
+        await validate(link)
+          .expect(400)
+          .expect(({ body }: { body: { code: string } }) =>
+            expect(body.code).toBe('PASSWORD_RESET_INVALID'),
+          );
         await reset(link)
           .expect(400)
           .expect(({ body }: { body: { code: string } }) =>
@@ -359,6 +418,18 @@ describe('Driver password change (e2e)', () => {
       for (const code of ['204', '400', '500'])
         expect(operation?.responses[code]).toBeDefined();
       expect(operation?.description).toContain('30분');
+      const validation = document.paths[`${resetPath}/validate`]?.post;
+      for (const code of ['204', '400', '500'])
+        expect(validation?.responses[code]).toBeDefined();
+      expect(validation?.security).toBeUndefined();
+      const validationSchema =
+        document.components?.schemas?.ValidatePasswordResetRequestDto;
+      const validationProperties =
+        validationSchema && 'properties' in validationSchema
+          ? validationSchema.properties
+          : undefined;
+      expect(Object.keys(validationProperties ?? {})).toEqual(['token']);
+      expect(validationProperties?.token).toMatchObject({ writeOnly: true });
       expect(
         document.paths['/api/v1/auth/password-reset-emails']?.post,
       ).toBeDefined();

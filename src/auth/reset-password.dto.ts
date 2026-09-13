@@ -38,3 +38,8 @@ export class ResetPasswordRequestDto extends PickType(
   @Matches(/^[A-Za-z0-9_-]{43}$/)
   token!: string;
 }
+
+export class ValidatePasswordResetRequestDto extends PickType(
+  ResetPasswordRequestDto,
+  ['token'] as const,
+) {}

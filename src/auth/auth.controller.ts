@@ -54,6 +54,7 @@ import {
   PasswordResetEmailResponseDto,
   RequestPasswordResetEmailDto,
   ResetPasswordRequestDto,
+  ValidatePasswordResetRequestDto,
 } from './reset-password.dto';
 import { FindEmailRequestDto, FindEmailResponseDto } from './find-email.dto';
 import {
@@ -262,6 +263,27 @@ export class AuthController {
     @Body() input: SendPhoneVerificationRequestDto,
   ): Promise<SendPhoneVerificationResponseDto> {
     return this.authService.sendPhoneVerification(input);
+  }
+
+  @Post('reset-password/validate')
+  @HttpCode(204)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: '비밀번호 재설정 링크 사전 검증',
+    description:
+      '30분 일회용 토큰과 기사·소속 상태를 확인합니다. 토큰을 소비하거나 만료 시각·비밀번호·세션을 변경하지 않으며, 실제 재설정 요청에서 다시 검증합니다.',
+  })
+  @ApiNoContentResponse({ description: '현재 유효한 비밀번호 재설정 링크' })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR | PASSWORD_RESET_INVALID',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  validatePasswordReset(@Body() input: ValidatePasswordResetRequestDto): void {
+    this.authService.validatePasswordReset(input.token);
   }
 
   @Post('reset-password')
