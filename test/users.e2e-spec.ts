@@ -340,7 +340,10 @@ describe('Current driver profile (e2e)', () => {
     const document = response.body as OpenAPIObject;
     const path = document.paths[PATH];
     for (const method of ['get', 'patch'] as const) {
-      expect(path?.[method]?.security).toEqual([{ bearer: [] }]);
+      expect(path?.[method]?.security).toEqual([
+        { bearer: [] },
+        { 'driver-session': [] },
+      ]);
       for (const status of ['200', '401', '500'])
         expect(path?.[method]?.responses?.[status]).toBeDefined();
     }

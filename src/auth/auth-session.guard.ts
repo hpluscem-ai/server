@@ -7,9 +7,15 @@ import {
 import type { Request, Response } from 'express';
 
 import { AuthService, type AuthenticatedSession } from './auth.service';
+import {
+  assertWebOrigin,
+  clearWebSession,
+  readWebSession,
+} from './auth-web-session';
 
 export type AuthenticatedRequest = Request & {
   authSession: AuthenticatedSession;
+  authMethod: 'bearer' | 'cookie';
 };
 
 @Injectable()
@@ -22,12 +28,25 @@ export class AuthSessionGuard implements CanActivate {
     const response = http.getResponse<Response>();
     // 인증 실패 응답에도 적용되도록 컨트롤러 실행 전에 설정한다.
     response.setHeader('Cache-Control', 'no-store');
-    const token = request.headers.authorization?.match(
-      /^Bearer +([A-Za-z0-9_-]{43})$/i,
-    )?.[1];
+    request.authMethod =
+      request.headers.authorization === undefined ? 'cookie' : 'bearer';
+    const token =
+      request.authMethod === 'bearer'
+        ? request.headers.authorization?.match(
+            /^Bearer +([A-Za-z0-9_-]{43})$/i,
+          )?.[1]
+        : readWebSession(request);
+    if (
+      request.authMethod === 'cookie' &&
+      token &&
+      !['GET', 'HEAD', 'OPTIONS'].includes(request.method)
+    ) {
+      assertWebOrigin(request);
+    }
     const session = this.authService.authenticateSession(token);
 
     if (!session) {
+      if (request.authMethod === 'cookie') clearWebSession(response);
       response.setHeader('WWW-Authenticate', 'Bearer');
       throw new UnauthorizedException({
         code: 'INVALID_SESSION',

@@ -578,7 +578,7 @@ export class AuthRepository {
       : undefined;
   }
 
-  findPendingPhoneVerification(
+  findActivePhoneVerification(
     id: string,
     purpose: VerificationPurpose,
     userId?: string,
@@ -586,7 +586,7 @@ export class AuthRepository {
     return this.database.db
       .select({ codeHash: phoneVerifications.codeHash })
       .from(phoneVerifications)
-      .where(validPendingPhoneVerification(id, purpose, userId))
+      .where(validPhoneVerification(id, purpose, userId))
       .get();
   }
 
@@ -599,7 +599,7 @@ export class AuthRepository {
     const verification = this.database.db
       .update(phoneVerifications)
       .set({ proofHash, verifiedAt: sql`CURRENT_TIMESTAMP` })
-      .where(validPendingPhoneVerification(id, purpose, userId))
+      .where(validPhoneVerification(id, purpose, userId))
       .returning({ expiresAt: phoneVerifications.expiresAt })
       .get();
 
@@ -853,7 +853,7 @@ function validPasswordReset(tokenHash: string) {
   );
 }
 
-function validPendingPhoneVerification(
+function validPhoneVerification(
   id: string,
   purpose: VerificationPurpose,
   userId?: string,
@@ -862,7 +862,6 @@ function validPendingPhoneVerification(
     eq(phoneVerifications.id, id),
     eq(phoneVerifications.purpose, purpose),
     verificationOwner(userId),
-    isNull(phoneVerifications.verifiedAt),
     isNull(phoneVerifications.consumedAt),
     isNull(phoneVerifications.invalidatedAt),
     gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),

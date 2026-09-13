@@ -365,6 +365,7 @@ describe('SOLAPI phone verification (e2e)', () => {
       ]) {
         expect(document.paths[endpoint]?.post?.security).toEqual([
           { bearer: [] },
+          { 'driver-session': [] },
         ]);
         expect(document.paths[endpoint]?.post?.responses['401']).toBeDefined();
         expect(document.paths[endpoint]?.post?.responses['500']).toBeDefined();
@@ -426,10 +427,18 @@ describe('SOLAPI phone verification (e2e)', () => {
           expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
         );
       expect(row(id).consumed_at).toBeNull();
-      await request(app.getHttpServer())
+      const reconfirmed = await request(app.getHttpServer())
         .post(`${basePath}/${id}/confirm`)
         .send({ code, purpose })
-        .expect(400);
+        .expect(200);
+      const reconfirmedProof = reconfirmed.body as ConfirmedVerification;
+      expect(reconfirmedProof.verificationProof).not.toBe(
+        (result.body as ConfirmedVerification).verificationProof,
+      );
+      expect(reconfirmedProof.expiresAt).toBe(
+        (sent.body as SentVerification).expiresAt,
+      );
+      await confirm(id, code).expect(400);
     },
   );
 
@@ -520,7 +529,7 @@ describe('SOLAPI phone verification (e2e)', () => {
     expect(authorization).not.toContain('test-api-secret');
   });
 
-  it('issues a phone-bound proof once, consumes it at signup and rejects replay', async () => {
+  it('rechecks a corrected code, replaces the proof and rejects replay after signup', async () => {
     const sent = await send();
     const code = sentCode();
     const response = await confirm(sent.verificationId, code)
@@ -536,7 +545,19 @@ describe('SOLAPI phone verification (e2e)', () => {
     expect(row(sent.verificationId).proof_hash).toBe(
       createHash('sha256').update(confirmed.verificationProof).digest('hex'),
     );
-    await confirm(sent.verificationId, code).expect(400);
+    const wrongCode = code === '000000' ? '111111' : '000000';
+    await confirm(sent.verificationId, wrongCode)
+      .expect(400)
+      .expect(({ body }: { body: { code: string } }) =>
+        expect(body.code).toBe('PHONE_VERIFICATION_CODE_MISMATCH'),
+      );
+    const reconfirmed = (await confirm(sent.verificationId, code).expect(200))
+      .body as ConfirmedVerification;
+    expect(reconfirmed.verificationProof).not.toBe(confirmed.verificationProof);
+    expect(reconfirmed.expiresAt).toBe(sent.expiresAt);
+    expect(row(sent.verificationId).proof_hash).toBe(
+      createHash('sha256').update(reconfirmed.verificationProof).digest('hex'),
+    );
 
     const companyId = randomUUID();
     database.connection
@@ -551,15 +572,21 @@ describe('SOLAPI phone verification (e2e)', () => {
     `,
       )
       .run(companyId);
-    await signUp(confirmed.verificationProof, companyId, '010-1111-2222')
+    await signUp(confirmed.verificationProof, companyId)
+      .expect(400)
+      .expect(({ body }: { body: { code: string } }) =>
+        expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
+      );
+    await signUp(reconfirmed.verificationProof, companyId, '010-1111-2222')
       .expect(400)
       .expect(({ body }: { body: { code: string } }) =>
         expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
       );
     expect(row(sent.verificationId).consumed_at).toBeNull();
-    await signUp(confirmed.verificationProof, companyId).expect(201);
+    await signUp(reconfirmed.verificationProof, companyId).expect(201);
     expect(row(sent.verificationId).consumed_at).not.toBeNull();
-    await signUp(confirmed.verificationProof, companyId).expect(400);
+    await signUp(reconfirmed.verificationProof, companyId).expect(400);
+    await confirm(sent.verificationId, code).expect(400);
     await send();
     expect(row(sent.verificationId).invalidated_at).toBeNull();
   });
@@ -579,19 +606,28 @@ describe('SOLAPI phone verification (e2e)', () => {
     await confirm(sent.verificationId, code).expect(200);
   });
 
-  it('issues only one proof when two confirmation requests race', async () => {
+  it('keeps only the latest proof valid when two confirmation requests race', async () => {
     const sent = await send();
     const code = sentCode();
     const results = await Promise.all([
       confirm(sent.verificationId, code),
       confirm(sent.verificationId, code),
     ]);
-    expect(results.map((result) => result.status).sort()).toEqual([200, 400]);
-    const success = results.find((result) => result.status === 200)!;
-    const { verificationProof } = success.body as ConfirmedVerification;
-    expect(row(sent.verificationId).proof_hash).toBe(
-      createHash('sha256').update(verificationProof).digest('hex'),
+    expect(results.map((result) => result.status)).toEqual([200, 200]);
+    const proofs = results.map(
+      (result) => (result.body as ConfirmedVerification).verificationProof,
     );
+    expect(new Set(proofs).size).toBe(2);
+    expect(
+      proofs.filter(
+        (proof) =>
+          createHash('sha256').update(proof).digest('hex') ===
+          row(sent.verificationId).proof_hash,
+      ),
+    ).toHaveLength(1);
+    expect(
+      results.map((result) => (result.body as ConfirmedVerification).expiresAt),
+    ).toEqual([sent.expiresAt, sent.expiresAt]);
   });
 
   it('preserves leading zeroes in a six-digit code', async () => {
@@ -635,6 +671,7 @@ describe('SOLAPI phone verification (e2e)', () => {
         'UPDATE phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = ?',
       )
       .run(sent.verificationId);
+    await confirm(sent.verificationId, sentCode()).expect(400);
     await signUp(confirmed.verificationProof)
       .expect(400)
       .expect(({ body }: { body: { code: string } }) =>
@@ -655,15 +692,16 @@ describe('SOLAPI phone verification (e2e)', () => {
 
   it('keeps previous proofs invalidated even when the resend fails', async () => {
     const sent = await send();
-    const confirmed = (
-      await confirm(sent.verificationId, sentCode()).expect(200)
-    ).body as ConfirmedVerification;
+    const code = sentCode();
+    const confirmed = (await confirm(sent.verificationId, code).expect(200))
+      .body as ConfirmedVerification;
     fetchMock.mockRejectedValueOnce(new Error('private provider failure'));
     await request(app.getHttpServer())
       .post(basePath)
       .send({ phone })
       .expect(502);
     expect(row(sent.verificationId).invalidated_at).not.toBeNull();
+    await confirm(sent.verificationId, code).expect(400);
     await signUp(confirmed.verificationProof)
       .expect(400)
       .expect(({ body }: { body: { code: string } }) =>

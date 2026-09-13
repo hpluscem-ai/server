@@ -757,7 +757,10 @@ describe('Stations (e2e)', () => {
       .expect(200);
     const document = result.body as OpenAPIObject;
     expect(document.paths[ADMIN_PATH]?.post?.security).toEqual([{ admin: [] }]);
-    expect(document.paths[APP_PATH]?.get?.security).toEqual([{ bearer: [] }]);
+    expect(document.paths[APP_PATH]?.get?.security).toEqual([
+      { bearer: [] },
+      { 'driver-session': [] },
+    ]);
     expect(document.paths[`${APP_PATH}/map`]?.get?.description).toContain(
       '미제공',
     );

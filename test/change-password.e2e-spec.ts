@@ -575,7 +575,10 @@ describe('Driver password change (e2e)', () => {
       .expect(200);
     const document = response.body as OpenAPIObject;
     const operation = document.paths[PATH]?.post;
-    expect(operation?.security).toEqual([{ bearer: [] }]);
+    expect(operation?.security).toEqual([
+      { bearer: [] },
+      { 'driver-session': [] },
+    ]);
     for (const code of ['204', '400', '401', '500'])
       expect(operation?.responses[code]).toBeDefined();
     const schema = document.components?.schemas?.ChangePasswordRequestDto;

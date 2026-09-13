@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
+import { getWebOrigins, WEB_SESSION_COOKIE } from './auth';
 import { ApiErrorResponseDto } from './common/api-error-response.dto';
 import { ApiExceptionFilter } from './common/api-exception.filter';
 
@@ -33,6 +34,16 @@ function collectFieldErrors(
 
 export function configureApp(app: INestApplication): void {
   app.setGlobalPrefix('api/v1');
+  const webOrigins = getWebOrigins();
+  app.enableCors({
+    origin: (
+      origin: string | undefined,
+      callback: (error: Error | null, allow: boolean) => void,
+    ) => callback(null, Boolean(origin && webOrigins.includes(origin))),
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  });
   app.useGlobalPipes(
     new ValidationPipe({
       forbidNonWhitelisted: true,
@@ -68,6 +79,15 @@ export function configureApp(app: INestApplication): void {
           '관리자 로그인 응답의 별도 세션 토큰을 입력합니다. 기사 토큰은 허용하지 않습니다.',
       },
       'admin',
+    )
+    .addCookieAuth(
+      WEB_SESSION_COOKIE,
+      {
+        type: 'apiKey',
+        in: 'cookie',
+        description: '웹 로그인에서 발급한 HttpOnly 기사 세션 쿠키.',
+      },
+      'driver-session',
     )
     .build();
 

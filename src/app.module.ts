@@ -12,7 +12,7 @@ import {
   AuthRepository,
   AuthService,
   SolapiSmsService,
-  PostmarkEmailService,
+  ResendEmailService,
 } from './auth';
 import { DatabaseService } from './database/database.service';
 import {
@@ -56,7 +56,7 @@ import {
     AuthRepository,
     AuthService,
     SolapiSmsService,
-    PostmarkEmailService,
+    ResendEmailService,
     UsersRepository,
     UsersService,
     AdminAuthRepository,

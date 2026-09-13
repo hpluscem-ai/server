@@ -41,7 +41,7 @@ import {
   RequestPasswordResetEmailDto,
   ResetPasswordRequestDto,
 } from './reset-password.dto';
-import { PostmarkEmailService } from './postmark-email.service';
+import { ResendEmailService } from './resend-email.service';
 import { MISSING_USER_PASSWORD_HASH } from './password.constants';
 import { ChangePhoneRequestDto } from './change-phone.dto';
 import { FindEmailRequestDto, FindEmailResponseDto } from './find-email.dto';
@@ -62,7 +62,7 @@ export class AuthService {
   constructor(
     private readonly authRepository: AuthRepository,
     private readonly smsService: SolapiSmsService,
-    private readonly emailService: PostmarkEmailService,
+    private readonly emailService: ResendEmailService,
   ) {}
 
   async login(input: LoginRequestDto): Promise<LoginResponseDto> {
@@ -337,17 +337,17 @@ export class AuthService {
     userId?: string,
   ): ConfirmPhoneVerificationResponseDto {
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
-    const pending = this.authRepository.findPendingPhoneVerification(
+    const verification = this.authRepository.findActivePhoneVerification(
       verificationId,
       purpose,
       userId,
     );
 
-    if (!pending) {
+    if (!verification) {
       this.throwPhoneVerificationInvalid();
     }
 
-    const storedHash = Buffer.from(pending.codeHash, 'hex');
+    const storedHash = Buffer.from(verification.codeHash, 'hex');
     const candidateHash = Buffer.from(codeHash, 'hex');
     if (
       storedHash.length !== candidateHash.length ||

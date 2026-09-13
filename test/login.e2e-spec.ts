@@ -35,7 +35,10 @@ describe('Login (e2e)', () => {
   let passwordHash: string;
   let replacementPasswordHash: string;
 
+  const previousWebOrigins = process.env.WEB_ORIGINS;
+
   beforeAll(async () => {
+    process.env.WEB_ORIGINS = 'http://localhost:8081';
     app = await createTestApp();
     database = app.get(DatabaseService);
     passwordHash = await argon2.hash(credentials.password, {
@@ -89,6 +92,8 @@ describe('Login (e2e)', () => {
 
   afterAll(async () => {
     await app.close();
+    if (previousWebOrigins === undefined) delete process.env.WEB_ORIGINS;
+    else process.env.WEB_ORIGINS = previousWebOrigins;
   });
 
   it('issues a non-cacheable token and stores only its hash for 30 days', async () => {
@@ -427,6 +432,93 @@ describe('Login (e2e)', () => {
         ['properties', field, 'description'],
         expect.stringMatching(/[가-힣]/),
       );
+    }
+  });
+
+  it('uses an HttpOnly cookie for web login, restoration and current-session logout', async () => {
+    const browser = request.agent(app.getHttpServer());
+    const response = await browser
+      .post('/api/v1/auth/web/login')
+      .set('Origin', 'http://localhost:8081')
+      .send(credentials)
+      .expect(200);
+    expect(Object.keys(response.body as { expiresAt: string })).toEqual([
+      'expiresAt',
+    ]);
+    expect(response.headers['cache-control']).toBe('no-store');
+    const cookie = String(response.headers['set-cookie']);
+    expect(cookie).toContain('hpluseco_driver_session=');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).toContain('Path=/api/v1');
+    expect(cookie).not.toContain('Domain=');
+    expect(cookie).not.toContain('Secure');
+    const me = await browser.get('/api/v1/auth/me').expect(200);
+    expect(me.body).toMatchObject({ id: userId, email: credentials.email });
+    const failed = await browser
+      .post('/api/v1/auth/web/login')
+      .set('Origin', 'http://localhost:8081')
+      .send({ ...credentials, password: 'Wrong!234' })
+      .expect(401);
+    expect(failed.headers['set-cookie']).toBeUndefined();
+    await browser.get('/api/v1/auth/me').expect(200);
+    const logout = await browser
+      .post('/api/v1/auth/logout')
+      .set('Origin', 'http://localhost:8081')
+      .expect(204);
+    expect(String(logout.headers['set-cookie'])).toContain(
+      'Expires=Thu, 01 Jan 1970',
+    );
+    await browser.get('/api/v1/auth/me').expect(401);
+  });
+
+  it.each([
+    undefined,
+    'null',
+    'https://untrusted.example',
+    'http://localhost:8081.evil.example',
+  ])('rejects web login from an untrusted Origin: %p', async (origin) => {
+    const pending = request(app.getHttpServer())
+      .post('/api/v1/auth/web/login')
+      .send(credentials);
+    if (origin !== undefined) pending.set('Origin', origin);
+    const response = await pending.expect(403);
+    expect(response.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
+    expect(response.headers['set-cookie']).toBeUndefined();
+    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+  });
+
+  it('allows credentials only for configured CORS origins', async () => {
+    const allowed = await request(app.getHttpServer())
+      .options('/api/v1/auth/web/login')
+      .set('Origin', 'http://localhost:8081')
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'content-type')
+      .expect(204);
+    expect(allowed.headers['access-control-allow-origin']).toBe(
+      'http://localhost:8081',
+    );
+    expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+    const denied = await request(app.getHttpServer())
+      .options('/api/v1/auth/web/login')
+      .set('Origin', 'https://untrusted.example')
+      .set('Access-Control-Request-Method', 'POST');
+    expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('sets Secure cookies outside explicit development and test environments', async () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/auth/web/login')
+        .set('Origin', 'http://localhost:8081')
+        .send(credentials)
+        .expect(200);
+      expect(String(response.headers['set-cookie'])).toContain('Secure');
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
     }
   });
 });

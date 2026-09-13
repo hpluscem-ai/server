@@ -5,7 +5,7 @@ import {
 } from './auth.repository';
 import { AuthService } from './auth.service';
 import { SolapiSmsService } from './solapi-sms.service';
-import { PostmarkEmailService } from './postmark-email.service';
+import { ResendEmailService } from './resend-email.service';
 
 describe('AuthService', () => {
   it('rejects a simultaneous proof use and releases it after a correctable failure', async () => {
@@ -28,7 +28,7 @@ describe('AuthService', () => {
     const service = new AuthService(
       repository as unknown as AuthRepository,
       new SolapiSmsService(),
-      new PostmarkEmailService(),
+      new ResendEmailService(),
     );
     const input: SignUpRequestDto = {
       email: 'driver@example.com',

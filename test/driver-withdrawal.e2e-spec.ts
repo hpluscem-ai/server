@@ -509,9 +509,9 @@ describe('Driver withdrawal and re-registration (e2e)', () => {
   it('targets the newly registered identity for recovery and cannot revive an in-flight old reset email', async () => {
     jest.replaceProperty(process, 'env', {
       ...process.env,
-      POSTMARK_SERVER_TOKEN: 'test-only',
-      POSTMARK_FROM_EMAIL: 'sender@example.com',
-      POSTMARK_FROM_NAME: '테스트',
+      RESEND_API_KEY: 're_test_only',
+      RESEND_FROM_EMAIL: 'sender@example.com',
+      RESEND_FROM_NAME: '테스트',
       PASSWORD_RESET_URL: 'https://app.example.com/reset-password',
     });
     let finish!: (value: Response) => void;
@@ -521,10 +521,7 @@ describe('Driver withdrawal and re-registration (e2e)', () => {
     });
     const accepted = () =>
       Response.json({
-        ErrorCode: 0,
-        MessageID: randomUUID(),
-        To: email,
-        SubmittedAt: new Date().toISOString(),
+        id: randomUUID(),
       });
     const fetchMock = jest
       .spyOn(globalThis, 'fetch')
@@ -582,5 +579,134 @@ describe('Driver withdrawal and re-registration (e2e)', () => {
       '404',
       '500',
     ]);
+    const self = (response.body as OpenAPIObject).paths['/api/v1/users/me']
+      .delete!;
+    expect(self.security).toEqual(
+      expect.arrayContaining([{ bearer: [] }, { 'driver-session': [] }]),
+    );
+    expect(Object.keys(self.responses).sort()).toEqual([
+      '204',
+      '401',
+      '403',
+      '404',
+      '500',
+    ]);
+  });
+
+  it('withdraws only the authenticated driver and permits a fresh identity after re-verification', async () => {
+    const before = saved();
+    const other = saved(otherId);
+    const first = sessionToken(await login());
+    const second = sessionToken(await login());
+    const otherToken = sessionToken(await login('other@example.com'));
+    const oldProof = proof();
+    const oldReset = resetLink();
+
+    await request(app.getHttpServer())
+      .delete('/api/v1/users/me')
+      .auth(first, { type: 'bearer' })
+      .send({ id: otherId, userId: otherId })
+      .expect(204)
+      .expect('Cache-Control', 'no-store');
+    expect(saved()).toEqual({
+      ...before,
+      passwordHash: null,
+      deactivatedAt: expect.any(String) as string,
+      updatedAt: expect.any(String) as string,
+    });
+    expect(saved(otherId)).toEqual(other);
+    for (const token of [first, second]) {
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/me')
+        .auth(token, { type: 'bearer' })
+        .expect(401);
+    }
+    await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .auth(otherToken, { type: 'bearer' })
+      .expect(200);
+    expect(database.db.select().from(phoneVerifications).all()).toEqual([]);
+    expect(database.db.select().from(passwordResetTokens).all()).toEqual([]);
+    await signup(oldProof.token).expect(400);
+    await request(app.getHttpServer())
+      .post('/api/v1/auth/reset-password')
+      .send({ token: oldReset, newPassword })
+      .expect(400);
+    expect((await login()).status).toBe(401);
+    await request(app.getHttpServer())
+      .delete('/api/v1/users/me')
+      .auth(first, { type: 'bearer' })
+      .expect(401);
+    const fresh = await signup(proof().token).expect(201);
+    expect((fresh.body as { id: string }).id).not.toBe(userId);
+    expect(saved().deactivatedAt).not.toBeNull();
+  });
+
+  it('requires a driver session for self-withdrawal and never accepts an admin token', async () => {
+    const before = database.db.select().from(users).all();
+    await request(app.getHttpServer()).delete('/api/v1/users/me').expect(401);
+    await request(app.getHttpServer())
+      .delete('/api/v1/users/me')
+      .set('Authorization', authorization)
+      .expect(401);
+    expect(database.db.select().from(users).all()).toEqual(before);
+  });
+
+  it('protects cookie self-withdrawal from CSRF, rolls back storage faults, and clears the cookie only on success', async () => {
+    const origin = 'http://localhost:4000';
+    jest.replaceProperty(process, 'env', {
+      ...process.env,
+      WEB_ORIGINS: origin,
+    });
+    const browser = request.agent(app.getHttpServer());
+    await browser
+      .post('/api/v1/auth/web/login')
+      .set('Origin', origin)
+      .send({ email, password })
+      .expect(200);
+    for (const untrusted of [undefined, 'https://untrusted.example']) {
+      const pending = browser.delete('/api/v1/users/me');
+      if (untrusted) pending.set('Origin', untrusted);
+      const denied = await pending.expect(403);
+      expect(denied.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
+    }
+    const before = saved();
+    const verification = proof();
+    resetLink();
+    const resets = database.db.select().from(passwordResetTokens).all();
+    database.connection.exec(
+      "CREATE TRIGGER fail_self_withdrawal BEFORE DELETE ON phone_verifications BEGIN SELECT RAISE(ABORT, 'test storage failure'); END;",
+    );
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    try {
+      const failed = await browser
+        .delete('/api/v1/users/me')
+        .set('Origin', origin)
+        .expect(500);
+      expect(failed.body).toMatchObject({ code: 'INTERNAL_SERVER_ERROR' });
+      expect(failed.headers['set-cookie']).toBeUndefined();
+      expect(saved()).toEqual(before);
+      expect(database.db.select().from(passwordResetTokens).all()).toEqual(
+        resets,
+      );
+      expect(database.db.select().from(phoneVerifications).all()).toHaveLength(
+        1,
+      );
+      expect(database.db.select().from(phoneVerifications).all()[0].id).toBe(
+        verification.id,
+      );
+      await browser.get('/api/v1/auth/me').expect(200);
+    } finally {
+      database.connection.exec('DROP TRIGGER fail_self_withdrawal;');
+    }
+    const result = await browser
+      .delete('/api/v1/users/me')
+      .set('Origin', origin)
+      .expect(204);
+    expect(String(result.headers['set-cookie'])).toContain(
+      'Expires=Thu, 01 Jan 1970',
+    );
+    await browser.get('/api/v1/auth/me').expect(401);
+    expect(saved().passwordHash).toBeNull();
   });
 });

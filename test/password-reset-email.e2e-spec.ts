@@ -25,14 +25,10 @@ const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 const accepted = () =>
   Response.json({
-    ErrorCode: 0,
-    Message: 'OK',
-    MessageID: randomUUID(),
-    To: email,
-    SubmittedAt: new Date().toISOString(),
+    id: randomUUID(),
   });
 
-describe('Postmark password reset email (e2e)', () => {
+describe('Resend password reset email (e2e)', () => {
   let app: INestApplication<App>;
   let database: DatabaseService;
   let fetchMock: jest.SpiedFunction<typeof fetch>;
@@ -49,9 +45,9 @@ describe('Postmark password reset email (e2e)', () => {
   beforeEach(() => {
     jest.replaceProperty(process, 'env', {
       ...process.env,
-      POSTMARK_SERVER_TOKEN: 'test-only-postmark-server-token',
-      POSTMARK_FROM_EMAIL: 'sender@example.com',
-      POSTMARK_FROM_NAME: '테스트 발신자',
+      RESEND_API_KEY: 're_test_only',
+      RESEND_FROM_EMAIL: 'sender@example.com',
+      RESEND_FROM_NAME: '테스트 발신자',
       PASSWORD_RESET_URL: 'https://app.example.com/reset-password',
     });
     fetchMock = jest
@@ -153,16 +149,15 @@ describe('Postmark password reset email (e2e)', () => {
   }
   function payload(index = fetchMock.mock.calls.length - 1) {
     return JSON.parse(fetchMock.mock.calls[index][1]!.body as string) as {
-      From: string;
-      To: string;
-      TextBody: string;
-      TrackLinks: string;
-      TrackOpens: boolean;
+      from: string;
+      to: string[];
+      subject: string;
+      text: string;
     };
   }
   function sentToken(index?: number) {
     const link = payload(index)
-      .TextBody.split('\n')
+      .text.split('\n')
       .find(
         (line) => line.startsWith('https:') || line.startsWith('hpluseco:'),
       )!;
@@ -202,18 +197,21 @@ describe('Postmark password reset email (e2e)', () => {
     expect(Object.keys(response.body as object)).toEqual(['message']);
     expect(JSON.stringify(response.body)).not.toContain(token);
     expect(payload()).toMatchObject({
-      To: email,
-      From: '"테스트 발신자" <sender@example.com>',
-      TrackOpens: false,
-      TrackLinks: 'None',
+      to: [email],
+      from: '"테스트 발신자" <sender@example.com>',
+      subject: '[에이치플러스에코] 비밀번호 재설정',
     });
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      'https://api.postmarkapp.com/email',
-    );
+    expect(Object.keys(payload()).sort()).toEqual([
+      'from',
+      'subject',
+      'text',
+      'to',
+    ]);
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.resend.com/emails');
     expect(fetchMock.mock.calls[0][1]).toMatchObject({
       method: 'POST',
       redirect: 'error',
-      headers: { 'X-Postmark-Server-Token': 'test-only-postmark-server-token' },
+      headers: { Authorization: 'Bearer re_test_only' },
     });
     expect(storedProof(item.id).consumedAt).not.toBeNull();
     expect(links()).toHaveLength(1);
@@ -240,7 +238,7 @@ describe('Postmark password reset email (e2e)', () => {
 
   it('returns only the current user email for an authenticated SMS-proven request', async () => {
     expect((await sendMine(proof().value).expect(200)).body).toEqual({ email });
-    expect(payload().To).toBe(email);
+    expect(payload().to).toEqual([email]);
   });
 
   it.each([
@@ -273,14 +271,7 @@ describe('Postmark password reset email (e2e)', () => {
           messageList: [{ messageId: 'test-id', statusCode: '2000' }],
         }),
       );
-      fetchMock.mockResolvedValueOnce(
-        Response.json({
-          ErrorCode: 0,
-          MessageID: randomUUID(),
-          To: storedEmail,
-          SubmittedAt: new Date().toISOString(),
-        }),
-      );
+      fetchMock.mockResolvedValueOnce(accepted());
       const response = await request(app.getHttpServer())
         .post('/api/v1/auth/phone-verifications')
         .send({ purpose: 'reset_password', email: inputEmail, phone })
@@ -301,7 +292,7 @@ describe('Postmark password reset email (e2e)', () => {
           email: storedEmail,
         });
       else await send(value, { email: inputEmail }).expect(202);
-      expect(payload().To).toBe(storedEmail);
+      expect(payload().to).toEqual([storedEmail]);
       await reset(sentToken()).expect(204);
       expect(storedProof(id).consumedAt).not.toBeNull();
     },
@@ -351,9 +342,9 @@ describe('Postmark password reset email (e2e)', () => {
   });
 
   it.each([
-    'POSTMARK_SERVER_TOKEN',
-    'POSTMARK_FROM_EMAIL',
-    'POSTMARK_FROM_NAME',
+    'RESEND_API_KEY',
+    'RESEND_FROM_EMAIL',
+    'RESEND_FROM_NAME',
     'PASSWORD_RESET_URL',
   ])('requires %s before consuming a proof', async (key) => {
     delete process.env[key];
@@ -363,10 +354,10 @@ describe('Postmark password reset email (e2e)', () => {
     expect(storedProof(item.id).consumedAt).toBeNull();
   });
   it.each([
-    ['POSTMARK_SERVER_TOKEN', 'POSTMARK_API_TEST'],
-    ['POSTMARK_SERVER_TOKEN', 'token\r\nInjected: value'],
-    ['POSTMARK_FROM_EMAIL', 'sender@example.com,other@example.com'],
-    ['POSTMARK_FROM_NAME', 'Name\r\nBcc: other@example.com'],
+    ['RESEND_API_KEY', 're_xxxxxxxxx'],
+    ['RESEND_API_KEY', 'token\r\nInjected: value'],
+    ['RESEND_FROM_EMAIL', 'sender@example.com,other@example.com'],
+    ['RESEND_FROM_NAME', 'Name\r\nBcc: other@example.com'],
     ['PASSWORD_RESET_URL', 'not-a-url'],
     ['PASSWORD_RESET_URL', 'http://app.example.com/reset-password'],
     ['PASSWORD_RESET_URL', 'javascript:alert(1)'],
@@ -388,7 +379,7 @@ describe('Postmark password reset email (e2e)', () => {
   it('allows an explicitly configured existing app scheme, without selecting it as a default', async () => {
     process.env.PASSWORD_RESET_URL = 'hpluseco://reset-password';
     await send(proof().value).expect(202);
-    expect(payload().TextBody).toContain('hpluseco://reset-password?token=');
+    expect(payload().text).toContain('hpluseco://reset-password?token=');
     await reset(sentToken()).expect(204);
   });
   it.each(['sign_up', 'find_email', 'change_phone'])(
@@ -526,11 +517,14 @@ describe('Postmark password reset email (e2e)', () => {
 
   it.each([
     'http_error',
+    'rate_limit',
+    'unverified_domain',
     'provider_error',
+    'embedded_error',
     'missing_id',
     'invalid_id',
-    'wrong_recipient',
-    'missing_timestamp',
+    'legacy_response',
+    'null_payload',
     'malformed_json',
     'timeout',
   ])(
@@ -542,10 +536,7 @@ describe('Postmark password reset email (e2e)', () => {
         .spyOn(Logger.prototype, 'error')
         .mockImplementation(() => undefined);
       const good = {
-        ErrorCode: 0,
-        MessageID: randomUUID(),
-        To: email,
-        SubmittedAt: new Date().toISOString(),
+        id: randomUUID(),
       };
       if (failure === 'timeout')
         fetchMock.mockRejectedValueOnce(
@@ -556,23 +547,36 @@ describe('Postmark password reset email (e2e)', () => {
           failure === 'malformed_json'
             ? new Response('private token')
             : Response.json(
+                failure === 'null_payload'
+                  ? null
+                  : failure === 'legacy_response'
+                    ? { ErrorCode: 0, MessageID: randomUUID() }
+                    : {
+                        ...good,
+                        ...(failure === 'provider_error'
+                          ? {
+                              name: 'validation_error',
+                              message: 'private data',
+                            }
+                          : {}),
+                        ...(failure === 'embedded_error'
+                          ? { error: { message: 'private data' } }
+                          : {}),
+                        ...(failure === 'missing_id' ? { id: undefined } : {}),
+                        ...(failure === 'invalid_id'
+                          ? { id: 'not-a-message-id' }
+                          : {}),
+                      },
                 {
-                  ...good,
-                  ...(failure === 'provider_error'
-                    ? { ErrorCode: 406, Message: 'private data' }
-                    : {}),
-                  ...(failure === 'missing_id' ? { MessageID: undefined } : {}),
-                  ...(failure === 'invalid_id'
-                    ? { MessageID: 'not-a-message-id' }
-                    : {}),
-                  ...(failure === 'wrong_recipient'
-                    ? { To: 'other@example.com' }
-                    : {}),
-                  ...(failure === 'missing_timestamp'
-                    ? { SubmittedAt: undefined }
-                    : {}),
+                  status:
+                    failure === 'http_error'
+                      ? 503
+                      : failure === 'rate_limit'
+                        ? 429
+                        : failure === 'unverified_domain'
+                          ? 403
+                          : 200,
                 },
-                { status: failure === 'http_error' ? 503 : 200 },
               ),
         );
       expect((await send(item.value).expect(502)).body).toEqual({
@@ -784,11 +788,17 @@ describe('Postmark password reset email (e2e)', () => {
       '200',
       '400',
       '401',
+      '403',
       '500',
       '502',
       '503',
     ]);
-    expect(docs.paths[mine].post!.security).toEqual([{ bearer: [] }]);
+    expect(docs.paths[mine].post!.security).toEqual([
+      { bearer: [] },
+      { 'driver-session': [] },
+    ]);
+    expect(docs.paths[path].post!.description).toContain('Resend');
+    expect(docs.paths[mine].post!.description).toContain('Resend');
     expect(
       docs.components!.schemas!.RequestPasswordResetEmailDto,
     ).toMatchObject({ required: ['phone', 'verificationProof', 'email'] });

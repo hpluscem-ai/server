@@ -14,6 +14,7 @@ import {
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
+  ApiCookieAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiInternalServerErrorResponse,
@@ -137,6 +138,7 @@ export class AdminStationsController {
 @Controller('stations')
 @ApiTags('Driver stations')
 @UseGuards(AuthSessionGuard)
+@ApiCookieAuth('driver-session')
 @ApiBearerAuth()
 @ApiUnauthorizedResponse({
   type: ApiErrorResponseDto,

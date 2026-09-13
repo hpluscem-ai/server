@@ -7,6 +7,7 @@ import {
   Param,
   Post,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -14,6 +15,7 @@ import {
   ApiAcceptedResponse,
   ApiBadRequestResponse,
   ApiBearerAuth,
+  ApiCookieAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiForbiddenResponse,
@@ -28,7 +30,17 @@ import {
 } from '@nestjs/swagger';
 
 import { ApiErrorResponseDto } from '../common/api-error-response.dto';
-import { LoginRequestDto, LoginResponseDto } from './auth-login.dto';
+import type { Request, Response } from 'express';
+import {
+  LoginRequestDto,
+  LoginResponseDto,
+  WebLoginResponseDto,
+} from './auth-login.dto';
+import {
+  assertWebOrigin,
+  clearWebSession,
+  setWebSession,
+} from './auth-web-session';
 import { CurrentUserResponseDto } from './auth-session.dto';
 import {
   AuthSessionGuard,
@@ -91,8 +103,53 @@ export class AuthController {
     return this.authService.login(input);
   }
 
+  @Post('web/login')
+  @HttpCode(200)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: '웹 기사 로그인',
+    description:
+      '허용된 Origin에서 로그인하고 기존 기사 세션을 HttpOnly 쿠키로 발급합니다. 응답 JSON에 토큰을 포함하지 않습니다.',
+  })
+  @ApiOkResponse({
+    type: WebLoginResponseDto,
+    headers: {
+      'Set-Cookie': {
+        description: 'HttpOnly 기사 세션 쿠키. 운영 HTTPS에서는 Secure.',
+        schema: { type: 'string' },
+      },
+    },
+  })
+  @ApiBadRequestResponse({
+    description: 'VALIDATION_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'INVALID_CREDENTIALS',
+    type: ApiErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED | ACCOUNT_UNAVAILABLE',
+    type: ApiErrorResponseDto,
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'INTERNAL_SERVER_ERROR',
+    type: ApiErrorResponseDto,
+  })
+  async webLogin(
+    @Body() input: LoginRequestDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<WebLoginResponseDto> {
+    assertWebOrigin(request);
+    const session = await this.authService.login(input);
+    setWebSession(response, session.token, session.expiresAt);
+    return { expiresAt: session.expiresAt };
+  }
+
   @Get('me')
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '현재 기사 세션 확인',
@@ -113,13 +170,18 @@ export class AuthController {
   }
 
   @Post('logout')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @HttpCode(204)
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '현재 기사 세션 로그아웃',
     description:
-      '헤더로 인증한 현재 세션만 폐기합니다. 다른 기기의 세션은 유지하며 이미 폐기되거나 만료된 세션으로 요청하면 401을 반환합니다.',
+      'Bearer 또는 쿠키로 인증한 현재 세션만 폐기합니다. 다른 기기의 세션은 유지하며 이미 폐기되거나 만료된 세션으로 요청하면 401을 반환합니다.',
   })
   @ApiNoContentResponse({ description: '현재 세션 로그아웃 완료' })
   @ApiUnauthorizedResponse({
@@ -130,13 +192,22 @@ export class AuthController {
     description: 'INTERNAL_SERVER_ERROR',
     type: ApiErrorResponseDto,
   })
-  logout(@Req() request: AuthenticatedRequest): void {
+  logout(
+    @Req() request: AuthenticatedRequest,
+    @Res({ passthrough: true }) response: Response,
+  ): void {
     this.authService.logout(request.authSession.tokenHash);
+    if (request.authMethod === 'cookie') clearWebSession(response);
   }
 
   @Post('change-password')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @HttpCode(204)
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '로그인한 기사의 비밀번호 변경',
@@ -222,7 +293,7 @@ export class AuthController {
   @ApiOperation({
     summary: 'SMS 인증 후 비밀번호 재설정 메일 요청',
     description:
-      'reset_password 목적·이메일·연락처에 묶인 증명을 발송 전에 한 번 소비합니다. 활성 기사·소속의 일치 계정에만 Postmark로 발송하며 계정 불일치도 동일한 접수 응답입니다. 설정 누락·발송 실패·저장 오류는 성공으로 바꾸지 않습니다. Postmark 접수 후 30분 링크를 활성화하고 이전 링크를 무효화합니다. 메일 실패 시 기존 링크를 유지하고 재요청은 SMS 재인증이 필요합니다. 토큰 원문을 반환하지 않고 실제 배달 완료를 보장하지 않습니다.',
+      'reset_password 목적·이메일·연락처에 묶인 증명을 발송 전에 한 번 소비합니다. 활성 기사·소속의 일치 계정에만 Resend로 발송하며 계정 불일치도 동일한 접수 응답입니다. 설정 누락·발송 실패·저장 오류는 성공으로 바꾸지 않습니다. Resend 접수 후 30분 링크를 활성화하고 이전 링크를 무효화합니다. 메일 실패 시 기존 링크를 유지하고 재요청은 SMS 재인증이 필요합니다. 토큰 원문을 반환하지 않고 실제 배달 완료를 보장하지 않습니다.',
   })
   @ApiAcceptedResponse({ type: PasswordResetEmailResponseDto })
   @ApiBadRequestResponse({
@@ -253,13 +324,18 @@ export class AuthController {
   }
 
   @Post('me/password-reset-emails')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @HttpCode(200)
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '마이페이지 SMS 재인증 후 본인 재설정 메일 요청',
     description:
-      '본인 이메일과 가입 연락처로 reset_password SMS를 발송·확인한 증명이 필요합니다. 수신 이메일은 기사 세션에서만 결정하며 요청에 이메일을 허용하지 않습니다. Postmark 접수·토큰 저장 성공 시 본인 이메일을 반환합니다. 링크 30분·증명 일회용·기존 링크 무효화와 실패 정책은 공개 재설정 메일 API와 같습니다.',
+      '본인 이메일과 가입 연락처로 reset_password SMS를 발송·확인한 증명이 필요합니다. 수신 이메일은 기사 세션에서만 결정하며 요청에 이메일을 허용하지 않습니다. Resend 접수·토큰 저장 성공 시 본인 이메일을 반환합니다. 링크 30분·증명 일회용·기존 링크 무효화와 실패 정책은 공개 재설정 메일 API와 같습니다.',
   })
   @ApiOkResponse({ type: MyPasswordResetEmailResponseDto })
   @ApiBadRequestResponse({
@@ -326,7 +402,7 @@ export class AuthController {
   @ApiOperation({
     summary: '목적별 SMS 인증번호 확인',
     description:
-      '발송 목적이 일치할 때 해당 목적·입력 범위에 묶인 일회용 증명을 발급합니다. 원래 3분 만료 시각은 연장하지 않으며 같은 인증번호를 다시 확인할 수 없습니다.',
+      '발송 목적이 일치할 때 해당 목적·입력 범위에 묶인 일회용 증명을 발급합니다. 원래 3분 안에 미사용 인증번호를 다시 확인할 수 있으며 성공할 때마다 이전 증명을 새 증명으로 교체합니다. 만료 시각은 연장하지 않고 소비·재발송·폐기된 인증은 거부합니다.',
   })
   @ApiOkResponse({ type: ConfirmPhoneVerificationResponseDto })
   @ApiBadRequestResponse({
@@ -365,7 +441,12 @@ export class AuthController {
   }
 
   @Post('phone-change/verifications')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '본인 연락처 변경용 SMS 발송',
@@ -408,13 +489,18 @@ export class AuthController {
   }
 
   @Post('phone-change/verifications/:verificationId/confirm')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @HttpCode(200)
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: '본인 연락처 변경용 SMS 확인',
     description:
-      '같은 기사가 발송한 미사용 인증만 확인합니다. 발송 시의 만료 시각은 연장하지 않습니다.',
+      '같은 기사가 발송한 미사용 인증만 확인합니다. 유효한 인증번호를 재확인하면 이전 증명을 새 증명으로 교체하며 발송 시의 만료 시각은 연장하지 않습니다.',
   })
   @ApiOkResponse({ type: ConfirmPhoneVerificationResponseDto })
   @ApiBadRequestResponse({
@@ -448,8 +534,13 @@ export class AuthController {
   }
 
   @Post('change-phone')
+  @ApiForbiddenResponse({
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+    type: ApiErrorResponseDto,
+  })
   @HttpCode(204)
   @UseGuards(AuthSessionGuard)
+  @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'SMS 인증 후 본인 연락처 변경',

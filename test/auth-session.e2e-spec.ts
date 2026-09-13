@@ -32,7 +32,10 @@ describe('Auth sessions (e2e)', () => {
   let passwordHash: string;
   let sequence = 0;
 
+  const previousWebOrigins = process.env.WEB_ORIGINS;
+
   beforeAll(async () => {
+    process.env.WEB_ORIGINS = 'http://localhost:8081';
     app = await createTestApp();
     database = app.get(DatabaseService);
     passwordHash = await argon2.hash('Password!1', { type: argon2.argon2id });
@@ -52,6 +55,8 @@ describe('Auth sessions (e2e)', () => {
 
   afterAll(async () => {
     await app.close();
+    if (previousWebOrigins === undefined) delete process.env.WEB_ORIGINS;
+    else process.env.WEB_ORIGINS = previousWebOrigins;
   });
 
   function seedCompany() {
@@ -211,7 +216,7 @@ describe('Auth sessions (e2e)', () => {
     },
   );
 
-  it('does not accept a token from the query string or cookies', async () => {
+  it('does not accept a token from the query string or unrelated cookies', async () => {
     const current = seedSession();
     await request(app.getHttpServer())
       .get('/api/v1/auth/me')
@@ -428,7 +433,7 @@ describe('Auth sessions (e2e)', () => {
     await me(current.token).expect(200);
   });
 
-  it('documents Bearer auth only on protected driver routes', async () => {
+  it('documents Bearer or cookie auth only on protected driver routes', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -439,7 +444,7 @@ describe('Auth sessions (e2e)', () => {
       bearerFormat: 'opaque',
     });
     expect(document.paths['/api/v1/auth/me']?.get).toMatchObject({
-      security: [{ bearer: [] }],
+      security: [{ bearer: [] }, { 'driver-session': [] }],
       responses: {
         '200': {
           content: {
@@ -453,7 +458,7 @@ describe('Auth sessions (e2e)', () => {
       },
     });
     expect(document.paths['/api/v1/auth/logout']?.post).toMatchObject({
-      security: [{ bearer: [] }],
+      security: [{ bearer: [] }, { 'driver-session': [] }],
       responses: {
         '204': { description: '현재 세션 로그아웃 완료' },
         '401': { description: 'INVALID_SESSION' },
@@ -466,6 +471,16 @@ describe('Auth sessions (e2e)', () => {
     expect(
       document.paths['/api/v1/auth/signup']?.post?.security,
     ).toBeUndefined();
+    expect(
+      document.components?.securitySchemes?.['driver-session'],
+    ).toMatchObject({
+      type: 'apiKey',
+      in: 'cookie',
+      name: 'hpluseco_driver_session',
+    });
+    expect(
+      document.paths['/api/v1/auth/web/login']?.post?.security,
+    ).toBeUndefined();
     const schema = document.components?.schemas?.CurrentUserResponseDto;
     expect(schema).toMatchObject({
       required: ['id', 'email', 'name', 'logisticsCompanyId'],
@@ -475,6 +490,83 @@ describe('Auth sessions (e2e)', () => {
         ['properties', field, 'description'],
         expect.stringMatching(/[가-힣]/),
       );
+    }
+  });
+
+  it('accepts only the named cookie and never falls back from malformed Bearer auth', async () => {
+    const current = seedSession();
+    const cookie = `hpluseco_driver_session=${current.token}`;
+    const rejected = await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Cookie', cookie)
+      .set('Authorization', 'Bearer invalid')
+      .expect(401);
+    expect(rejected.headers['set-cookie']).toBeUndefined();
+    expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+    await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Cookie', cookie)
+      .expect(200);
+    const duplicate = await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Cookie', `${cookie}; ${cookie}`)
+      .expect(401);
+    expect(String(duplicate.headers['set-cookie'])).toContain(
+      'hpluseco_driver_session=;',
+    );
+    await request(app.getHttpServer())
+      .get('/api/v1/admin/auth/me')
+      .set('Cookie', cookie)
+      .expect(401);
+  });
+
+  it.each([undefined, 'null', 'https://untrusted.example'])(
+    'blocks cookie mutations before touching the session for Origin %p',
+    async (origin) => {
+      const current = seedSession();
+      for (const path of [
+        '/api/v1/auth/logout',
+        '/api/v1/auth/change-password',
+      ]) {
+        const pending = request(app.getHttpServer())
+          .post(path)
+          .set('Cookie', `hpluseco_driver_session=${current.token}`)
+          .send({});
+        if (origin !== undefined) pending.set('Origin', origin);
+        const response = await pending.expect(403);
+        expect(response.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
+        expect(response.headers['set-cookie']).toBeUndefined();
+        expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+      }
+    },
+  );
+
+  it('clears an expired cookie but preserves cookies when the database fails', async () => {
+    const expired = seedSession({
+      createdAt: new Date(NOW - 10 * DAY),
+      lastUsedAt: new Date(NOW - 7 * DAY),
+    });
+    const expiredResponse = await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Cookie', `hpluseco_driver_session=${expired.token}`)
+      .expect(401);
+    expect(String(expiredResponse.headers['set-cookie'])).toContain(
+      'Expires=Thu, 01 Jan 1970',
+    );
+    const current = seedSession();
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    database.connection
+      .exec(`CREATE TRIGGER fail_cookie_touch AFTER UPDATE OF last_used_at ON auth_sessions
+      BEGIN SELECT RAISE(FAIL, 'forced cookie update failure'); END;`);
+    try {
+      const response = await request(app.getHttpServer())
+        .get('/api/v1/auth/me')
+        .set('Cookie', `hpluseco_driver_session=${current.token}`)
+        .expect(500);
+      expect(response.headers['set-cookie']).toBeUndefined();
+      expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+    } finally {
+      database.connection.exec('DROP TRIGGER fail_cookie_touch');
     }
   });
 });
