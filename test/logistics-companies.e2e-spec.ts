@@ -477,6 +477,7 @@ describe('Logistics companies (e2e)', () => {
       '201',
       '400',
       '401',
+      '403',
       '409',
       '500',
     ]);
@@ -491,6 +492,7 @@ describe('Logistics companies (e2e)', () => {
       '200',
       '400',
       '401',
+      '403',
       '404',
       '409',
       '500',
@@ -499,6 +501,7 @@ describe('Logistics companies (e2e)', () => {
       '204',
       '400',
       '401',
+      '403',
       '404',
       '500',
     ]);
@@ -524,10 +527,10 @@ describe('Logistics companies (e2e)', () => {
       item.put.responses['200'].content?.['application/json'].schema.$ref,
     ).toBe('#/components/schemas/LogisticsCompanyResponseDto');
     for (const [operation, statusCodes] of [
-      [collection.post, ['400', '409']],
+      [collection.post, ['400', '403', '409']],
       [item.get, ['400', '404']],
-      [item.put, ['400', '404', '409']],
-      [item.delete, ['400', '404', '500']],
+      [item.put, ['400', '403', '404', '409']],
+      [item.delete, ['400', '403', '404', '500']],
     ] as const) {
       for (const statusCode of statusCodes) {
         expect(
