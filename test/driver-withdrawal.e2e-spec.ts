@@ -571,11 +571,15 @@ describe('Driver withdrawal and re-registration (e2e)', () => {
       .expect(200);
     const operation = (response.body as OpenAPIObject).paths[`${path}/{id}`]
       .delete!;
-    expect(operation.security).toEqual([{ admin: [] }]);
+    expect(operation.security).toEqual([
+      { admin: [] },
+      { 'admin-session': [] },
+    ]);
     expect(Object.keys(operation.responses).sort()).toEqual([
       '204',
       '400',
       '401',
+      '403',
       '404',
       '500',
     ]);

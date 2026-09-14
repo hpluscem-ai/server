@@ -12,6 +12,7 @@ import {
   ApiBadRequestResponse,
   ApiBearerAuth,
   ApiCookieAuth,
+  ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
@@ -61,6 +62,10 @@ export class AdminDriversController {
   }
 
   @Delete(':id')
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @HttpCode(204)
   @ApiOperation({
     summary: '관리자 기사 탈퇴 처리',

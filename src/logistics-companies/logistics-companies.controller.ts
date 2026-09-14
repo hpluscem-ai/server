@@ -15,6 +15,7 @@ import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
@@ -68,6 +69,10 @@ export class LogisticsCompaniesController {
   }
 
   @Post()
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @ApiBadRequestResponse({ type: ApiErrorResponseDto })
   @ApiConflictResponse({ type: ApiErrorResponseDto })
   @ApiCreatedResponse({ type: LogisticsCompanyResponseDto })
@@ -78,6 +83,10 @@ export class LogisticsCompaniesController {
   }
 
   @Put(':id')
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @ApiBadRequestResponse({ type: ApiErrorResponseDto })
   @ApiConflictResponse({ type: ApiErrorResponseDto })
   @ApiNotFoundResponse({ type: ApiErrorResponseDto })
@@ -91,6 +100,10 @@ export class LogisticsCompaniesController {
   }
 
   @Delete(':id')
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiBadRequestResponse({ type: ApiErrorResponseDto })
   @ApiNoContentResponse({

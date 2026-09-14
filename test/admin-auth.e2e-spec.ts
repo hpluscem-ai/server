@@ -356,11 +356,15 @@ describe('Admin authentication (e2e)', () => {
         continue;
       for (const method of ['get', 'post', 'put', 'delete'] as const) {
         const operation = operations?.[method];
-        if (operation)
+        if (operation) {
           expect(operation.security).toEqual([
             { admin: [] },
             { 'admin-session': [] },
           ]);
+          if (['post', 'put', 'delete'].includes(method)) {
+            expect(operation.responses['403']).toBeDefined();
+          }
+        }
       }
     }
     expect(document.paths[`${PATH}/login`]?.post?.description).toContain(

@@ -185,7 +185,10 @@ describe('Admin driver list (e2e)', () => {
       .get('/docs-json')
       .expect(200);
     const document = result.body as OpenAPIObject;
-    expect(document.paths[PATH]?.get?.security).toEqual([{ admin: [] }]);
+    expect(document.paths[PATH]?.get?.security).toEqual([
+      { admin: [] },
+      { 'admin-session': [] },
+    ]);
     expect(document.paths[PATH]?.get?.description).toContain('미제공');
     const schema = document.components?.schemas?.AdminDriverResponseDto;
     expect(

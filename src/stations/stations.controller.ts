@@ -17,6 +17,7 @@ import {
   ApiCookieAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
@@ -85,6 +86,10 @@ export class AdminStationsController {
   }
 
   @Post()
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @ApiOperation({
     summary: '주유소 및 설치 기기 등록',
     description:
@@ -96,6 +101,10 @@ export class AdminStationsController {
   }
 
   @Put(':id')
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @ApiOperation({
     summary: '주유소 및 설치 기기 수정',
     description:
@@ -119,6 +128,10 @@ export class AdminStationsController {
   }
 
   @Delete(':id')
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
   @HttpCode(204)
   @ApiOperation({
     summary: '주유소 및 종속 기기 삭제',

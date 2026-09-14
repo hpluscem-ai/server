@@ -756,7 +756,10 @@ describe('Stations (e2e)', () => {
       .get('/docs-json')
       .expect(200);
     const document = result.body as OpenAPIObject;
-    expect(document.paths[ADMIN_PATH]?.post?.security).toEqual([{ admin: [] }]);
+    expect(document.paths[ADMIN_PATH]?.post?.security).toEqual([
+      { admin: [] },
+      { 'admin-session': [] },
+    ]);
     expect(document.paths[APP_PATH]?.get?.security).toEqual([
       { bearer: [] },
       { 'driver-session': [] },
@@ -766,12 +769,13 @@ describe('Stations (e2e)', () => {
     );
     expect(document.paths[`${ADMIN_PATH}/{id}`]?.delete?.security).toEqual([
       { admin: [] },
+      { 'admin-session': [] },
     ]);
     expect(
       Object.keys(
         document.paths[`${ADMIN_PATH}/{id}`].delete!.responses,
       ).sort(),
-    ).toEqual(['204', '400', '401', '404', '500']);
+    ).toEqual(['204', '400', '401', '403', '404', '500']);
     const invalidIdResponse =
       document.paths[`${ADMIN_PATH}/{id}`]?.put?.responses?.['400'];
     expect(
