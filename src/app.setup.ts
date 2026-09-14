@@ -6,7 +6,11 @@ import {
 } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
-import { getWebOrigins, WEB_SESSION_COOKIE } from './auth';
+import {
+  ADMIN_WEB_SESSION_COOKIE,
+  getWebOrigins,
+  WEB_SESSION_COOKIE,
+} from './auth';
 import { ApiErrorResponseDto } from './common/api-error-response.dto';
 import { ApiExceptionFilter } from './common/api-exception.filter';
 
@@ -88,6 +92,16 @@ export function configureApp(app: INestApplication): void {
         description: '웹 로그인에서 발급한 HttpOnly 기사 세션 쿠키.',
       },
       'driver-session',
+    )
+    .addCookieAuth(
+      ADMIN_WEB_SESSION_COOKIE,
+      {
+        type: 'apiKey',
+        in: 'cookie',
+        description:
+          '웹 관리자 로그인에서 발급한 HttpOnly 관리자 전용 세션 쿠키.',
+      },
+      'admin-session',
     )
     .build();
 

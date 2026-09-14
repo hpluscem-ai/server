@@ -41,6 +41,7 @@ import { StationsService } from './stations.service';
 @Controller('admin/stations')
 @ApiTags('Admin stations')
 @UseGuards(AdminSessionGuard)
+@ApiCookieAuth('admin-session')
 @ApiBearerAuth('admin')
 @ApiUnauthorizedResponse({
   type: ApiErrorResponseDto,

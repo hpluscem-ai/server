@@ -18,12 +18,13 @@ export class AdminAuthService {
   constructor(private readonly repository: AdminAuthRepository) {}
 
   async login(input: LoginRequestDto): Promise<LoginResponseDto> {
-    // 미정인 관리자 유지기간을 기사 정책이나 임의 기본값으로 채우지 않는다.
+    // 승인된 관리자 최대 유지기간은 8시간이며 기본값은 두지 않는다.
     const setting = process.env.ADMIN_SESSION_TTL_SECONDS?.trim() ?? '';
     const lifetime = Number(setting) * 1000;
     if (
       !/^[1-9]\d*$/.test(setting) ||
       !Number.isSafeInteger(lifetime) ||
+      lifetime > 8 * 60 * 60 * 1000 ||
       Number.isNaN(new Date(Date.now() + lifetime).getTime())
     ) {
       throw new ServiceUnavailableException({

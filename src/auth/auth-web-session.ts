@@ -2,6 +2,7 @@ import { ForbiddenException } from '@nestjs/common';
 import type { CookieOptions, Request, Response } from 'express';
 
 export const WEB_SESSION_COOKIE = 'hpluseco_driver_session';
+export const ADMIN_WEB_SESSION_COOKIE = 'hpluseco_admin_session';
 
 export function getWebOrigins(): string[] {
   const configured = process.env.WEB_ORIGINS?.trim();
@@ -36,22 +37,25 @@ export function assertWebOrigin(request: Request): void {
   }
 }
 
-function cookieOptions(): CookieOptions {
+function cookieOptions(path = '/api/v1'): CookieOptions {
   return {
     httpOnly: true,
     sameSite: 'lax',
-    path: '/api/v1',
+    path,
     secure: !['development', 'test'].includes(process.env.NODE_ENV ?? ''),
   };
 }
 
-export function readWebSession(request: Request): string | undefined {
+export function readWebSession(
+  request: Request,
+  cookieName = WEB_SESSION_COOKIE,
+): string | undefined {
   const values = (request.headers.cookie ?? '')
     .split(';')
     .map((part) => part.trim())
-    .filter((part) => part.startsWith(`${WEB_SESSION_COOKIE}=`));
+    .filter((part) => part.startsWith(`${cookieName}=`));
   if (values.length !== 1) return undefined;
-  const token = values[0].slice(WEB_SESSION_COOKIE.length + 1);
+  const token = values[0].slice(cookieName.length + 1);
   return /^[A-Za-z0-9_-]{43}$/.test(token) ? token : undefined;
 }
 
@@ -59,13 +63,19 @@ export function setWebSession(
   response: Response,
   token: string,
   expiresAt: string,
+  cookieName = WEB_SESSION_COOKIE,
+  path = '/api/v1',
 ): void {
-  response.cookie(WEB_SESSION_COOKIE, token, {
-    ...cookieOptions(),
+  response.cookie(cookieName, token, {
+    ...cookieOptions(path),
     expires: new Date(expiresAt),
   });
 }
 
-export function clearWebSession(response: Response): void {
-  response.clearCookie(WEB_SESSION_COOKIE, cookieOptions());
+export function clearWebSession(
+  response: Response,
+  cookieName = WEB_SESSION_COOKIE,
+  path = '/api/v1',
+): void {
+  response.clearCookie(cookieName, cookieOptions(path));
 }

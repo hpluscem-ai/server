@@ -6,9 +6,16 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 
+import {
+  ADMIN_WEB_SESSION_COOKIE,
+  assertWebOrigin,
+  readWebSession,
+} from '../auth';
+
 import { AdminAuthService } from './admin-auth.service';
 
 export type AdminAuthenticatedRequest = Request & {
+  authMethod: 'bearer' | 'cookie';
   adminSession: NonNullable<ReturnType<AdminAuthService['authenticate']>>;
 };
 
@@ -20,9 +27,21 @@ export class AdminSessionGuard implements CanActivate {
     const request = http.getRequest<AdminAuthenticatedRequest>();
     const response = http.getResponse<Response>();
     response.setHeader('Cache-Control', 'no-store');
-    const token = request.headers.authorization?.match(
-      /^Bearer +([A-Za-z0-9_-]{43})$/i,
-    )?.[1];
+    request.authMethod =
+      request.headers.authorization === undefined ? 'cookie' : 'bearer';
+    const token =
+      request.authMethod === 'bearer'
+        ? request.headers.authorization?.match(
+            /^Bearer +([A-Za-z0-9_-]{43})$/i,
+          )?.[1]
+        : readWebSession(request, ADMIN_WEB_SESSION_COOKIE);
+    if (
+      request.authMethod === 'cookie' &&
+      token &&
+      !['GET', 'HEAD', 'OPTIONS'].includes(request.method)
+    ) {
+      assertWebOrigin(request);
+    }
     const session = this.auth.authenticate(token);
     if (!session) {
       response.setHeader('WWW-Authenticate', 'Bearer');

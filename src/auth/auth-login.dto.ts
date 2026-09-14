@@ -54,7 +54,7 @@ export class LoginResponseDto {
 export class WebLoginResponseDto {
   @ApiProperty({
     description:
-      '기사 세션의 최대 만료 시각. 세션 토큰은 HttpOnly 쿠키로만 전달합니다.',
+      '세션의 최대 만료 시각. 세션 토큰은 HttpOnly 쿠키로만 전달합니다.',
     format: 'date-time',
   })
   expiresAt!: string;

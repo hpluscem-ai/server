@@ -22,6 +22,7 @@ import {
   ApiParam,
   ApiTags,
   ApiBearerAuth,
+  ApiCookieAuth,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 
@@ -35,6 +36,7 @@ import { LogisticsCompaniesService } from './logistics-companies.service';
 
 @ApiTags('Admin logistics companies')
 @UseGuards(AdminSessionGuard)
+@ApiCookieAuth('admin-session')
 @ApiBearerAuth('admin')
 @ApiUnauthorizedResponse({
   type: ApiErrorResponseDto,

@@ -16,13 +16,17 @@ import { createTestApp } from './helpers/create-test-app';
 
 const PATH = '/api/v1/admin/auth';
 const password = 'AdminPassword!1';
+const ORIGIN = 'http://localhost:5173';
+const COOKIE = 'hpluseco_admin_session';
 
 describe('Admin authentication (e2e)', () => {
   let app: INestApplication<App>;
   let database: DatabaseService;
   let adminId: string;
   let hash: string;
+  const previousOrigins = process.env.WEB_ORIGINS;
   beforeAll(async () => {
+    process.env.WEB_ORIGINS = ORIGIN;
     app = await createTestApp();
     database = app.get(DatabaseService);
     hash = await argon2.hash(password, { type: argon2.argon2id });
@@ -50,7 +54,11 @@ describe('Admin authentication (e2e)', () => {
     database.connection.exec('DROP TRIGGER IF EXISTS fail_admin_session');
     jest.restoreAllMocks();
   });
-  afterAll(async () => app.close());
+  afterAll(async () => {
+    await app.close();
+    if (previousOrigins === undefined) delete process.env.WEB_ORIGINS;
+    else process.env.WEB_ORIGINS = previousOrigins;
+  });
   function login(input: unknown = { email: 'admin@example.com', password }) {
     return request(app.getHttpServer())
       .post(`${PATH}/login`)
@@ -101,18 +109,24 @@ describe('Admin authentication (e2e)', () => {
       .expect(200);
   });
 
-  it.each(['', '0', '-1', 'abc', '1.5', 'Infinity', '9007199254740991'])(
-    'fails closed for unconfigured/invalid TTL %p',
-    async (ttl) => {
-      process.env.ADMIN_SESSION_TTL_SECONDS = ttl;
-      await login()
-        .expect(503)
-        .expect(({ body }: { body: { code: string } }) =>
-          expect(body.code).toBe('ADMIN_AUTH_NOT_CONFIGURED'),
-        );
-      expect(count()).toEqual({ count: 0 });
-    },
-  );
+  it.each([
+    '',
+    '0',
+    '-1',
+    'abc',
+    '1.5',
+    'Infinity',
+    '28801',
+    '9007199254740991',
+  ])('fails closed for unconfigured/invalid TTL %p', async (ttl) => {
+    process.env.ADMIN_SESSION_TTL_SECONDS = ttl;
+    await login()
+      .expect(503)
+      .expect(({ body }: { body: { code: string } }) =>
+        expect(body.code).toBe('ADMIN_AUTH_NOT_CONFIGURED'),
+      );
+    expect(count()).toEqual({ count: 0 });
+  });
 
   it.each([
     { email: 'missing@example.com', password },
@@ -334,16 +348,220 @@ describe('Admin authentication (e2e)', () => {
       .expect(200);
     const document = response.body as OpenAPIObject;
     for (const [path, operations] of Object.entries(document.paths)) {
-      if (!path.startsWith('/api/v1/admin/') || path === `${PATH}/login`)
+      if (
+        !path.startsWith('/api/v1/admin/') ||
+        path === `${PATH}/login` ||
+        path === `${PATH}/web/login`
+      )
         continue;
       for (const method of ['get', 'post', 'put', 'delete'] as const) {
         const operation = operations?.[method];
-        if (operation) expect(operation.security).toEqual([{ admin: [] }]);
+        if (operation)
+          expect(operation.security).toEqual([
+            { admin: [] },
+            { 'admin-session': [] },
+          ]);
       }
     }
     expect(document.paths[`${PATH}/login`]?.post?.description).toContain(
       'ADMIN_SESSION_TTL_SECONDS',
     );
     expect(document.components?.securitySchemes?.admin).toBeDefined();
+    expect(
+      document.components?.securitySchemes?.['admin-session'],
+    ).toMatchObject({ type: 'apiKey', in: 'cookie', name: COOKIE });
+    expect(document.paths[`${PATH}/web/login`]?.post?.security).toBeUndefined();
+  });
+
+  it('uses a separate HttpOnly web cookie with fixed 8-hour expiry and current-session logout', async () => {
+    process.env.ADMIN_SESSION_TTL_SECONDS = '28800';
+    const browser = request.agent(app.getHttpServer());
+    const before = Date.now();
+    const result = await browser
+      .post(`${PATH}/web/login`)
+      .set('Origin', ORIGIN)
+      .send({ email: 'admin@example.com', password })
+      .expect(200)
+      .expect('Cache-Control', 'no-store');
+    const body = result.body as { expiresAt: string };
+    expect(Object.keys(body)).toEqual(['expiresAt']);
+    expect(Date.parse(body.expiresAt)).toBeGreaterThanOrEqual(
+      before + 28800000,
+    );
+    expect(Date.parse(body.expiresAt)).toBeLessThanOrEqual(
+      Date.now() + 28800000,
+    );
+    const cookie = String(result.headers['set-cookie']);
+    for (const flag of [
+      `${COOKIE}=`,
+      'HttpOnly',
+      'SameSite=Lax',
+      'Path=/api/v1/admin',
+    ])
+      expect(cookie).toContain(flag);
+    expect(cookie).not.toContain('hpluseco_driver_session');
+    expect(cookie).not.toContain('Domain=');
+    expect(cookie).not.toContain('Secure');
+    const stored = database.connection
+      .prepare('SELECT * FROM admin_sessions')
+      .all();
+    await browser
+      .get(`${PATH}/me`)
+      .expect(200)
+      .expect({ id: adminId, email: 'admin@example.com', name: '관리자' });
+    expect(
+      database.connection.prepare('SELECT * FROM admin_sessions').all(),
+    ).toEqual(stored);
+    await browser.get('/api/v1/admin/drivers').expect(200);
+    await browser.get('/api/v1/admin/stations').expect(200);
+    await browser.get('/api/v1/admin/logistics-companies').expect(200);
+    await request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Cookie', cookie.split(';')[0])
+      .expect(401);
+    const other = await token();
+    const logout = await browser
+      .post(`${PATH}/logout`)
+      .set('Origin', ORIGIN)
+      .expect(204);
+    expect(String(logout.headers['set-cookie'])).toContain(
+      'Expires=Thu, 01 Jan 1970',
+    );
+    expect(String(logout.headers['set-cookie'])).not.toContain(
+      'hpluseco_driver_session',
+    );
+    await browser.get(`${PATH}/me`).expect(401);
+    await me(other).expect(200);
+  });
+
+  it.each([undefined, 'null', 'http://localhost:5173.evil.test'])(
+    'rejects cookie login and mutations from Origin %p',
+    async (origin) => {
+      const value = await token();
+      for (const path of [
+        `${PATH}/web/login`,
+        `${PATH}/logout`,
+        '/api/v1/admin/logistics-companies',
+      ]) {
+        const pending = request(app.getHttpServer())
+          .post(path)
+          .set('Cookie', `${COOKIE}=${value}`)
+          .send(
+            path.endsWith('/login')
+              ? { email: 'admin@example.com', password }
+              : {},
+          );
+        if (origin !== undefined) pending.set('Origin', origin);
+        const result = await pending.expect(403);
+        expect(result.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
+        expect(result.headers['set-cookie']).toBeUndefined();
+      }
+      await me(value).expect(200);
+      expect(count()).toEqual({ count: 1 });
+    },
+  );
+
+  it('supports exact-origin credential CORS and secure production cookies', async () => {
+    const cors = await request(app.getHttpServer())
+      .options(`${PATH}/web/login`)
+      .set('Origin', ORIGIN)
+      .set('Access-Control-Request-Method', 'POST')
+      .expect(204);
+    expect(cors.headers['access-control-allow-origin']).toBe(ORIGIN);
+    expect(cors.headers['access-control-allow-credentials']).toBe('true');
+    const denied = await request(app.getHttpServer())
+      .options(`${PATH}/web/login`)
+      .set('Origin', `${ORIGIN}.evil.test`)
+      .set('Access-Control-Request-Method', 'POST');
+    expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+    process.env.NODE_ENV = 'production';
+    const result = await request(app.getHttpServer())
+      .post(`${PATH}/web/login`)
+      .set('Origin', ORIGIN)
+      .send({ email: 'admin@example.com', password })
+      .expect(200);
+    expect(String(result.headers['set-cookie'])).toContain('Secure');
+  });
+
+  it('rejects malformed Bearer, ambiguous cookies, and driver tokens without deleting a newer cookie', async () => {
+    const value = await token();
+    const cookie = `${COOKIE}=${value}`;
+    for (const header of ['Bearer invalid', 'Basic invalid']) {
+      const result = await request(app.getHttpServer())
+        .get(`${PATH}/me`)
+        .set('Authorization', header)
+        .set('Cookie', cookie)
+        .expect(401);
+      expect(result.headers['set-cookie']).toBeUndefined();
+    }
+    for (const cookies of [
+      `${cookie}; ${cookie}`,
+      `hpluseco_driver_session=${value}`,
+      `${COOKIE}=invalid`,
+    ]) {
+      const result = await request(app.getHttpServer())
+        .get(`${PATH}/me`)
+        .set('Cookie', cookies)
+        .expect(401);
+      expect(result.headers['set-cookie']).toBeUndefined();
+    }
+    const driverToken = randomBytes(32).toString('base64url');
+    database.db
+      .insert(authSessions)
+      .values({
+        tokenHash: createHash('sha256').update(driverToken).digest('hex'),
+        userId: adminId,
+        createdAt: new Date(),
+        lastUsedAt: new Date(),
+        expiresAt: new Date(Date.now() + 60000),
+      })
+      .run();
+    await request(app.getHttpServer())
+      .get(`${PATH}/me`)
+      .set('Cookie', `${COOKIE}=${driverToken}`)
+      .expect(401);
+    database.connection
+      .prepare('UPDATE admin_sessions SET created_at = ?, expires_at = ?')
+      .run(Date.now() - 1000, Date.now() - 1);
+    const newer = await token();
+    const expired = await request(app.getHttpServer())
+      .get(`${PATH}/me`)
+      .set('Cookie', cookie)
+      .expect(401);
+    expect(expired.headers['set-cookie']).toBeUndefined();
+    await me(newer).expect(200);
+  });
+
+  it('preserves cookies and sessions on storage failures and clears only after successful logout', async () => {
+    const value = await token();
+    const cookie = `${COOKIE}=${value}`;
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    database.connection.exec(
+      'ALTER TABLE admin_sessions RENAME TO unavailable_admin_sessions',
+    );
+    try {
+      const result = await request(app.getHttpServer())
+        .get(`${PATH}/me`)
+        .set('Cookie', cookie)
+        .expect(500);
+      expect(result.headers['set-cookie']).toBeUndefined();
+    } finally {
+      database.connection.exec(
+        'ALTER TABLE unavailable_admin_sessions RENAME TO admin_sessions',
+      );
+    }
+    database.connection.exec(
+      "CREATE TRIGGER fail_admin_session AFTER DELETE ON admin_sessions BEGIN SELECT RAISE(FAIL, 'forced failure'); END;",
+    );
+    const result = await request(app.getHttpServer())
+      .post(`${PATH}/logout`)
+      .set('Cookie', cookie)
+      .set('Origin', ORIGIN)
+      .expect(500);
+    expect(result.headers['set-cookie']).toBeUndefined();
+    await request(app.getHttpServer())
+      .get(`${PATH}/me`)
+      .set('Cookie', cookie)
+      .expect(200);
   });
 });

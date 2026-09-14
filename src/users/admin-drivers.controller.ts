@@ -11,6 +11,7 @@ import {
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
+  ApiCookieAuth,
   ApiInternalServerErrorResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
@@ -31,6 +32,7 @@ import { UsersService } from './users.service';
 @Controller('admin/drivers')
 @ApiTags('Admin drivers')
 @UseGuards(AdminSessionGuard)
+@ApiCookieAuth('admin-session')
 @ApiBearerAuth('admin')
 export class AdminDriversController {
   constructor(private readonly users: UsersService) {}
