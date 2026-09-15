@@ -5,6 +5,7 @@ import * as argon2 from 'argon2';
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { App } from 'supertest/types';
+import { ResendEmailService } from '../src/auth/resend-email.service';
 import { DatabaseService } from '../src/database/database.service';
 import {
   authSessions,
@@ -375,6 +376,30 @@ describe('Resend password reset email (e2e)', () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(storedProof(item.id).consumedAt).toBeNull();
+  });
+  it('allows loopback HTTP only outside production', () => {
+    const service = app.get(ResendEmailService);
+    for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+      process.env.PASSWORD_RESET_URL = `http://${host}:4000/reset-password`;
+      process.env.NODE_ENV = 'development';
+      expect(service.getResetConfiguration().resetUrl.href).toBe(
+        process.env.PASSWORD_RESET_URL,
+      );
+      process.env.NODE_ENV = 'production';
+      expect(() => service.getResetConfiguration()).toThrow();
+    }
+    process.env.NODE_ENV = 'development';
+    for (const url of [
+      'http://localhost.evil.example/reset-password',
+      'http://192.168.0.1/reset-password',
+      'http://localhost@evil.example/reset-password',
+      'http://user:password@localhost/reset-password',
+      'http://localhost/reset-password?token=old',
+      'http://localhost/reset-password#fragment',
+    ]) {
+      process.env.PASSWORD_RESET_URL = url;
+      expect(() => service.getResetConfiguration()).toThrow();
+    }
   });
   it('allows an explicitly configured existing app scheme, without selecting it as a default', async () => {
     process.env.PASSWORD_RESET_URL = 'hpluseco://reset-password';

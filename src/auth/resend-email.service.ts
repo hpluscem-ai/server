@@ -18,6 +18,10 @@ export class ResendEmailService {
     } catch {
       // 잘못된 URL도 미설정과 같은 명시적 설정 오류로 처리한다.
     }
+    const isLocalHttp =
+      process.env.NODE_ENV !== 'production' &&
+      resetUrl?.protocol === 'http:' &&
+      ['localhost', '127.0.0.1', '[::1]'].includes(resetUrl.hostname);
     if (
       !apiKey ||
       !/^[\x21-\x7e]+$/.test(apiKey) ||
@@ -28,7 +32,7 @@ export class ResendEmailService {
       /\p{Cc}/u.test(fromName) ||
       `${JSON.stringify(fromName)} <${fromEmail}>`.length > 255 ||
       !resetUrl ||
-      !['https:', 'hpluseco:'].includes(resetUrl.protocol) ||
+      (!['https:', 'hpluseco:'].includes(resetUrl.protocol) && !isLocalHttp) ||
       !resetUrl.hostname ||
       resetUrl.username ||
       resetUrl.password ||
