@@ -1,3 +1,4 @@
+import { AdminMileageController, AdminMileageService } from './admin-mileage';
 import {
   MileageController,
   MileageRepository,
@@ -43,6 +44,7 @@ import {
 @Module({
   imports: [],
   controllers: [
+    AdminMileageController,
     MileageController,
     AdminStationsController,
     StationsController,
@@ -55,6 +57,7 @@ import {
     AdminAuthController,
   ],
   providers: [
+    AdminMileageService,
     MileageRepository,
     MileageService,
     PhotoProcessorService,
