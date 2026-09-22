@@ -96,3 +96,23 @@ Nest is an MIT-licensed open source project. It can grow thanks to the sponsors 
 ## License
 
 Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+
+
+## Mileage application API
+
+`/api/v1/mileage/applications` uses the existing driver Bearer token or driver web cookie. Cookie writes require an allowed `WEB_ORIGINS` Origin. Administrator sessions cannot access these routes.
+
+- `POST /`: multipart fields `idempotencyKey` (UUID v4), `receipt`, `meter`. Exactly one photo of each kind, at most 50 MiB and 60,000,000 source pixels per file. Actual JPEG/PNG/HEIC/HEIF decoding is required. A successful request returns `201` with a pending application; monetary values stay `null` until a later approval workflow exists.
+- `GET /`: own unsettled applications. `createdFrom` is inclusive and `createdBefore` exclusive, both timezone-qualified ISO timestamps. `order=desc|asc` (default `desc`), `limit=1..100` (default `20`), and the returned `nextCursor` provide stable timestamp/ID pagination. A cursor belongs to its date range and order. Completed settlements are excluded; pending transfers remain visible.
+- `GET /:id`: own application details and protected photo API paths.
+- `GET /:id/photos/receipt` or `/meter`: authenticated normalized JPEG with `Cache-Control: no-store`. Session and ownership are checked again after storage I/O. Other users, missing records and completed settlements return `404`; missing stored files/storage failures return `503`.
+
+The same user/key/original bytes replay the existing application. Different original bytes with the same key return `409 IDEMPOTENCY_CONFLICT`. Keys remain with application records. Concurrent processing can return `503`; retry with the same key and the same original bytes. No edit, cancellation, rejection/resubmission, OCR, automatic approval or settlement mutation endpoint is included.
+
+Set `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` for an existing private bucket. Keep public access disabled and scope credentials to that bucket. Missing configuration fails photo operations with `503`; startup and existing APIs continue to work. The server never provisions a bucket. Tests replace only the storage boundary and do not contact R2.
+
+Originals and normalized copies remain private. Normalization corrects orientation, converts to sRGB JPEG quality 90, limits the long edge to 4096px and removes EXIF/GPS. Image decoding runs in a timed worker with bounded pixel/memory use; one decoder and at most two multipart requests run per server process. Excess concurrent requests return a retryable `503`. HEIC decoding uses ImageMagick WASM, retaining its source color profile through conversion to sharp. The worker asset is copied by the Nest build.
+
+Schema migration 6 adds request fingerprints, original-photo metadata and `mileage_upload_attempts`. An attempt with all candidate storage keys is recorded before remote writes. Application/photo metadata and removal of the attempt commit together. Failed attempts retain their records, including ambiguous remote writes; cleanup only targets that attempt's uncommitted objects. A process interruption may leave an attempt requiring manual reconciliation. There is no automatic retention or deletion job, and accepted application/settlement records are preserved.
+
+The committed HEIC test fixture is a generated solid-color image, not a user receipt. Live R2 credentials, bucket configuration and live upload/read validation are separate from the isolated tests.

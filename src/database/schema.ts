@@ -148,3 +148,74 @@ export const installationSiteDevices = sqliteTable(
       .default(sql`CURRENT_TIMESTAMP`),
   },
 );
+
+export const settlements = sqliteTable('settlements', {
+  id: text('id').primaryKey(),
+  logisticsCompanyId: text('logistics_company_id').notNull(),
+  settlementMonth: text('settlement_month').notNull(),
+  transferStatus: text('transfer_status', {
+    enum: ['pending', 'completed'],
+  }).notNull(),
+  transferredAt: text('transferred_at'),
+});
+
+export const mileageApplications = sqliteTable('mileage_applications', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull(),
+  logisticsCompanyId: text('logistics_company_id').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash'),
+  receiptAmount: integer('receipt_amount'),
+  meterAmount: integer('meter_amount'),
+  finalAmount: integer('final_amount'),
+  mileageAmount: integer('mileage_amount'),
+  receiptAt: text('receipt_at'),
+  matchStatus: text('match_status', {
+    enum: [
+      'pending',
+      'matched',
+      'mismatched',
+      'ocr_failed',
+      'duplicate_suspected',
+    ],
+  })
+    .notNull()
+    .default('pending'),
+  approvalStatus: text('approval_status', {
+    enum: ['pending', 'approved', 'rejected'],
+  })
+    .notNull()
+    .default('pending'),
+  rejectionReason: text('rejection_reason'),
+  settlementId: text('settlement_id'),
+  submittedAt: text('submitted_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  decidedAt: text('decided_at'),
+  updatedAt: text('updated_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const mileagePhotos = sqliteTable('mileage_application_photos', {
+  id: text('id').primaryKey(),
+  mileageApplicationId: text('mileage_application_id').notNull(),
+  kind: text('kind', { enum: ['receipt', 'meter'] }).notNull(),
+  storageKey: text('storage_key').notNull(),
+  contentType: text('content_type').notNull(),
+  byteSize: integer('byte_size').notNull(),
+  originalStorageKey: text('original_storage_key'),
+  originalContentType: text('original_content_type'),
+  originalByteSize: integer('original_byte_size'),
+});
+
+export const mileageUploadAttempts = sqliteTable('mileage_upload_attempts', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull(),
+  storageKeys: text('storage_keys', { mode: 'json' })
+    .$type<string[]>()
+    .notNull(),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});

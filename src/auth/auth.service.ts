@@ -109,7 +109,13 @@ export class AuthService {
   ): AuthenticatedSession | undefined {
     if (!token) return undefined;
 
-    const tokenHash = createHash('sha256').update(token).digest('hex');
+    return this.authenticateSessionHash(
+      createHash('sha256').update(token).digest('hex'),
+    );
+  }
+
+  // Recheck long-running uploads/reads after external I/O without retaining the raw token.
+  authenticateSessionHash(tokenHash: string): AuthenticatedSession | undefined {
     const now = new Date(Date.now());
     const user = this.authRepository.useSession(
       tokenHash,

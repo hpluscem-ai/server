@@ -1,3 +1,10 @@
+import {
+  MileageController,
+  MileageRepository,
+  MileageService,
+  PhotoProcessorService,
+  PhotoStorageService,
+} from './mileage';
 import { Module } from '@nestjs/common';
 import {
   AdminStationsController,
@@ -36,6 +43,7 @@ import {
 @Module({
   imports: [],
   controllers: [
+    MileageController,
     AdminStationsController,
     StationsController,
     AppController,
@@ -47,6 +55,10 @@ import {
     AdminAuthController,
   ],
   providers: [
+    MileageRepository,
+    MileageService,
+    PhotoProcessorService,
+    PhotoStorageService,
     StationsRepository,
     StationsService,
     AppService,

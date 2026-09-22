@@ -35,6 +35,7 @@ describe('DatabaseService', () => {
       'logistics_companies',
       'mileage_application_photos',
       'mileage_applications',
+      'mileage_upload_attempts',
       'password_reset_tokens',
       'phone_verifications',
       'settlements',
@@ -43,7 +44,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 5 });
+    ).toEqual({ user_version: 6 });
 
     expect(() => {
       databaseService.connection
@@ -53,6 +54,69 @@ describe('DatabaseService', () => {
         .run('application-1', 'missing-user', 'missing-company', 'request-1');
     }).toThrow();
   });
+
+  it.each([false, true])(
+    'migrates v5 once and rolls back a failed v6 upgrade (failure: %s)',
+    (fail) => {
+      const directory = mkdtempSync(join(tmpdir(), 'hpluseco-v6-test-'));
+      const path = join(directory, 'v5.sqlite');
+      let connection: DatabaseSync | undefined = new DatabaseSync(path);
+      let upgraded: DatabaseService | undefined;
+      try {
+        for (const file of [
+          'schema.sql',
+          '002-auth-sessions.sql',
+          '003-admin-sessions.sql',
+          '004-phone-verification-owner.sql',
+        ])
+          connection.exec(readFileSync(join(__dirname, file), 'utf8'));
+        connection.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+        connection.exec(
+          readFileSync(join(__dirname, '005-driver-withdrawal.sql'), 'utf8'),
+        );
+        connection.exec('COMMIT; PRAGMA foreign_keys = ON;');
+        connection.exec(
+          "INSERT INTO users (id, role, email, password_hash, name) VALUES ('v5-admin', 'admin', 'v5@example.com', 'existing-hash', '기존 관리자');",
+        );
+        const original = connection.prepare('SELECT * FROM users').all();
+        if (fail)
+          connection.exec(
+            'CREATE TABLE mileage_upload_attempts (id TEXT PRIMARY KEY)',
+          );
+        connection.close();
+        connection = undefined;
+        process.env.DATABASE_PATH = path;
+        if (fail) {
+          expect(() => new DatabaseService()).toThrow('already exists');
+          connection = new DatabaseSync(path);
+          expect(connection.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 5,
+          });
+          const columns = connection
+            .prepare('PRAGMA table_info(mileage_applications)')
+            .all();
+          expect(columns.some((column) => column.name === 'request_hash')).toBe(
+            false,
+          );
+        } else {
+          upgraded = new DatabaseService();
+          upgraded.onModuleDestroy();
+          upgraded = new DatabaseService();
+          expect(
+            upgraded.connection.prepare('PRAGMA user_version').get(),
+          ).toEqual({ user_version: 6 });
+        }
+        const checked = upgraded?.connection ?? connection!;
+        expect(checked.prepare('SELECT * FROM users').all()).toEqual(original);
+        expect(checked.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally {
+        connection?.close();
+        upgraded?.onModuleDestroy();
+        process.env.DATABASE_PATH = ':memory:';
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   describe('auth_sessions', () => {
     beforeEach(() => {
@@ -411,7 +475,7 @@ describe('DatabaseService', () => {
 
       const originalSchema = connection
         .prepare(
-          "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name <> 'users' AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
+          "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
         )
         .all();
       const tables = [
@@ -427,7 +491,9 @@ describe('DatabaseService', () => {
           .map((row) =>
             table === 'phone_verifications'
               ? { ...row, scope_user_id: null }
-              : row,
+              : table === 'mileage_applications'
+                ? { ...row, request_hash: null }
+                : row,
           ),
       );
       connection.close();
@@ -436,12 +502,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 5,
+        user_version: 6,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name = 'phone_verifications') ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -575,7 +641,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 5 });
+          ).toEqual({ user_version: 6 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -605,13 +671,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 6;');
+    newerDatabase.exec('PRAGMA user_version = 7;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 6 is newer than supported version 5',
+        'Database schema version 7 is newer than supported version 6',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -688,7 +754,23 @@ describe('DatabaseService', () => {
             .all() as { name: string }[]
         ).map((row) => row.name);
         const original = tables.map((table) =>
-          connection!.prepare(`SELECT * FROM ${table}`).all(),
+          connection!
+            .prepare(`SELECT * FROM ${table}`)
+            .all()
+            .map((row) =>
+              fail
+                ? row
+                : table === 'mileage_applications'
+                  ? { ...row, request_hash: null }
+                  : table === 'mileage_application_photos'
+                    ? {
+                        ...row,
+                        original_storage_key: null,
+                        original_content_type: null,
+                        original_byte_size: null,
+                      }
+                    : row,
+            ),
         );
         connection.close();
         connection = undefined;
@@ -705,7 +787,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 5 });
+          ).toEqual({ user_version: 6 });
           expect(
             upgraded.connection.prepare('PRAGMA foreign_keys').get(),
           ).toEqual({ foreign_keys: 1 });
@@ -781,7 +863,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 5 });
+          ).toEqual({ user_version: 6 });
           expect(() =>
             upgraded!.connection.exec(
               "UPDATE phone_verifications SET scope_user_id = 'missing-user'",
