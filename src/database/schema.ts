@@ -217,3 +217,33 @@ export const mileageUploadAttempts = sqliteTable('mileage_upload_attempts', {
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const mileageOcrJobs = sqliteTable('mileage_ocr_jobs', {
+  id: text('id').primaryKey(),
+  applicationId: text('application_id')
+    .notNull()
+    .references(() => mileageApplications.id, { onDelete: 'cascade' }),
+  sourceVersion: text('source_version').notNull(),
+  extractorVersion: text('extractor_version').notNull(),
+  status: text('status', {
+    enum: ['queued', 'running', 'completed', 'failed', 'unknown'],
+  })
+    .notNull()
+    .default('queued'),
+  clovaReservedAt: text('clova_reserved_at'),
+  lunaReservedAt: text('luna_reserved_at'),
+  clovaDurationMs: integer('clova_duration_ms'),
+  lunaDurationMs: integer('luna_duration_ms'),
+  lunaInputTokens: integer('luna_input_tokens'),
+  lunaOutputTokens: integer('luna_output_tokens'),
+  result: text('result_json', { mode: 'json' }).$type<Record<
+    string,
+    unknown
+  > | null>(),
+  errorCode: text('error_code'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  startedAt: text('started_at'),
+  finishedAt: text('finished_at'),
+});

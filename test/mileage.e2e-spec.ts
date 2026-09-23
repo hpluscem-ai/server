@@ -13,6 +13,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import sharp from 'sharp';
 import { AppModule } from '../src/app.module';
+import { AdminMileageService } from '../src/admin-mileage';
 import { configureApp } from '../src/app.setup';
 import { WEB_SESSION_COOKIE } from '../src/auth';
 import { DatabaseService } from '../src/database/database.service';
@@ -20,12 +21,18 @@ import {
   authSessions,
   logisticsCompanies,
   mileageApplications,
+  mileageOcrJobs,
   mileagePhotos,
   mileageUploadAttempts,
   settlements,
   users,
 } from '../src/database/schema';
-import { MileageRepository, PhotoStorageService } from '../src/mileage';
+import {
+  MileageOcrService,
+  MileageOcrWorkerService,
+  MileageRepository,
+  PhotoStorageService,
+} from '../src/mileage';
 import type {
   MileageDetailDto,
   MileageListDto,
@@ -245,6 +252,59 @@ describe('Mileage applications (e2e)', () => {
       .expect(({ body }: { body: MileageDetailDto }) =>
         expect(body).toEqual(result),
       );
+  });
+
+  it('runs saved photos through OCR and exposes review values without approving', async () => {
+    const ocr = app.get(MileageOcrService);
+    jest.spyOn(ocr, 'isConfigured').mockReturnValue(true);
+    jest.spyOn(ocr, 'readReceipt').mockResolvedValue({
+      reading: {
+        amountText: '11700',
+        transactionDateText: '2026-09-23',
+        transactionTimeText: '12:34:56',
+        quantityText: '11.000',
+        quantityUnit: 'L',
+        unitPriceText: null,
+        documentKind: 'sale',
+        issues: [],
+      },
+      durationMs: 1,
+    });
+    jest.spyOn(ocr, 'readMeter').mockResolvedValue({
+      reading: {
+        amountText: '11,700원',
+        litersText: '11.000 L',
+        unitPriceText: null,
+        issues: [],
+      },
+      durationMs: 1,
+      usage: { inputTokens: 100, outputTokens: 20 },
+    });
+    process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT = '10';
+    process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = '10';
+    try {
+      const accepted = await saved();
+      expect(accepted.status).toBe('pending');
+      expect(database.db.select().from(mileageOcrJobs).get()?.status).toBe(
+        'queued',
+      );
+      expect(await app.get(MileageOcrWorkerService).processOne()).toBe(true);
+      expect(app.get(AdminMileageService).detail(accepted.id)).toMatchObject({
+        receiptAmount: 11700,
+        meterAmount: 11700,
+        matchStatus: 'matched',
+        status: 'pending',
+      });
+      const userDetail = await get(URL + '/' + accepted.id).expect(200);
+      expect(userDetail.body).toMatchObject({
+        status: 'pending',
+        mileageAmount: null,
+        finalAmount: null,
+      });
+    } finally {
+      delete process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT;
+      delete process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT;
+    }
   });
 
   it('decodes a synthetic real HEIC with an embedded color profile', async () => {

@@ -1,17 +1,36 @@
 import { Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, gt, gte, isNull, lt, or, sql } from 'drizzle-orm';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
 import {
   mileageApplications as applications,
   mileagePhotos as photos,
+  mileageOcrJobs as ocrJobs,
   mileageUploadAttempts as attempts,
   settlements,
 } from '../database/schema';
 import type { MileageListQueryDto } from './mileage.dto';
+import {
+  amountValue,
+  litersValue,
+  OCR_VERSION,
+  type MeterReading,
+  type ReceiptReading,
+} from './mileage-ocr.service';
 
 export type MileageRecord = typeof applications.$inferSelect;
 export type PhotoRecord = typeof photos.$inferSelect;
+export type OcrJob = typeof ocrJobs.$inferSelect;
+export type OcrResult = {
+  receipt: ReceiptReading | null;
+  meter: MeterReading | null;
+  clovaError: string | null;
+  lunaError: string | null;
+  clovaDurationMs: number | null;
+  lunaDurationMs: number | null;
+  lunaInputTokens: number | null;
+  lunaOutputTokens: number | null;
+};
 export type MileageCursor = {
   at: string;
   id: string;
@@ -127,6 +146,7 @@ export class MileageRepository {
     logisticsCompanyId: string;
     idempotencyKey: string;
     requestHash: string;
+    queueOcr: boolean;
     photos: Omit<PhotoRecord, 'id' | 'mileageApplicationId'>[];
   }): MileageRecord {
     return this.database.db.transaction(
@@ -143,27 +163,315 @@ export class MileageRepository {
           )
           .get();
         if (existing) return existing;
-        const { photos: inputPhotos, ...values } = input;
+        const { photos: inputPhotos, queueOcr, ...values } = input;
         const application = tx
           .insert(applications)
           .values({ ...values, submittedAt: new Date().toISOString() })
           .returning()
           .get();
+        const savedPhotos: PhotoRecord[] = [];
         for (const photo of inputPhotos) {
-          tx.insert(photos)
+          const saved = {
+            ...photo,
+            id: randomUUID(),
+            mileageApplicationId: application.id,
+          };
+          tx.insert(photos).values(saved).run();
+          savedPhotos.push(saved);
+        }
+        if (queueOcr)
+          tx.insert(ocrJobs)
             .values({
-              ...photo,
               id: randomUUID(),
-              mileageApplicationId: application.id,
+              applicationId: application.id,
+              sourceVersion: photoVersion(application.requestHash, savedPhotos),
+              extractorVersion: OCR_VERSION,
             })
             .run();
-        }
         tx.delete(attempts).where(eq(attempts.id, input.id)).run();
         return application;
       },
       { behavior: 'immediate' },
     );
   }
+
+  interruptRunningOcrJobs(): void {
+    this.database.db
+      .update(ocrJobs)
+      .set({
+        status: 'unknown',
+        errorCode: 'INTERRUPTED',
+        finishedAt: new Date().toISOString(),
+      })
+      .where(eq(ocrJobs.status, 'running'))
+      .run();
+  }
+
+  claimOcrJob(): OcrJob | undefined {
+    return this.database.db.transaction(
+      (tx) => {
+        const job = tx
+          .select()
+          .from(ocrJobs)
+          .where(eq(ocrJobs.status, 'queued'))
+          .orderBy(asc(ocrJobs.createdAt), asc(ocrJobs.id))
+          .limit(1)
+          .get();
+        if (!job) return undefined;
+        return tx
+          .update(ocrJobs)
+          .set({
+            status: 'running',
+            startedAt: new Date().toISOString(),
+          })
+          .where(and(eq(ocrJobs.id, job.id), eq(ocrJobs.status, 'queued')))
+          .returning()
+          .get();
+      },
+      { behavior: 'immediate' },
+    );
+  }
+
+  ocrSource(job: OcrJob): { receiptKey: string; meterKey: string } | null {
+    return this.database.db.transaction((tx) => {
+      const application = tx
+        .select()
+        .from(applications)
+        .where(eq(applications.id, job.applicationId))
+        .get();
+      if (
+        !application ||
+        application.approvalStatus !== 'pending' ||
+        application.settlementId !== null
+      )
+        return null;
+      const savedPhotos = tx
+        .select()
+        .from(photos)
+        .where(eq(photos.mileageApplicationId, job.applicationId))
+        .all();
+      if (
+        photoVersion(application.requestHash, savedPhotos) !== job.sourceVersion
+      )
+        return null;
+      const receipt = savedPhotos.find((photo) => photo.kind === 'receipt');
+      const meter = savedPhotos.find((photo) => photo.kind === 'meter');
+      return receipt && meter
+        ? { receiptKey: receipt.storageKey, meterKey: meter.storageKey }
+        : null;
+    });
+  }
+
+  reserveOcrCalls(
+    jobId: string,
+    clovaLimit: number,
+    lunaLimit: number,
+  ): boolean {
+    return this.database.db.transaction(
+      (tx) => {
+        const job = tx
+          .select()
+          .from(ocrJobs)
+          .where(eq(ocrJobs.id, jobId))
+          .get();
+        if (
+          !job ||
+          job.status !== 'running' ||
+          job.clovaReservedAt ||
+          job.lunaReservedAt
+        )
+          return false;
+        const now = new Date();
+        const today = now.toISOString().slice(0, 10);
+        const from = today + 'T00:00:00.000Z';
+        const until = new Date(Date.parse(from) + 86400000).toISOString();
+        const used = (column: typeof ocrJobs.clovaReservedAt) =>
+          tx
+            .select({ count: sql<number>`count(*)` })
+            .from(ocrJobs)
+            .where(and(gte(column, from), lt(column, until)))
+            .get()!.count;
+        if (
+          used(ocrJobs.clovaReservedAt) >= clovaLimit ||
+          used(ocrJobs.lunaReservedAt) >= lunaLimit
+        )
+          return false;
+        tx.update(ocrJobs)
+          .set({
+            clovaReservedAt: now.toISOString(),
+            lunaReservedAt: now.toISOString(),
+          })
+          .where(eq(ocrJobs.id, jobId))
+          .run();
+        return true;
+      },
+      { behavior: 'immediate' },
+    );
+  }
+
+  finishOcrJob(job: OcrJob, result: OcrResult, errorCode?: string): void {
+    this.database.db.transaction(
+      (tx) => {
+        const current = tx
+          .select()
+          .from(ocrJobs)
+          .where(eq(ocrJobs.id, job.id))
+          .get();
+        if (!current || current.status !== 'running') return;
+        const application = tx
+          .select()
+          .from(applications)
+          .where(eq(applications.id, job.applicationId))
+          .get();
+        const savedPhotos = tx
+          .select()
+          .from(photos)
+          .where(eq(photos.mileageApplicationId, job.applicationId))
+          .all();
+        const stillCurrent =
+          application?.approvalStatus === 'pending' &&
+          application.settlementId === null &&
+          photoVersion(application.requestHash, savedPhotos) ===
+            job.sourceVersion;
+        const receiptAmount = amountValue(result.receipt?.amountText ?? null);
+        const meterAmount = amountValue(result.meter?.amountText ?? null);
+        const receiptAt = transactionAt(result.receipt);
+        const duplicate =
+          stillCurrent &&
+          application &&
+          tx
+            .select({ id: applications.id })
+            .from(applications)
+            .where(
+              and(
+                sql`${applications.id} <> ${application.id}`,
+                or(
+                  application.requestHash
+                    ? eq(applications.requestHash, application.requestHash)
+                    : undefined,
+                  receiptAt !== null &&
+                    receiptAmount !== null &&
+                    meterAmount !== null
+                    ? and(
+                        eq(applications.receiptAt, receiptAt),
+                        eq(applications.receiptAmount, receiptAmount),
+                        eq(applications.meterAmount, meterAmount),
+                      )
+                    : undefined,
+                  result.receipt?.transactionDateText &&
+                    result.receipt.transactionTimeText &&
+                    receiptAmount !== null &&
+                    meterAmount !== null
+                    ? and(
+                        eq(applications.receiptAmount, receiptAmount),
+                        eq(applications.meterAmount, meterAmount),
+                        sql`EXISTS (
+                          SELECT 1 FROM ${ocrJobs}
+                          WHERE ${ocrJobs.applicationId} = ${applications.id}
+                            AND json_extract(${ocrJobs.result}, '$.receipt.transactionDateText') = ${result.receipt.transactionDateText}
+                            AND json_extract(${ocrJobs.result}, '$.receipt.transactionTimeText') = ${result.receipt.transactionTimeText}
+                        )`,
+                      )
+                    : undefined,
+                ),
+              ),
+            )
+            .get();
+        if (stillCurrent && application) {
+          const status = duplicate
+            ? 'duplicate_suspected'
+            : receiptAmount !== null &&
+                meterAmount !== null &&
+                receiptAmount !== meterAmount
+              ? 'mismatched'
+              : receiptAmount !== null &&
+                  meterAmount !== null &&
+                  result.receipt?.documentKind === 'sale' &&
+                  result.receipt.issues.length === 0 &&
+                  result.meter?.issues.length === 0 &&
+                  litersValue(result.meter.litersText) !== null
+                ? 'matched'
+                : 'ocr_failed';
+          tx.update(applications)
+            .set({
+              receiptAmount,
+              meterAmount,
+              receiptAt,
+              matchStatus: status,
+              updatedAt: new Date().toISOString(),
+            })
+            .where(
+              and(
+                eq(applications.id, application.id),
+                eq(applications.approvalStatus, 'pending'),
+                isNull(applications.settlementId),
+              ),
+            )
+            .run();
+        }
+        tx.update(ocrJobs)
+          .set({
+            status:
+              errorCode || result.clovaError || result.lunaError
+                ? 'failed'
+                : 'completed',
+            result,
+            errorCode: errorCode ?? result.clovaError ?? result.lunaError,
+            clovaDurationMs: result.clovaDurationMs,
+            lunaDurationMs: result.lunaDurationMs,
+            lunaInputTokens: result.lunaInputTokens,
+            lunaOutputTokens: result.lunaOutputTokens,
+            finishedAt: new Date().toISOString(),
+          })
+          .where(eq(ocrJobs.id, job.id))
+          .run();
+      },
+      { behavior: 'immediate' },
+    );
+  }
+}
+
+function photoVersion(
+  requestHash: string | null,
+  savedPhotos: PhotoRecord[],
+): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        requestHash,
+        ...(['receipt', 'meter'] as const).map((kind) => {
+          const photo = savedPhotos.find((row) => row.kind === kind);
+          return photo
+            ? [photo.id, photo.storageKey, photo.originalStorageKey]
+            : null;
+        }),
+      ]),
+    )
+    .digest('hex');
+}
+
+function transactionAt(receipt: ReceiptReading | null): string | null {
+  if (!receipt?.transactionDateText || !receipt.transactionTimeText)
+    return null;
+  const date = receipt.transactionDateText
+    .replaceAll('.', '-')
+    .replaceAll('/', '-');
+  const time = receipt.transactionTimeText;
+  if (
+    !/^20\d{2}-\d{2}-\d{2}$/.test(date) ||
+    !/^\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(time)
+  )
+    return null;
+  const iso = date + 'T' + time;
+  const parsed = new Date(iso);
+  const [year, month, day] = date.split('-').map(Number);
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  return Number.isNaN(parsed.getTime()) ||
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() + 1 !== month ||
+    calendar.getUTCDate() !== day
+    ? null
+    : parsed.toISOString();
 }
 
 function visibleSettlement() {

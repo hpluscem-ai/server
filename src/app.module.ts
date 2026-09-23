@@ -8,6 +8,8 @@ import {
   MileageController,
   MileageRepository,
   MileageService,
+  MileageOcrService,
+  MileageOcrWorkerService,
   PhotoProcessorService,
   PhotoStorageService,
 } from './mileage';
@@ -68,6 +70,8 @@ import {
     AdminMileageService,
     MileageRepository,
     MileageService,
+    MileageOcrService,
+    MileageOcrWorkerService,
     PhotoProcessorService,
     PhotoStorageService,
     StationsRepository,

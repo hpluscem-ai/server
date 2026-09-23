@@ -24,6 +24,7 @@ import {
 } from './mileage.repository';
 import { PhotoProcessorService } from './photo-processor.service';
 import { PhotoStorageService } from './photo-storage.service';
+import { MileageOcrService } from './mileage-ocr.service';
 
 @Injectable()
 export class MileageService {
@@ -33,6 +34,7 @@ export class MileageService {
     private readonly processor: PhotoProcessorService,
     private readonly storage: PhotoStorageService,
     private readonly auth: AuthService,
+    private readonly ocr: MileageOcrService,
   ) {}
 
   async create(
@@ -100,6 +102,7 @@ export class MileageService {
         logisticsCompanyId: current.user.logisticsCompanyId,
         idempotencyKey: key,
         requestHash,
+        queueOcr: this.ocr.isConfigured(),
         photos,
       });
       if (saved.id !== id) await this.cleanup(id, keys, false);
