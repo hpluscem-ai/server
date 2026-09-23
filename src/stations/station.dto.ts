@@ -3,7 +3,6 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
-  IsIn,
   IsInt,
   IsNotEmpty,
   IsNumber,
@@ -70,15 +69,6 @@ export class CreateStationDto {
   @MaxLength(100)
   businessName!: string;
 
-  @ApiProperty({
-    description: '소재지. 실제 값을 입력하며 주소에서 임의 추출하지 않음',
-  })
-  @Transform(trim)
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(100)
-  area!: string;
-
   @ApiProperty({ description: '시/군/구가 포함된 설치 도로명 주소' })
   @Transform(trim)
   @IsString()
@@ -86,13 +76,6 @@ export class CreateStationDto {
   @MaxLength(200)
   @Matches(/[가-힣]+(?:시|군|구)(?:\s|$)/)
   roadAddress!: string;
-
-  @ApiProperty({
-    description: '주유소 또는 직판 구분',
-    enum: ['station', 'direct_sales'],
-  })
-  @IsIn(['station', 'direct_sales'])
-  siteType!: 'station' | 'direct_sales';
 
   @ApiPropertyOptional({
     description: '비고(예: 셀프). 생략하면 비고 없음으로 저장',

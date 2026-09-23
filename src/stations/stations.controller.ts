@@ -93,7 +93,7 @@ export class AdminStationsController {
   @ApiOperation({
     summary: '주유소 및 설치 기기 등록',
     description:
-      '주유소와 1개 이상의 기기를 함께 저장하거나 함께 롤백합니다. 소재지·주유소/직판 구분은 실제 값이 필수입니다. 좌표는 미검증 상태로 저장하며 출처·확인 시각을 만들지 않습니다.',
+      '주유소와 1개 이상의 기기를 함께 저장하거나 함께 롤백합니다. 주소는 도로명 주소 하나로 저장합니다. 좌표는 미검증 상태로 저장하며 출처·확인 시각을 만들지 않습니다.',
   })
   @ApiCreatedResponse({ type: StationResponseDto })
   create(@Body() input: CreateStationDto): StationResponseDto {

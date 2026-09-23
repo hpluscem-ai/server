@@ -22,9 +22,7 @@ const bounds = { south: 37, west: 127, north: 38, east: 128 };
 const input = {
   businessName: '테스트 주유소',
   pole: 'S-OIL',
-  area: '서울',
   roadAddress: '서울시 강남구 테스트로 1',
-  siteType: 'station',
   latitude: 37.5,
   longitude: 127.1,
   devices: [{ model: '테스트 모델', capacityLiters: 2000 }],
@@ -170,6 +168,8 @@ describe('Stations (e2e)', () => {
       .expect(201)
       .expect(({ body }: { body: Record<string, unknown> }) => {
         expect(body.businessName).toBe(input.businessName);
+        expect(body).not.toHaveProperty('area');
+        expect(body).not.toHaveProperty('siteType');
         expect(body.coordinateVerified).toBe(false);
         expect(body.coordinateSource).toBeNull();
         expect(body.coordinateVerifiedAt).toBeNull();
@@ -180,8 +180,6 @@ describe('Stations (e2e)', () => {
     expect(state.devices).toHaveLength(1);
     expect(state.devices[0].installation_site_id).toBe(state.stations[0].id);
     expect(state.devices[0].capacity_liters).toBe(2000);
-    expect(state.stations[0].area).toBe(input.area);
-    expect(state.stations[0].site_type).toBe(input.siteType);
   });
 
   it('updates stable station and device ids, adds a device, and returns only public device fields', async () => {
@@ -235,12 +233,9 @@ describe('Stations (e2e)', () => {
   });
 
   it.each([
-    { area: undefined },
-    { area: null },
-    { area: ' ' },
-    { siteType: undefined },
-    { siteType: 'unknown' },
     { businessName: '' },
+    { area: '서울' },
+    { siteType: 'station' },
     { pole: ' ' },
     { roadAddress: 'no address' },
     { latitude: undefined },
@@ -783,15 +778,22 @@ describe('Stations (e2e)', () => {
         'description' in invalidIdResponse &&
         invalidIdResponse.description,
     ).toContain('BAD_REQUEST');
+    for (const name of [
+      'CreateStationDto',
+      'UpdateStationDto',
+      'StationResponseDto',
+    ]) {
+      const model = document.components?.schemas?.[name];
+      expect(
+        model && 'properties' in model && model.properties,
+      ).not.toHaveProperty('area');
+      expect(
+        model && 'properties' in model && model.properties,
+      ).not.toHaveProperty('siteType');
+    }
     const schema = document.components?.schemas?.CreateStationDto;
     expect(schema && 'required' in schema && schema.required).toEqual(
-      expect.arrayContaining([
-        'area',
-        'siteType',
-        'latitude',
-        'longitude',
-        'devices',
-      ]),
+      expect.arrayContaining(['latitude', 'longitude', 'devices']),
     );
     for (const name of [
       'CreateStationDto',
