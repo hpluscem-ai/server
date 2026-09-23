@@ -23,6 +23,16 @@ export class CreateMileageDto {
   idempotencyKey!: string;
 }
 
+export class ResubmitMileageDto extends CreateMileageDto {
+  @ApiProperty({
+    description: 'Opaque submissionVersion returned by the current detail.',
+    pattern: '^[0-9a-f]{64}$',
+  })
+  @IsString()
+  @Matches(/^[0-9a-f]{64}$/)
+  submissionVersion!: string;
+}
+
 export class MileageListQueryDto extends DateRangeQueryDto {
   @ApiPropertyOptional({ enum: ['desc', 'asc'], default: 'desc' })
   @ValidateIf((_object, value: unknown) => value !== undefined)
@@ -71,6 +81,11 @@ export class MileagePhotoPathsDto {
 }
 
 export class MileageDetailDto extends MileageResponseDto {
+  @ApiProperty({
+    description: 'Opaque version of the current submitted photos.',
+    pattern: '^[0-9a-f]{64}$',
+  })
+  submissionVersion!: string;
   @ApiProperty({ type: MileagePhotoPathsDto }) photos!: MileagePhotoPathsDto;
 }
 

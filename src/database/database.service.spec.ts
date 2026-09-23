@@ -36,6 +36,7 @@ describe('DatabaseService', () => {
       'mileage_application_photos',
       'mileage_applications',
       'mileage_ocr_jobs',
+      'mileage_resubmissions',
       'mileage_upload_attempts',
       'password_reset_tokens',
       'phone_verifications',
@@ -47,7 +48,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 9 });
+    ).toEqual({ user_version: 10 });
 
     expect(() => {
       databaseService.connection
@@ -70,11 +71,13 @@ describe('DatabaseService', () => {
       );
       created.onModuleDestroy();
       const old = new DatabaseSync(path);
-      old.exec('DROP TABLE mileage_ocr_jobs; PRAGMA user_version = 8;');
+      old.exec(
+        'DROP TABLE mileage_resubmissions; DROP TABLE mileage_ocr_jobs; PRAGMA user_version = 8;',
+      );
       old.close();
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 9,
+        user_version: 10,
       });
       expect(
         upgraded.connection
@@ -97,6 +100,84 @@ describe('DatabaseService', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it.each([false, true])(
+    'upgrades v9 upload attempts atomically (failure: %s)',
+    (fail) => {
+      const directory = mkdtempSync(join(tmpdir(), 'hpluseco-resubmit-'));
+      const path = join(directory, 'v9.sqlite');
+      let checked: DatabaseService | undefined;
+      let old: DatabaseSync | undefined;
+      try {
+        process.env.DATABASE_PATH = path;
+        const created = new DatabaseService();
+        created.onModuleDestroy();
+        old = new DatabaseSync(path);
+        old.exec(`DROP TABLE mileage_resubmissions; DROP TABLE mileage_upload_attempts;
+        CREATE TABLE mileage_upload_attempts (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+          storage_keys TEXT NOT NULL CHECK (json_valid(storage_keys) AND json_array_length(storage_keys) = 4),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) STRICT;
+        INSERT INTO users (id, role, email, password_hash, name) VALUES ('owner', 'admin', 'test@example.com', 'hash', 'test');
+        INSERT INTO mileage_upload_attempts (id, user_id, storage_keys) VALUES ('old', 'owner', '["a","b","c","d"]');
+        PRAGMA user_version = 9;`);
+        const previous = old
+          .prepare('SELECT * FROM mileage_upload_attempts')
+          .get();
+        if (fail)
+          old.exec('CREATE TABLE mileage_upload_attempts_new (id TEXT)');
+        old.close();
+        old = undefined;
+        if (fail) {
+          expect(() => new DatabaseService()).toThrow('already exists');
+          old = new DatabaseSync(path);
+          expect(old.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 9,
+          });
+          expect(
+            old
+              .prepare(
+                "SELECT name FROM sqlite_schema WHERE name = 'mileage_resubmissions'",
+              )
+              .get(),
+          ).toBeUndefined();
+          expect(
+            old.prepare('SELECT * FROM mileage_upload_attempts').get(),
+          ).toEqual(previous);
+        } else {
+          checked = new DatabaseService();
+          const connection = checked.connection;
+          expect(
+            connection.prepare('SELECT * FROM mileage_upload_attempts').get(),
+          ).toEqual(previous);
+          connection
+            .prepare(
+              'INSERT INTO mileage_upload_attempts (id, user_id, storage_keys) VALUES (?, ?, ?)',
+            )
+            .run('new', 'owner', '["e","f"]');
+          expect(() =>
+            connection
+              .prepare(
+                'INSERT INTO mileage_upload_attempts (id, user_id, storage_keys) VALUES (?, ?, ?)',
+              )
+              .run('invalid', 'owner', '["g"]'),
+          ).toThrow();
+          expect(connection.prepare('PRAGMA foreign_key_check').all()).toEqual(
+            [],
+          );
+          expect(connection.prepare('PRAGMA user_version').get()).toEqual({
+            user_version: 10,
+          });
+        }
+      } finally {
+        old?.close();
+        checked?.onModuleDestroy();
+        process.env.DATABASE_PATH = ':memory:';
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([false, true])(
     'migrates v5 once and rolls back a failed v6 upgrade (failure: %s)',
@@ -147,7 +228,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 9 });
+          ).toEqual({ user_version: 10 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(original);
@@ -545,12 +626,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 9,
+        user_version: 10,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions', 'settlement_snapshots', 'settlement_completions', 'mileage_ocr_jobs') AND name NOT GLOB 'settlement_capture_*' AND name <> 'mileage_approved_decided_idx' AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions', 'settlement_snapshots', 'settlement_completions', 'mileage_ocr_jobs', 'mileage_resubmissions') AND name NOT GLOB 'settlement_capture_*' AND name <> 'mileage_approved_decided_idx' AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -684,7 +765,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 9 });
+          ).toEqual({ user_version: 10 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -714,13 +795,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 10;');
+    newerDatabase.exec('PRAGMA user_version = 11;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 10 is newer than supported version 9',
+        'Database schema version 11 is newer than supported version 10',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -830,7 +911,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 9 });
+          ).toEqual({ user_version: 10 });
           expect(
             upgraded.connection.prepare('PRAGMA foreign_keys').get(),
           ).toEqual({ foreign_keys: 1 });
@@ -906,7 +987,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 9 });
+          ).toEqual({ user_version: 10 });
           expect(() =>
             upgraded!.connection.exec(
               "UPDATE phone_verifications SET scope_user_id = 'missing-user'",

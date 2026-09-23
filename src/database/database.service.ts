@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const CURRENT_SCHEMA_VERSION = 9;
+const CURRENT_SCHEMA_VERSION = 10;
 
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
@@ -45,7 +45,7 @@ export class DatabaseService implements OnModuleDestroy {
       }
 
       if (schemaVersion < CURRENT_SCHEMA_VERSION) {
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8].includes(schemaVersion)) {
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(schemaVersion)) {
           throw new Error(
             `Database schema version ${schemaVersion} requires an explicit migration`,
           );
@@ -113,6 +113,13 @@ export class DatabaseService implements OnModuleDestroy {
         if (schemaVersion < 9)
           this.database.exec(
             readFileSync(join(__dirname, '009-mileage-ocr.sql'), 'utf8'),
+          );
+        if (schemaVersion < 10)
+          this.database.exec(
+            readFileSync(
+              join(__dirname, '010-mileage-resubmissions.sql'),
+              'utf8',
+            ),
           );
       }
     } catch (error) {

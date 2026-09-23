@@ -272,6 +272,71 @@ describe('MileageOcrWorkerService', () => {
     });
   });
 
+  it('compares current submissions instead of retained creation hashes or old OCR readings', async () => {
+    await worker.processOne();
+    database.db
+      .update(mileageApplications)
+      .set({ approvalStatus: 'rejected', decidedAt: new Date().toISOString() })
+      .where(eq(mileageApplications.id, applicationId))
+      .run();
+    const current = repository.findOne(userId, applicationId)!;
+    const oldReceipt = current.photos.find(
+      (photo) => photo.kind === 'receipt',
+    )!;
+    repository.commitResubmission({
+      id: applicationId,
+      userId,
+      attemptId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      requestHash: 'c'.repeat(64),
+      submissionVersion: repository.submissionVersion(current),
+      queueOcr: true,
+      photos: [
+        {
+          ...oldReceipt,
+          storageKey: 'replacement/receipt',
+          originalStorageKey: 'replacement/original',
+        },
+      ],
+    });
+    const reading = (date: string, amount: string) => ({
+      reading: {
+        amountText: amount,
+        transactionDateText: date,
+        transactionTimeText: '12:34:56',
+        quantityText: null,
+        quantityUnit: 'unknown' as const,
+        unitPriceText: null,
+        documentKind: 'sale' as const,
+        issues: [],
+      },
+      durationMs: 1,
+    });
+    receiptCall.mockResolvedValue(reading('2026-09-24', '11700'));
+    await worker.processOne();
+    const differentHash = createApplication('b'.repeat(64));
+    receiptCall.mockResolvedValue(reading('2026-09-23', '11700'));
+    await worker.processOne();
+    expect(repository.findOne(userId, differentHash)?.matchStatus).toBe(
+      'matched',
+    );
+    const retainedHash = createApplication('a'.repeat(64));
+    receiptCall.mockResolvedValue(reading('2026-09-25', '25000'));
+    meterCall.mockResolvedValue({
+      reading: {
+        amountText: '25000',
+        litersText: '11.000 L',
+        unitPriceText: null,
+        issues: [],
+      },
+      durationMs: 1,
+    });
+    await worker.processOne();
+    expect(repository.findOne(userId, retainedHash)?.matchStatus).toBe(
+      'matched',
+    );
+  });
+
   it('flags the same photo pair submitted again as a duplicate', async () => {
     const second = createApplication();
     await worker.processOne();
@@ -286,8 +351,8 @@ describe('MileageOcrWorkerService', () => {
   });
 
   it('flags different photos with matching totals and printed transaction time', async () => {
-    const second = createApplication('b'.repeat(64));
     await worker.processOne();
+    const second = createApplication('b'.repeat(64));
     await worker.processOne();
     expect(
       database.db

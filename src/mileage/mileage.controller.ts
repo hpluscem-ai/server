@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   Param,
   ParseUUIDPipe,
   Post,
@@ -38,6 +39,7 @@ import { AuthSessionGuard, type AuthenticatedRequest } from '../auth';
 import { ApiErrorResponseDto } from '../common/api-error-response.dto';
 import {
   CreateMileageDto,
+  ResubmitMileageDto,
   MileageDetailDto,
   MileageListDto,
   MileageListQueryDto,
@@ -126,6 +128,68 @@ export class MileageController {
     files: { receipt?: Express.Multer.File[]; meter?: Express.Multer.File[] },
   ): Promise<MileageDetailDto> {
     return this.mileage.create(request.authSession, input, files);
+  }
+
+  @Post(':id/resubmit')
+  @HttpCode(200)
+  @UseInterceptors(MileageUploadInterceptor)
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: '본인 반려 신청 재등록',
+    description:
+      '본인 소유·반려·정산 미편입·현재 submissionVersion을 확인합니다. 선택한 사진 한 장 또는 두 장만 교체하고 같은 신청 ID와 최초 신청일을 유지합니다. 동일 파일 재선택도 허용합니다. 심사/OCR 파생값 초기화와 설정된 OCR 작업 등록은 원자적입니다. 원신청 키는 유지하며 재등록 키는 별도 보관합니다. 같은 키/버전/원본 바이트 재전송은 추가 처리 없이 최신 상세를 반환합니다. 과거 요청 재전송은 최신 상태를 되돌리지 않습니다. 새 선택에는 새 키를 사용합니다.',
+  })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['idempotencyKey', 'submissionVersion'],
+      anyOf: [{ required: ['receipt'] }, { required: ['meter'] }],
+      properties: {
+        idempotencyKey: { type: 'string', format: 'uuid' },
+        submissionVersion: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        receipt: { type: 'string', format: 'binary' },
+        meter: { type: 'string', format: 'binary' },
+      },
+    },
+  })
+  @ApiOkResponse({ type: MileageDetailDto })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'IDEMPOTENCY_CONFLICT | MILEAGE_RESUBMISSION_CONFLICT',
+  })
+  @ApiNotFoundResponse({
+    type: ApiErrorResponseDto,
+    description: 'MILEAGE_APPLICATION_NOT_FOUND',
+  })
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
+  @ApiResponse({
+    status: 413,
+    type: ApiErrorResponseDto,
+    description: 'PHOTO_TOO_LARGE',
+  })
+  @ApiResponse({
+    status: 415,
+    type: ApiErrorResponseDto,
+    description: 'MULTIPART_REQUIRED | UNSUPPORTED_PHOTO_TYPE',
+  })
+  @ApiServiceUnavailableResponse({
+    type: ApiErrorResponseDto,
+    description:
+      'PHOTO_STORAGE_UNAVAILABLE | PHOTO_PROCESSING_BUSY | PHOTO_PROCESSING_TIMEOUT',
+  })
+  resubmit(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @Body() input: ResubmitMileageDto,
+    @UploadedFiles()
+    files: { receipt?: Express.Multer.File[]; meter?: Express.Multer.File[] },
+  ): Promise<MileageDetailDto> {
+    return this.mileage.resubmit(request.authSession, id, input, files);
   }
 
   @Get()

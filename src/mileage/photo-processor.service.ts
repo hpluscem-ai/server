@@ -34,6 +34,11 @@ export class PhotoProcessorService {
     receipt: Express.Multer.File,
     meter: Express.Multer.File,
   ): Promise<[ProcessedPhoto, ProcessedPhoto]> {
+    const photos = await this.processPhotos([receipt, meter]);
+    return [photos[0], photos[1]];
+  }
+
+  async processPhotos(files: Express.Multer.File[]): Promise<ProcessedPhoto[]> {
     // ponytail: one bounded decoder per process; add a bounded worker pool when upload throughput requires it.
     if (this.active)
       throw new ServiceUnavailableException({
@@ -42,7 +47,9 @@ export class PhotoProcessorService {
       });
     this.active = true;
     try {
-      return [await this.process(receipt.path), await this.process(meter.path)];
+      const photos: ProcessedPhoto[] = [];
+      for (const file of files) photos.push(await this.process(file.path));
+      return photos;
     } finally {
       this.active = false;
     }

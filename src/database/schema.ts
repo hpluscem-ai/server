@@ -218,6 +218,20 @@ export const mileageUploadAttempts = sqliteTable('mileage_upload_attempts', {
     .default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const mileageResubmissions = sqliteTable('mileage_resubmissions', {
+  id: integer('id').primaryKey(),
+  applicationId: text('application_id').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  previousVersion: text('previous_version').notNull(),
+  submissionVersion: text('submission_version').notNull(),
+  previousRejectionReason: text('previous_rejection_reason'),
+  previousDecidedAt: text('previous_decided_at'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const mileageOcrJobs = sqliteTable('mileage_ocr_jobs', {
   id: text('id').primaryKey(),
   applicationId: text('application_id')

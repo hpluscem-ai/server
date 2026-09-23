@@ -1,4 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { and, asc, desc, eq, gt, gte, isNull, lt, or, sql } from 'drizzle-orm';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
@@ -7,6 +11,7 @@ import {
   mileagePhotos as photos,
   mileageOcrJobs as ocrJobs,
   mileageUploadAttempts as attempts,
+  mileageResubmissions as resubmissions,
   settlements,
 } from '../database/schema';
 import type { MileageListQueryDto } from './mileage.dto';
@@ -195,6 +200,155 @@ export class MileageRepository {
     );
   }
 
+  submissionVersion(
+    record: Pick<MileageRecord, 'requestHash'> & { photos: PhotoRecord[] },
+  ): string {
+    return photoVersion(record.requestHash, record.photos);
+  }
+
+  findResubmission(applicationId: string, key: string) {
+    return this.database.db
+      .select()
+      .from(resubmissions)
+      .where(
+        and(
+          eq(resubmissions.applicationId, applicationId),
+          eq(resubmissions.idempotencyKey, key),
+        ),
+      )
+      .get();
+  }
+
+  assertResubmittable(
+    record: MileageRecord & { photos: PhotoRecord[] },
+    version: string,
+  ): void {
+    if (
+      record.approvalStatus !== 'rejected' ||
+      record.settlementId !== null ||
+      this.submissionVersion(record) !== version ||
+      !['receipt', 'meter'].every((kind) =>
+        record.photos.some((photo) => photo.kind === kind),
+      )
+    ) {
+      throw new ConflictException({
+        code: 'MILEAGE_RESUBMISSION_CONFLICT',
+        message:
+          '신청 상태나 사진이 변경되었습니다. 신청 내역을 다시 확인해 주세요.',
+      });
+    }
+  }
+
+  commitResubmission(input: {
+    id: string;
+    userId: string;
+    attemptId: string;
+    idempotencyKey: string;
+    requestHash: string;
+    submissionVersion: string;
+    queueOcr: boolean;
+    photos: Omit<PhotoRecord, 'id' | 'mileageApplicationId'>[];
+  }): { committed: boolean; requestHash: string } {
+    return this.database.db.transaction(
+      (tx) => {
+        const application = tx
+          .select()
+          .from(applications)
+          .where(
+            and(
+              eq(applications.id, input.id),
+              eq(applications.userId, input.userId),
+            ),
+          )
+          .get();
+        if (!application)
+          throw new NotFoundException({
+            code: 'MILEAGE_APPLICATION_NOT_FOUND',
+            message: '신청 내역을 찾을 수 없습니다.',
+          });
+        const replay = tx
+          .select()
+          .from(resubmissions)
+          .where(
+            and(
+              eq(resubmissions.applicationId, input.id),
+              eq(resubmissions.idempotencyKey, input.idempotencyKey),
+            ),
+          )
+          .get();
+        if (replay)
+          return { committed: false, requestHash: replay.requestHash };
+        const savedPhotos = tx
+          .select()
+          .from(photos)
+          .where(eq(photos.mileageApplicationId, input.id))
+          .all();
+        this.assertResubmittable(
+          { ...application, photos: savedPhotos },
+          input.submissionVersion,
+        );
+        for (const photo of input.photos) {
+          tx.delete(photos)
+            .where(
+              and(
+                eq(photos.mileageApplicationId, input.id),
+                eq(photos.kind, photo.kind),
+              ),
+            )
+            .run();
+          const replacement = {
+            ...photo,
+            id: randomUUID(),
+            mileageApplicationId: input.id,
+          };
+          tx.insert(photos).values(replacement).run();
+          savedPhotos[
+            savedPhotos.findIndex((previous) => previous.kind === photo.kind)
+          ] = replacement;
+        }
+        const version = photoVersion(application.requestHash, savedPhotos);
+        tx.insert(resubmissions)
+          .values({
+            applicationId: input.id,
+            idempotencyKey: input.idempotencyKey,
+            requestHash: input.requestHash,
+            previousVersion: input.submissionVersion,
+            submissionVersion: version,
+            previousRejectionReason: application.rejectionReason,
+            previousDecidedAt: application.decidedAt,
+          })
+          .run();
+        tx.update(applications)
+          .set({
+            approvalStatus: 'pending',
+            matchStatus: 'pending',
+            receiptAmount: null,
+            meterAmount: null,
+            receiptAt: null,
+            finalAmount: null,
+            mileageAmount: null,
+            rejectionReason: null,
+            decidedAt: null,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(applications.id, input.id))
+          .run();
+        if (input.queueOcr)
+          tx.insert(ocrJobs)
+            .values({
+              id: randomUUID(),
+              applicationId: input.id,
+              sourceVersion: version,
+              extractorVersion: OCR_VERSION,
+            })
+            .run();
+        tx.delete(attempts).where(eq(attempts.id, input.attemptId)).run();
+        return { committed: true, requestHash: input.requestHash };
+      },
+      { behavior: 'immediate' },
+    );
+  }
+
   interruptRunningOcrJobs(): void {
     this.database.db
       .update(ocrJobs)
@@ -346,8 +500,14 @@ export class MileageRepository {
               and(
                 sql`${applications.id} <> ${application.id}`,
                 or(
+                  sql`0`,
+                  // The retained creation hash no longer identifies resubmitted photos.
                   application.requestHash
-                    ? eq(applications.requestHash, application.requestHash)
+                    ? and(
+                        eq(applications.requestHash, application.requestHash),
+                        sql`NOT EXISTS (SELECT 1 FROM ${resubmissions}
+                          WHERE ${resubmissions.applicationId} IN (${application.id}, ${applications.id}))`,
+                      )
                     : undefined,
                   receiptAt !== null &&
                     receiptAmount !== null &&
@@ -368,6 +528,10 @@ export class MileageRepository {
                         sql`EXISTS (
                           SELECT 1 FROM ${ocrJobs}
                           WHERE ${ocrJobs.applicationId} = ${applications.id}
+                            AND ${ocrJobs.sourceVersion} = COALESCE((
+                              SELECT submission_version FROM mileage_resubmissions
+                              WHERE application_id = ${applications.id} ORDER BY id DESC LIMIT 1
+                            ), ${ocrJobs.sourceVersion})
                             AND json_extract(${ocrJobs.result}, '$.receipt.transactionDateText') = ${result.receipt.transactionDateText}
                             AND json_extract(${ocrJobs.result}, '$.receipt.transactionTimeText') = ${result.receipt.transactionTimeText}
                         )`,

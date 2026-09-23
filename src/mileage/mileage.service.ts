@@ -12,6 +12,7 @@ import { AuthService, type AuthenticatedSession } from '../auth';
 import { normalizeDateRange } from '../common/date-range-query';
 import {
   CreateMileageDto,
+  ResubmitMileageDto,
   MileageDetailDto,
   MileageListDto,
   MileageListQueryDto,
@@ -116,6 +117,94 @@ export class MileageService {
     }
   }
 
+  async resubmit(
+    session: AuthenticatedSession,
+    id: string,
+    input: ResubmitMileageDto,
+    files: { receipt?: Express.Multer.File[]; meter?: Express.Multer.File[] },
+  ): Promise<MileageDetailDto> {
+    const kinds = (['receipt', 'meter'] as const).filter(
+      (kind) => files?.[kind]?.length,
+    );
+    if (!kinds.length || kinds.some((kind) => files[kind]!.length !== 1))
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: '교체할 사진을 한 장 이상 선택해 주세요.',
+      });
+    const row = this.repository.findOne(session.user.id, id);
+    if (!row) throw this.notFound();
+    const key = input.idempotencyKey.toLowerCase();
+    if (!this.repository.findResubmission(id, key))
+      this.repository.assertResubmittable(row, input.submissionVersion);
+    const processed = await this.processor.processPhotos(
+      kinds.map((kind) => files[kind]![0]),
+    );
+    const requestHash = createHash('sha256')
+      .update(
+        JSON.stringify([
+          input.submissionVersion,
+          ...processed.map((photo, index) => [kinds[index], photo.hash]),
+        ]),
+      )
+      .digest('hex');
+    this.revalidate(session);
+    const replay = this.repository.findResubmission(id, key);
+    if (replay) {
+      this.assertSameRequest(replay, requestHash);
+      return this.findOne(session.user.id, id);
+    }
+    this.storage.ensureConfigured();
+    const attemptId = randomUUID();
+    const photos = processed.map((photo, index) => ({
+      kind: kinds[index],
+      storageKey: `mileage/${id}/resubmissions/${attemptId}/${kinds[index]}.jpg`,
+      contentType: 'image/jpeg',
+      byteSize: photo.size,
+      originalStorageKey: `mileage/${id}/resubmissions/${attemptId}/${kinds[index]}-original`,
+      originalContentType: photo.contentType,
+      originalByteSize: photo.originalSize,
+    }));
+    const keys = photos.flatMap((photo) => [
+      photo.originalStorageKey,
+      photo.storageKey,
+    ]);
+    this.repository.trackAttempt(attemptId, session.user.id, keys);
+    try {
+      for (let i = 0; i < photos.length; i++) {
+        await this.storage.put(
+          photos[i].originalStorageKey,
+          processed[i].path,
+          processed[i].contentType,
+          processed[i].originalSize,
+        );
+        await this.storage.put(
+          photos[i].storageKey,
+          processed[i].outputPath,
+          'image/jpeg',
+          processed[i].size,
+        );
+      }
+      const current = this.revalidate(session);
+      const saved = this.repository.commitResubmission({
+        id,
+        userId: current.user.id,
+        attemptId,
+        idempotencyKey: key,
+        requestHash,
+        submissionVersion: input.submissionVersion,
+        queueOcr: this.ocr.isConfigured(),
+        photos,
+      });
+      if (!saved.committed) await this.cleanup(attemptId, keys, false);
+      this.assertSameRequest(saved, requestHash);
+      this.revalidate(session);
+      return this.findOne(session.user.id, id);
+    } catch (error) {
+      await this.cleanup(attemptId, keys, true);
+      throw error;
+    }
+  }
+
   findList(userId: string, input: MileageListQueryDto): MileageListDto {
     const query = { ...input, ...normalizeDateRange(input) };
     const cursor = query.cursor ? this.decodeCursor(query) : undefined;
@@ -150,6 +239,7 @@ export class MileageService {
         : null;
     return {
       ...this.present(row),
+      submissionVersion: this.repository.submissionVersion(row),
       photos: { receipt: path('receipt'), meter: path('meter') },
     };
   }
@@ -213,7 +303,10 @@ export class MileageService {
     }
   }
 
-  private assertSameRequest(record: MileageRecord, hash: string): void {
+  private assertSameRequest(
+    record: Pick<MileageRecord, 'requestHash'>,
+    hash: string,
+  ): void {
     if (record.requestHash !== hash)
       throw new ConflictException({
         code: 'IDEMPOTENCY_CONFLICT',

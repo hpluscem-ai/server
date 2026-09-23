@@ -73,7 +73,7 @@ it.each([
           service.connection.prepare('SELECT * FROM installation_sites').get(),
         ).toEqual(preserved);
         expect(service.connection.prepare('PRAGMA user_version').get()).toEqual(
-          { user_version: 8 },
+          { user_version: 10 },
         );
         expect(service.connection.prepare('PRAGMA foreign_keys').get()).toEqual(
           { foreign_keys: 1 },

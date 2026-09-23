@@ -27,7 +27,7 @@ export class MileageUploadInterceptor implements NestInterceptor {
     if (!request.is('multipart/form-data'))
       throw new UnsupportedMediaTypeException({
         code: 'MULTIPART_REQUIRED',
-        message: '사진 두 장을 multipart/form-data로 전송해 주세요.',
+        message: '사진을 multipart/form-data로 전송해 주세요.',
       });
     // Bound temporary disk use as well as the separate image decoder's memory use.
     if (this.activeUploads >= 2)
@@ -58,10 +58,10 @@ export class MileageUploadInterceptor implements NestInterceptor {
     const limits = {
       fileSize: MAX_PHOTO_BYTES,
       files: 2,
-      fields: 1,
-      parts: 3,
+      fields: 2,
+      parts: 4,
       fieldNameSize: 64,
-      fieldSize: 64,
+      fieldSize: 128,
       fieldArrayIndexLimit: 0,
     };
     const upload = multer({
@@ -111,7 +111,7 @@ export class MileageUploadInterceptor implements NestInterceptor {
       }
       throw new BadRequestException({
         code: 'VALIDATION_ERROR',
-        message: '영수증·계기판 사진 한 장씩과 idempotencyKey를 전송해 주세요.',
+        message: '사진과 요청 식별자의 형식과 개수를 확인해 주세요.',
       });
     }
   }
