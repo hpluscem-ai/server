@@ -800,7 +800,6 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .set('Authorization', authorization)
       .send({
         reviewVersion: (detail.body as { reviewVersion: string }).reviewVersion,
-        rejectionReason: '정산 후 변경 시도',
       })
       .expect(409);
     expect(snapshots()[0].mileage_amount).toBe(3000);
@@ -827,7 +826,6 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         .send({
           reviewVersion: (detail.body as { reviewVersion: string })
             .reviewVersion,
-          rejectionReason: '판독 불가',
         }),
     ]);
     expect(results.map((r) => r.status)).toEqual([200, 200]);

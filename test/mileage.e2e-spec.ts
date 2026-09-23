@@ -415,7 +415,6 @@ describe('Mileage applications (e2e)', () => {
     const admin = app.get(AdminMileageService);
     admin.reject(original.id, {
       reviewVersion: admin.detail(original.id).reviewVersion,
-      rejectionReason: '두번째 심사',
     });
     const next = (await get(`${URL}/${original.id}`).expect(200))
       .body as MileageDetailDto;
@@ -434,7 +433,7 @@ describe('Mileage applications (e2e)', () => {
         .all(),
     ).toEqual([
       { previous_rejection_reason: '기존에 저장된 사유' },
-      { previous_rejection_reason: '두번째 심사' },
+      { previous_rejection_reason: null },
     ]);
   });
 
@@ -581,7 +580,6 @@ describe('Mileage applications (e2e)', () => {
     expect(() =>
       admin.reject(original.id, {
         reviewVersion,
-        rejectionReason: '기존에 저장된 사유',
       }),
     ).toThrow();
     const nextJob = repository.claimOcrJob()!;

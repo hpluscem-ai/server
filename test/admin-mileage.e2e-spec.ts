@@ -17,10 +17,15 @@ import {
   logisticsCompanies,
   mileageApplications,
   mileagePhotos,
+  mileageOcrJobs,
   settlements,
   users,
 } from '../src/database/schema';
-import { PhotoStorageService } from '../src/mileage';
+import {
+  PhotoStorageService,
+  MileageRepository,
+  OCR_VERSION,
+} from '../src/mileage';
 import { seedAdminSession } from './helpers/seed-admin-session';
 
 const URL = '/api/v1/admin/mileage/applications';
@@ -403,45 +408,127 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       .send(input);
   }
 
-  it('requires a trimmed reason and current review version; never accepts client money or status', async () => {
+  function ocrJob() {
+    const repository = app.get(MileageRepository);
+    const record = repository.findOne(userId, applicationId)!;
+    return database.db
+      .insert(mileageOcrJobs)
+      .values({
+        id: randomUUID(),
+        applicationId,
+        sourceVersion: repository.submissionVersion(record),
+        extractorVersion: OCR_VERSION,
+        status: 'running',
+      })
+      .returning()
+      .get();
+  }
+
+  const reading = {
+    receipt: {
+      amountText: '10000원',
+      transactionDateText: null,
+      transactionTimeText: null,
+      quantityText: null,
+      quantityUnit: 'unknown' as const,
+      unitPriceText: null,
+      documentKind: 'sale' as const,
+      issues: [],
+    },
+    meter: {
+      amountText: '10000원',
+      litersText: '5.125 리터',
+      unitPriceText: null,
+      issues: [],
+    },
+    clovaError: null,
+    lunaError: null,
+    clovaDurationMs: null,
+    lunaDurationMs: null,
+    lunaInputTokens: null,
+    lunaOutputTokens: null,
+  };
+
+  it('includes stored OCR liters in the review version even when amount and timestamps are unchanged', async () => {
+    const job = ocrJob();
+    app.get(MileageRepository).finishOcrJob(job, reading);
+    const before = await snapshot();
+    database.db
+      .update(mileageOcrJobs)
+      .set({
+        result: {
+          ...reading,
+          meter: { ...reading.meter, litersText: '6.125 리터' },
+        },
+      })
+      .where(eq(mileageOcrJobs.id, job.id))
+      .run();
+    const after = await snapshot();
+    expect(after.reviewVersion).not.toBe(before.reviewVersion);
+    expect(after.meterAmount).toBe(before.meterAmount);
+    await reject({ reviewVersion: before.reviewVersion }).expect(409);
+  });
+
+  it('preserves a reasonless rejection replay after late OCR finishes without applying its readings', async () => {
+    const job = ocrJob();
+    const before = await snapshot();
+    const rejected = await reject({
+      reviewVersion: before.reviewVersion,
+    }).expect(200);
+    app.get(MileageRepository).finishOcrJob(job, reading);
+    await reject({ reviewVersion: before.reviewVersion })
+      .expect(200)
+      .expect(rejected.body);
+    expect((await snapshot()).meterAmount).toBeNull();
+  });
+
+  it('requires only the current review version and stores no new rejection reason', async () => {
     const { reviewVersion } = await snapshot();
     for (const input of [
       {},
-      { reviewVersion },
-      { reviewVersion, rejectionReason: '  ' },
+      { reviewVersion: 'wrong' },
+      { reviewVersion, rejectionReason: '사유' },
       { reviewVersion, rejectionReason: null },
-      { reviewVersion: 'wrong', rejectionReason: '사유' },
-      { reviewVersion, rejectionReason: '사유', finalAmount: 100 },
-      { reviewVersion, rejectionReason: '사유', status: 'approved' },
+      { reviewVersion, finalAmount: 100 },
+      { reviewVersion, status: 'approved' },
     ]) {
       await reject(input).expect(400);
     }
-    const result = await reject({
-      reviewVersion,
-      rejectionReason: '  사진 확인 필요  ',
-    }).expect(200);
+    const result = await reject({ reviewVersion }).expect(200);
     const body = result.body as AdminMileageResponseDto;
     expect(body).toMatchObject({
       status: 'rejected',
-      rejectionReason: '사진 확인 필요',
+      rejectionReason: null,
       finalAmount: null,
       mileageAmount: null,
       settlementId: null,
       reviewVersion,
     });
     expect(Date.parse(body.decidedAt!)).toBeLessThanOrEqual(Date.now());
-    const repeated = await reject({
-      reviewVersion,
-      rejectionReason: '사진 확인 필요',
-    }).expect(200);
-    expect(repeated.body).toEqual(body);
+    await reject({ reviewVersion }).expect(200).expect(body);
     expect(await snapshot()).toEqual(body);
-    await reject({ reviewVersion, rejectionReason: '다른 사유' }).expect(409);
+  });
+
+  it('preserves a historical rejection reason and decision timestamp on reasonless replay', async () => {
+    database.db
+      .update(mileageApplications)
+      .set({
+        approvalStatus: 'rejected',
+        rejectionReason: '과거 사유',
+        decidedAt: '2026-09-22T01:00:00Z',
+      })
+      .where(eq(mileageApplications.id, applicationId))
+      .run();
+    const before = await snapshot();
+    await reject({ reviewVersion: before.reviewVersion })
+      .expect(200)
+      .expect(before);
+    expect(await snapshot()).toEqual(before);
   });
 
   it('requires administrator authentication and exact Origin for cookie rejection', async () => {
     const { reviewVersion } = await snapshot();
-    const body = { reviewVersion, rejectionReason: '사진 확인 필요' };
+    const body = { reviewVersion };
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
     database.db
@@ -490,29 +577,18 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     }
   });
 
-  it('serializes competing administrators and makes identical retransmission harmless', async () => {
+  it('serializes identical reasonless rejections and preserves the first decision', async () => {
     const { reviewVersion } = await snapshot();
     const secondAdmin = seedAdminSession(database);
     const responses = await Promise.all(
-      ['첫 번째 사유', '두 번째 사유'].map((reason, i) =>
-        reject(
-          { reviewVersion, rejectionReason: reason },
-          i ? secondAdmin : authorization,
-        ),
+      [authorization, secondAdmin].map((auth) =>
+        reject({ reviewVersion }, auth),
       ),
     );
-    expect(responses.map((response) => response.status).sort()).toEqual([
-      200, 409,
-    ]);
-    const winner = responses.find((response) => response.status === 200)!
-      .body as AdminMileageResponseDto;
-    const retries = await Promise.all(
-      [1, 2].map(() =>
-        reject({ reviewVersion, rejectionReason: winner.rejectionReason }),
-      ),
-    );
-    expect(retries.map((response) => response.status)).toEqual([200, 200]);
-    expect(await snapshot()).toEqual(winner);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(responses[0].body).toEqual(responses[1].body);
+    const before = await snapshot();
+    await reject({ reviewVersion }).expect(200).expect(before);
   });
 
   it('blocks stale reviews after photo replacement or changed OCR input, even with unchanged timestamps', async () => {
@@ -524,7 +600,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       .run();
     await reject({
       reviewVersion: old.reviewVersion,
-      rejectionReason: '오래된 사진',
     }).expect(409);
     const changed = await snapshot();
     database.db
@@ -534,7 +609,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       .run();
     await reject({
       reviewVersion: changed.reviewVersion,
-      rejectionReason: '오래된 금액',
     }).expect(409);
     expect((await snapshot()).status).toBe('pending');
   });
@@ -543,7 +617,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     const old = await snapshot();
     await reject({
       reviewVersion: old.reviewVersion,
-      rejectionReason: '기존 사진',
     }).expect(200);
     // Models the atomic DB result of re-registration; no driver endpoint is claimed here.
     database.db.transaction(
@@ -565,14 +638,12 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     );
     await reject({
       reviewVersion: old.reviewVersion,
-      rejectionReason: '기존 사진',
     }).expect(409);
     const fresh = await snapshot();
     expect(fresh.status).toBe('pending');
     expect(fresh.reviewVersion).not.toBe(old.reviewVersion);
     await reject({
       reviewVersion: fresh.reviewVersion,
-      rejectionReason: '새 사진 확인 필요',
     }).expect(200);
   });
 
@@ -590,7 +661,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       .run();
     await reject({
       reviewVersion: old.reviewVersion,
-      rejectionReason: '변경 시도',
     }).expect(409);
     const settlementId = randomUUID();
     database.db
@@ -620,7 +690,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       const before = await snapshot();
       await reject({
         reviewVersion: before.reviewVersion,
-        rejectionReason: '정산 후 변경 시도',
       }).expect(409);
       expect(await snapshot()).toEqual(before);
     }
@@ -633,7 +702,6 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     );
     await reject({
       reviewVersion: before.reviewVersion,
-      rejectionReason: '사유',
     }).expect(500);
     expect(await snapshot()).toEqual(before);
   });

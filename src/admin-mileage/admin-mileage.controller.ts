@@ -95,7 +95,7 @@ export class AdminMileageController {
   @ApiOperation({
     summary: '대기 신청 반려',
     description:
-      '필수 사유와 조회 시 reviewVersion을 제출합니다. 대기·정산 미편입 신청만 원자적으로 반려합니다. 같은 사진·입력에 대한 동일 사유 재전송은 기존 결과를 반환하며 decidedAt을 다시 쓰지 않습니다. 다른 사유·심사 결과·사진/입력 변경은 409입니다. 승인·승인 취소는 지원하지 않습니다.',
+      '조회 시 reviewVersion만 제출합니다. 대기·정산 미편입 신청만 원자적으로 반려하며 새 반려 사유는 null입니다. 같은 버전의 반려 재전송은 기존 결과·decidedAt·역사적 사유를 유지합니다. 심사 결과·사진/입력 변경 또는 정산 편입은 409입니다. 반려 사유나 임의 금액을 입력받지 않습니다.',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiOkResponse({ type: AdminMileageResponseDto })

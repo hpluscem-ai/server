@@ -16,9 +16,11 @@ import {
   logisticsCompanies,
   mileageApplications as applications,
   mileagePhotos as photos,
+  mileageOcrJobs as ocrJobs,
+  mileageResubmissions as resubmissions,
   users,
 } from '../database/schema';
-import { PhotoStorageService } from '../mileage';
+import { PhotoStorageService, OCR_VERSION } from '../mileage';
 import {
   AdminMileageQueryDto,
   AdminMileageResponseDto,
@@ -59,18 +61,14 @@ export class AdminMileageService {
           throw this.conflict();
         }
         // A lost response can be retried without rewriting the decision or its timestamp.
-        if (
-          current.status === 'rejected' &&
-          current.rejectionReason === input.rejectionReason
-        )
-          return current;
+        if (current.status === 'rejected') return current;
         if (current.status !== 'pending') throw this.conflict();
         const now = new Date().toISOString();
         const changed = tx
           .update(applications)
           .set({
             approvalStatus: 'rejected',
-            rejectionReason: input.rejectionReason,
+            rejectionReason: null,
             finalAmount: null,
             mileageAmount: null,
             decidedAt: now,
@@ -156,6 +154,15 @@ export class AdminMileageService {
         submittedAt: applications.submittedAt,
         decidedAt: applications.decidedAt,
         settlementId: applications.settlementId,
+        // Late OCR after a rejection of unread photos is not applied to the application.
+        ocrEvidence: sql<
+          string | null
+        >`(SELECT json_array(${ocrJobs.sourceVersion}, ${ocrJobs.extractorVersion}, ${ocrJobs.result}, ${ocrJobs.errorCode})
+          FROM ${ocrJobs} WHERE ${ocrJobs.applicationId} = ${applications.id}
+          AND ${ocrJobs.extractorVersion} = ${OCR_VERSION} AND ${ocrJobs.status} = 'completed'
+          AND ${applications.matchStatus} <> 'pending'
+          AND ${ocrJobs.sourceVersion} = COALESCE((SELECT ${resubmissions.submissionVersion} FROM ${resubmissions}
+            WHERE ${resubmissions.applicationId} = ${applications.id} ORDER BY ${resubmissions.id} DESC LIMIT 1), ${ocrJobs.sourceVersion}) LIMIT 1)`,
         receiptPhotoIdentity: sql<
           string | null
         >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = 'receipt')`,
@@ -188,6 +195,7 @@ export class AdminMileageService {
           meterPhotoIdentity,
           requestHash,
           idempotencyKey,
+          ocrEvidence,
           ...row
         }) => {
           for (const amount of [
@@ -219,6 +227,7 @@ export class AdminMileageService {
                 row.matchStatus,
                 receiptPhotoIdentity,
                 meterPhotoIdentity,
+                ocrEvidence,
               ]),
             )
             .digest('hex');

@@ -1,7 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
-  IsNotEmpty,
   IsString,
   IsUUID,
   Matches,
@@ -39,16 +38,6 @@ export class RejectAdminMileageDto {
   @IsString()
   @Matches(/^[a-f0-9]{64}$/)
   reviewVersion!: string;
-
-  @ApiProperty({
-    description: '필수 반려 사유. 앞뒤 공백을 제거해 저장합니다.',
-  })
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string' ? value.trim() : value,
-  )
-  @IsString()
-  @IsNotEmpty()
-  rejectionReason!: string;
 }
 
 export class AdminMileagePhotoPathsDto {
