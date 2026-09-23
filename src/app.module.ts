@@ -1,3 +1,8 @@
+import {
+  SettlementsController,
+  SettlementsService,
+  MileageBalanceController,
+} from './settlements';
 import { AdminMileageController, AdminMileageService } from './admin-mileage';
 import {
   MileageController,
@@ -44,6 +49,8 @@ import {
 @Module({
   imports: [],
   controllers: [
+    SettlementsController,
+    MileageBalanceController,
     AdminMileageController,
     MileageController,
     AdminStationsController,
@@ -57,6 +64,7 @@ import {
     AdminAuthController,
   ],
   providers: [
+    SettlementsService,
     AdminMileageService,
     MileageRepository,
     MileageService,

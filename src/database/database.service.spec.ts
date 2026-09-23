@@ -38,13 +38,15 @@ describe('DatabaseService', () => {
       'mileage_upload_attempts',
       'password_reset_tokens',
       'phone_verifications',
+      'settlement_completions',
+      'settlement_snapshots',
       'settlements',
       'users',
     ]);
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 7 });
+    ).toEqual({ user_version: 8 });
 
     expect(() => {
       databaseService.connection
@@ -104,7 +106,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 7 });
+          ).toEqual({ user_version: 8 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(original);
@@ -502,12 +504,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 7,
+        user_version: 8,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions', 'settlement_snapshots', 'settlement_completions') AND name NOT GLOB 'settlement_capture_*' AND name <> 'mileage_approved_decided_idx' AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -641,7 +643,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 7 });
+          ).toEqual({ user_version: 8 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -671,13 +673,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 8;');
+    newerDatabase.exec('PRAGMA user_version = 9;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 8 is newer than supported version 7',
+        'Database schema version 9 is newer than supported version 8',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -787,7 +789,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 7 });
+          ).toEqual({ user_version: 8 });
           expect(
             upgraded.connection.prepare('PRAGMA foreign_keys').get(),
           ).toEqual({ foreign_keys: 1 });
@@ -863,7 +865,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 7 });
+          ).toEqual({ user_version: 8 });
           expect(() =>
             upgraded!.connection.exec(
               "UPDATE phone_verifications SET scope_user_id = 'missing-user'",
