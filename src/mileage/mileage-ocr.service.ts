@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 
-export const OCR_VERSION = 'clova-general-v2+luna-meter-v1';
+export const OCR_VERSION = 'clova-general-v2+luna-meter-v1+evidence-v2';
 export type ReceiptReading = {
   amountText: string | null;
   transactionDateText: string | null;
@@ -271,9 +271,12 @@ type OcrField = {
 };
 
 export function parseReceiptFields(rawFields: unknown[]): ReceiptReading {
+  const issues: string[] = [];
+  if (rawFields.length > 2000) issues.push('TRUNCATED_DOCUMENT');
   const fields: OcrField[] = rawFields.slice(0, 2000).flatMap((raw) => {
     const field = record(raw);
     if (!field || typeof field.inferText !== 'string') return [];
+    if (field.inferText.trim().length > 120) issues.push('TRUNCATED_DOCUMENT');
     const text = field.inferText.trim().slice(0, 120);
     if (!text) return [];
     const polygon = record(field.boundingPoly);
@@ -337,39 +340,53 @@ export function parseReceiptFields(rawFields: unknown[]): ReceiptReading {
   }
   const text = lines.join(' ');
   const cancel = /취소|환불|반품/.test(text);
-  const sale = /승인|매출|주유/.test(text);
+  const sale =
+    /(?:^|\s)(?:승인|승인취소|정상승인|매출|매출전표|결제완료)(?:\s|$)/.test(
+      text,
+    );
   const documentKind =
     cancel && sale ? 'mixed' : cancel ? 'cancel' : sale ? 'sale' : 'unknown';
+  if (/재출력|재인쇄|재발행|사본/.test(text)) issues.push('REPRINTED_DOCUMENT');
+  if (/외상|미수|후불/.test(text)) issues.push('UNPAID_DOCUMENT');
+  if (/계기판/.test(text)) issues.push('MIXED_DOCUMENT');
   const amountCandidates = lines.flatMap((line) => {
     const label =
       /(?:실결제금액|결제금액|승인금액|거래금액|주유금액|총금액|합계금액|합계)/.exec(
         line,
       );
     if (!label || /취소|환불/.test(line)) return [];
-    const rest = line.slice(line.indexOf(label[0]) + label[0].length);
-    const matches = rest.match(/\d{1,3}(?:,\d{3})+|\d{1,9}/g) ?? [];
-    return matches.filter((candidate) => amountValue(candidate) !== null);
+    const rest = line
+      .slice(line.indexOf(label[0]) + label[0].length)
+      .trim()
+      .replace(/^[:：]\s*/, '');
+    if (amountValue(rest) === null) issues.push('AMOUNT_UNCLEAR');
+    return amountValue(rest) === null ? [] : [rest];
   });
   const amountValues = [
     ...new Set(amountCandidates.map((candidate) => amountValue(candidate))),
   ];
-  const issues: string[] = [];
   if (amountValues.length !== 1)
     issues.push(amountValues.length ? 'AMOUNT_AMBIGUOUS' : 'AMOUNT_MISSING');
   if (documentKind !== 'sale') issues.push('DOCUMENT_NOT_CONFIRMED_SALE');
   const dates = lines.filter((line) => /거래일시|승인일시|결제일시/.test(line));
   const dateMatches = dates.flatMap(
-    (line) => line.match(/20\d{2}[-./]\d{1,2}[-./]\d{1,2}/g) ?? [],
+    (line) =>
+      line.match(/(?<![\d./-])20\d{2}[-./]\d{1,2}[-./]\d{1,2}(?![\d./-])/g) ??
+      [],
   );
   const timeMatches = dates.flatMap(
     (line) =>
       line.match(
-        /(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?:Z|[+-]\d{2}:\d{2})?/g,
+        /(?<![\d:.+-])\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?(?![\w:.+-])/g,
       ) ?? [],
   );
   const uniqueDates = [...new Set(dateMatches)];
   const uniqueTimes = [...new Set(timeMatches)];
-  if (uniqueDates.length !== 1 || uniqueTimes.length !== 1)
+  if (
+    dates.length !== 1 ||
+    dateMatches.length !== 1 ||
+    timeMatches.length !== 1
+  )
     issues.push('TRANSACTION_TIME_UNCLEAR');
   const quantityLine = lines.find((line) => /주유량|수량|판매량/.test(line));
   const quantityMatch = quantityLine?.match(
@@ -404,4 +421,74 @@ export function litersValue(raw: string | null): string | null {
   if (!raw) return null;
   const match = /^(\d{1,5}(?:\.\d{1,3})?)\s*(?:L|ℓ|리터)$/i.exec(raw.trim());
   return match ? match[1] : null;
+}
+
+// Require printed seconds and an explicit offset until the timezone policy is confirmed.
+export function transactionAt(receipt: ReceiptReading | null): string | null {
+  const date = /^(20\d{2})[-./](\d{1,2})[-./](\d{1,2})$/.exec(
+    receipt?.transactionDateText ?? '',
+  );
+  const time = /^(\d{1,2}):(\d{2}):(\d{2})(Z|([+-])(\d{2}):(\d{2}))$/.exec(
+    receipt?.transactionTimeText ?? '',
+  );
+  if (!date || !time) return null;
+  const [, year, month, day] = date.map(Number);
+  const hour = Number(time[1]),
+    minute = Number(time[2]),
+    second = Number(time[3]);
+  const offsetHour = Number(time[6] ?? 0),
+    offsetMinute = Number(time[7] ?? 0);
+  if (
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  )
+    return null;
+  const calendar = new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second),
+  );
+  if (
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() + 1 !== month ||
+    calendar.getUTCDate() !== day
+  )
+    return null;
+  const offset = (offsetHour * 60 + offsetMinute) * (time[5] === '-' ? -1 : 1);
+  return new Date(calendar.getTime() - offset * 60000).toISOString();
+}
+
+export function mileageFromLiters(raw: string | null): number | null {
+  const liters = litersValue(raw);
+  if (liters === null) return null;
+  const [whole, fraction = ''] = liters.split('.');
+  const scale = 10n ** BigInt(fraction.length);
+  const numerator = BigInt(whole + fraction) * 20n;
+  const rounded = (numerator * 2n + scale) / (scale * 2n);
+  return rounded <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rounded) : null;
+}
+
+export function automaticApprovalAmounts(
+  receipt: ReceiptReading | null,
+  meter: MeterReading | null,
+  receiptAt: string | null,
+): { finalAmount: number; mileageAmount: number } | null {
+  if (
+    !receipt ||
+    !meter ||
+    receipt.documentKind !== 'sale' ||
+    receipt.issues.length ||
+    meter.issues.length ||
+    !receiptAt ||
+    transactionAt(receipt) !== receiptAt
+  )
+    return null;
+  const finalAmount = amountValue(receipt.amountText);
+  const mileageAmount = mileageFromLiters(meter.litersText);
+  return finalAmount !== null &&
+    finalAmount === amountValue(meter.amountText) &&
+    mileageAmount !== null
+    ? { finalAmount, mileageAmount }
+    : null;
 }

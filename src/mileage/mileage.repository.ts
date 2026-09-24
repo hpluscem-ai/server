@@ -17,6 +17,8 @@ import {
 import type { MileageListQueryDto } from './mileage.dto';
 import {
   amountValue,
+  automaticApprovalAmounts,
+  transactionAt,
   litersValue,
   OCR_VERSION,
   type MeterReading,
@@ -388,6 +390,20 @@ export class MileageRepository {
 
   ocrSource(job: OcrJob): { receiptKey: string; meterKey: string } | null {
     return this.database.db.transaction((tx) => {
+      const current = tx
+        .select()
+        .from(ocrJobs)
+        .where(eq(ocrJobs.id, job.id))
+        .get();
+      if (
+        !current ||
+        current.status !== 'running' ||
+        current.applicationId !== job.applicationId ||
+        current.sourceVersion !== job.sourceVersion ||
+        current.extractorVersion !== job.extractorVersion ||
+        current.extractorVersion !== OCR_VERSION
+      )
+        return null;
       const application = tx
         .select()
         .from(applications)
@@ -471,7 +487,14 @@ export class MileageRepository {
           .from(ocrJobs)
           .where(eq(ocrJobs.id, job.id))
           .get();
-        if (!current || current.status !== 'running') return;
+        if (
+          !current ||
+          current.status !== 'running' ||
+          current.applicationId !== job.applicationId ||
+          current.sourceVersion !== job.sourceVersion ||
+          current.extractorVersion !== job.extractorVersion
+        )
+          return;
         const application = tx
           .select()
           .from(applications)
@@ -483,6 +506,9 @@ export class MileageRepository {
           .where(eq(photos.mileageApplicationId, job.applicationId))
           .all();
         const stillCurrent =
+          current.extractorVersion === OCR_VERSION &&
+          savedPhotos.some((photo) => photo.kind === 'receipt') &&
+          savedPhotos.some((photo) => photo.kind === 'meter') &&
           application?.approvalStatus === 'pending' &&
           application.settlementId === null &&
           photoVersion(application.requestHash, savedPhotos) ===
@@ -490,57 +516,92 @@ export class MileageRepository {
         const receiptAmount = amountValue(result.receipt?.amountText ?? null);
         const meterAmount = amountValue(result.meter?.amountText ?? null);
         const receiptAt = transactionAt(result.receipt);
-        const duplicate =
+        // Keep the original pair-hash suspicion rule; creation hashes do not identify replacements.
+        let duplicate = Boolean(
           stillCurrent &&
-          application &&
+          application?.requestHash &&
           tx
             .select({ id: applications.id })
             .from(applications)
             .where(
               and(
                 sql`${applications.id} <> ${application.id}`,
-                or(
-                  sql`0`,
-                  // The retained creation hash no longer identifies resubmitted photos.
-                  application.requestHash
-                    ? and(
-                        eq(applications.requestHash, application.requestHash),
-                        sql`NOT EXISTS (SELECT 1 FROM ${resubmissions}
-                          WHERE ${resubmissions.applicationId} IN (${application.id}, ${applications.id}))`,
-                      )
-                    : undefined,
-                  receiptAt !== null &&
-                    receiptAmount !== null &&
-                    meterAmount !== null
-                    ? and(
-                        eq(applications.receiptAt, receiptAt),
-                        eq(applications.receiptAmount, receiptAmount),
-                        eq(applications.meterAmount, meterAmount),
-                      )
-                    : undefined,
-                  result.receipt?.transactionDateText &&
-                    result.receipt.transactionTimeText &&
-                    receiptAmount !== null &&
-                    meterAmount !== null
-                    ? and(
-                        eq(applications.receiptAmount, receiptAmount),
-                        eq(applications.meterAmount, meterAmount),
-                        sql`EXISTS (
-                          SELECT 1 FROM ${ocrJobs}
-                          WHERE ${ocrJobs.applicationId} = ${applications.id}
-                            AND ${ocrJobs.sourceVersion} = COALESCE((
-                              SELECT submission_version FROM mileage_resubmissions
-                              WHERE application_id = ${applications.id} ORDER BY id DESC LIMIT 1
-                            ), ${ocrJobs.sourceVersion})
-                            AND json_extract(${ocrJobs.result}, '$.receipt.transactionDateText') = ${result.receipt.transactionDateText}
-                            AND json_extract(${ocrJobs.result}, '$.receipt.transactionTimeText') = ${result.receipt.transactionTimeText}
-                        )`,
-                      )
-                    : undefined,
-                ),
+                eq(applications.requestHash, application.requestHash),
+                sql`NOT EXISTS (SELECT 1 FROM ${resubmissions}
+              WHERE ${resubmissions.applicationId} IN (${application.id}, ${applications.id}))`,
               ),
             )
-            .get();
+            .get(),
+        );
+        if (
+          !duplicate &&
+          stillCurrent &&
+          application &&
+          receiptAmount !== null &&
+          meterAmount !== null
+        ) {
+          const candidates = tx
+            .select({ application: applications, job: ocrJobs })
+            .from(applications)
+            .leftJoin(ocrJobs, eq(ocrJobs.applicationId, applications.id))
+            .where(
+              and(
+                sql`${applications.id} <> ${application.id}`,
+                eq(applications.receiptAmount, receiptAmount),
+                eq(applications.meterAmount, meterAmount),
+              ),
+            )
+            .all();
+          // ponytail: scan only matching totals; index normalized current evidence if this set becomes large.
+          duplicate = candidates.some((candidate) => {
+            if (!candidate.job)
+              return (
+                receiptAt !== null &&
+                candidate.application.receiptAt === receiptAt
+              );
+            const candidatePhotos = tx
+              .select()
+              .from(photos)
+              .where(eq(photos.mileageApplicationId, candidate.application.id))
+              .all();
+            if (
+              candidate.job.sourceVersion !==
+              photoVersion(candidate.application.requestHash, candidatePhotos)
+            )
+              return false;
+            const previous = candidate.job.result as OcrResult | null;
+            const receipt = previous?.receipt;
+            if (
+              !receipt ||
+              amountValue(receipt.amountText) !== receiptAmount ||
+              amountValue(previous?.meter?.amountText ?? null) !== meterAmount
+            )
+              return false;
+            return (
+              (receiptAt !== null && transactionAt(receipt) === receiptAt) ||
+              Boolean(
+                result.receipt?.transactionDateText &&
+                result.receipt.transactionTimeText &&
+                receipt.transactionDateText ===
+                  result.receipt.transactionDateText &&
+                receipt.transactionTimeText ===
+                  result.receipt.transactionTimeText,
+              )
+            );
+          });
+        }
+        const failed =
+          errorCode !== undefined ||
+          result.clovaError !== null ||
+          result.lunaError !== null;
+        const approval =
+          stillCurrent &&
+          !duplicate &&
+          !failed &&
+          process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED === 'true'
+            ? automaticApprovalAmounts(result.receipt, result.meter, receiptAt)
+            : null;
+        const now = new Date().toISOString();
         if (stillCurrent && application) {
           const status = duplicate
             ? 'duplicate_suspected'
@@ -562,7 +623,14 @@ export class MileageRepository {
               meterAmount,
               receiptAt,
               matchStatus: status,
-              updatedAt: new Date().toISOString(),
+              ...(approval
+                ? {
+                    ...approval,
+                    approvalStatus: 'approved' as const,
+                    decidedAt: now,
+                  }
+                : {}),
+              updatedAt: now,
             })
             .where(
               and(
@@ -575,17 +643,14 @@ export class MileageRepository {
         }
         tx.update(ocrJobs)
           .set({
-            status:
-              errorCode || result.clovaError || result.lunaError
-                ? 'failed'
-                : 'completed',
+            status: failed ? 'failed' : 'completed',
             result,
             errorCode: errorCode ?? result.clovaError ?? result.lunaError,
             clovaDurationMs: result.clovaDurationMs,
             lunaDurationMs: result.lunaDurationMs,
             lunaInputTokens: result.lunaInputTokens,
             lunaOutputTokens: result.lunaOutputTokens,
-            finishedAt: new Date().toISOString(),
+            finishedAt: now,
           })
           .where(eq(ocrJobs.id, job.id))
           .run();
@@ -612,30 +677,6 @@ function photoVersion(
       ]),
     )
     .digest('hex');
-}
-
-function transactionAt(receipt: ReceiptReading | null): string | null {
-  if (!receipt?.transactionDateText || !receipt.transactionTimeText)
-    return null;
-  const date = receipt.transactionDateText
-    .replaceAll('.', '-')
-    .replaceAll('/', '-');
-  const time = receipt.transactionTimeText;
-  if (
-    !/^20\d{2}-\d{2}-\d{2}$/.test(date) ||
-    !/^\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(time)
-  )
-    return null;
-  const iso = date + 'T' + time;
-  const parsed = new Date(iso);
-  const [year, month, day] = date.split('-').map(Number);
-  const calendar = new Date(Date.UTC(year, month - 1, day));
-  return Number.isNaN(parsed.getTime()) ||
-    calendar.getUTCFullYear() !== year ||
-    calendar.getUTCMonth() + 1 !== month ||
-    calendar.getUTCDate() !== day
-    ? null
-    : parsed.toISOString();
 }
 
 function visibleSettlement() {

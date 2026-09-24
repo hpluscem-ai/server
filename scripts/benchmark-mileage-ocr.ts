@@ -1,8 +1,11 @@
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
+import { readFile, writeFile, rename } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import {
   amountValue,
+  automaticApprovalAmounts,
+  transactionAt,
   litersValue,
   MileageOcrService,
   type MeterReading,
@@ -17,8 +20,77 @@ type Case = {
     receiptAmount: number | null;
     meterAmount: number | null;
     liters: string | null;
+    transactionAt?: string | null;
+    documentKind?: ReceiptReading['documentKind'] | null;
+    uncertain?: boolean | null;
+    autoApprove?: boolean | null;
   };
 };
+
+type ReadingResult = {
+  receipt: ReceiptReading | null;
+  meter: MeterReading | null;
+  clovaError: string | null;
+  lunaError: string | null;
+};
+
+export function evaluateReading(result: ReadingResult, truth: Case['truth']) {
+  const receipt = amountValue(result.receipt?.amountText ?? null);
+  const meter = amountValue(result.meter?.amountText ?? null);
+  const liters = litersValue(result.meter?.litersText ?? null);
+  const at = transactionAt(result.receipt);
+  const candidate =
+    !result.clovaError &&
+    !result.lunaError &&
+    automaticApprovalAmounts(result.receipt, result.meter, at) !== null;
+  const receiptExact =
+    truth.receiptAmount !== null && receipt === truth.receiptAmount;
+  const meterExact = truth.meterAmount !== null && meter === truth.meterAmount;
+  const litersExact =
+    truth.liters !== null &&
+    liters !== null &&
+    Number(liters) === Number(truth.liters);
+  const transactionExact = Boolean(
+    truth.transactionAt && at === truth.transactionAt,
+  );
+  const complete =
+    truth.receiptAmount !== null &&
+    truth.meterAmount !== null &&
+    truth.liters !== null &&
+    Boolean(truth.transactionAt) &&
+    truth.documentKind != null &&
+    truth.documentKind !== 'unknown' &&
+    typeof truth.uncertain === 'boolean' &&
+    typeof truth.autoApprove === 'boolean';
+  const wrong =
+    (truth.receiptAmount !== null && !receiptExact) ||
+    (truth.meterAmount !== null && !meterExact) ||
+    (truth.liters !== null && !litersExact) ||
+    (Boolean(truth.transactionAt) && !transactionExact) ||
+    (truth.documentKind != null &&
+      truth.documentKind !== 'unknown' &&
+      truth.documentKind !== 'sale') ||
+    truth.uncertain === true ||
+    truth.autoApprove === false;
+  return {
+    receiptExact,
+    meterExact,
+    litersExact,
+    transactionExact,
+    candidate,
+    falseMatch:
+      receipt !== null &&
+      receipt === meter &&
+      ((truth.receiptAmount !== null && !receiptExact) ||
+        (truth.meterAmount !== null && !meterExact)),
+    falseApproval: candidate && wrong,
+    missedApproval: !candidate && truth.autoApprove === true,
+    decisionExact:
+      typeof truth.autoApprove === 'boolean' && candidate === truth.autoApprove,
+    verifiedApproval: candidate && complete && !wrong,
+    unverifiedApproval: candidate && !complete && !wrong,
+  };
+}
 
 function option(name: string): string | undefined {
   const position = process.argv.indexOf('--' + name);
@@ -55,7 +127,22 @@ function caseRecord(value: unknown): value is Case {
     (item.truth.meterAmount === null ||
       (Number.isSafeInteger(item.truth.meterAmount) &&
         item.truth.meterAmount >= 0)) &&
-    (item.truth.liters === null || typeof item.truth.liters === 'string')
+    (item.truth.liters === null ||
+      (typeof item.truth.liters === 'string' &&
+        litersValue(item.truth.liters + ' L') !== null)) &&
+    (item.truth.transactionAt == null ||
+      (typeof item.truth.transactionAt === 'string' &&
+        Number.isFinite(Date.parse(item.truth.transactionAt)) &&
+        new Date(item.truth.transactionAt).toISOString() ===
+          item.truth.transactionAt)) &&
+    (item.truth.documentKind == null ||
+      ['sale', 'cancel', 'mixed', 'unknown'].includes(
+        item.truth.documentKind,
+      )) &&
+    (item.truth.uncertain == null ||
+      typeof item.truth.uncertain === 'boolean') &&
+    (item.truth.autoApprove == null ||
+      typeof item.truth.autoApprove === 'boolean')
   );
 }
 
@@ -73,14 +160,62 @@ async function main(): Promise<void> {
     throw new Error(
       'Absolute --manifest and --output paths outside the repository are required',
     );
-  const clovaLimit = limit('max-clova-calls');
-  const lunaLimit = limit('max-luna-calls');
+  const replayPath = option('results');
+  const live = process.argv.includes('--live');
+  if (
+    replayPath &&
+    (live || !isAbsolute(replayPath) || !outsideRepository(replayPath))
+  )
+    throw new Error(
+      '--results requires an outside-repository absolute path and cannot use --live',
+    );
   const manifest: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
   const cases = (manifest as { cases?: unknown })?.cases;
   if (!Array.isArray(cases) || !cases.every(caseRecord))
     throw new Error(
       'Manifest must contain cases with absolute image paths and truth',
     );
+  if (new Set(cases.map((item) => item.id)).size !== cases.length)
+    throw new Error('Duplicate case ids');
+  if (replayPath) {
+    const saved = JSON.parse(await readFile(replayPath, 'utf8')) as {
+      results?: unknown[];
+    };
+    if (!Array.isArray(saved.results))
+      throw new Error('Saved results are missing');
+    const evaluations = saved.results.map((raw) => {
+      const result = raw as ReadingResult & { id: string };
+      const item = cases.find((item) => item.id === result.id);
+      if (!item || !validSavedReading(result))
+        throw new Error('Invalid saved reading or missing truth case');
+      return { id: item.id, ...evaluateReading(result, item.truth) };
+    });
+    if (new Set(evaluations.map((item) => item.id)).size !== evaluations.length)
+      throw new Error('Duplicate result ids');
+    const report = {
+      mode: 'replay',
+      source: replayPath,
+      evaluatedAt: new Date().toISOString(),
+      clovaCalls: 0,
+      lunaCalls: 0,
+      missingResults: cases.length - evaluations.length,
+      evaluations,
+    };
+    await writeFile(outputPath, JSON.stringify(report, null, 2), {
+      mode: 0o600,
+      flag: 'wx',
+    });
+    process.stdout.write(
+      JSON.stringify({
+        mode: 'replay',
+        evaluated: evaluations.length,
+        clovaCalls: 0,
+        lunaCalls: 0,
+        output: outputPath,
+      }) + '\n',
+    );
+    return;
+  }
   const unique = new Map<
     string,
     { item: Case; receipt: Buffer; meter: Buffer }
@@ -99,9 +234,11 @@ async function main(): Promise<void> {
       .update(receipt)
       .update(meter)
       .digest('hex');
-    if (!unique.has(hash)) unique.set(hash, { item, receipt, meter });
+    const previous = unique.get(hash);
+    if (previous && !isDeepStrictEqual(previous.item.truth, item.truth))
+      throw new Error('Conflicting truth for identical image pairs');
+    if (!previous) unique.set(hash, { item, receipt, meter });
   }
-  const live = process.argv.includes('--live');
   const count = unique.size;
   process.stdout.write(
     JSON.stringify({
@@ -113,9 +250,13 @@ async function main(): Promise<void> {
     }) + '\n',
   );
   if (!live) return;
-  if (clovaLimit < count || lunaLimit < count)
+  const clovaLimit = limit('max-clova-calls');
+  const lunaLimit = limit('max-luna-calls');
+  const clovaUsed = limit('used-clova-calls');
+  const lunaUsed = limit('used-luna-calls');
+  if (clovaLimit - clovaUsed < count || lunaLimit - lunaUsed < count)
     throw new Error(
-      'Explicit provider call limits are lower than unique pairs',
+      'Remaining approved provider calls are lower than unique pairs',
     );
   if (
     !process.env.CLOVA_OCR_INVOKE_URL ||
@@ -135,7 +276,36 @@ async function main(): Promise<void> {
     clovaDurationMs: number | null;
     lunaDurationMs: number | null;
   }> = [];
+  // Reserve attempts durably before calling; a crash must not silently restore paid budget.
+  let reservedPairs = 0;
+  const writeReport = async (report: object, initial = false) => {
+    const contents = JSON.stringify(report, null, 2);
+    if (initial)
+      await writeFile(outputPath, contents, { mode: 0o600, flag: 'wx' });
+    else {
+      await writeFile(outputPath + '.next', contents, {
+        mode: 0o600,
+        flag: 'wx',
+      });
+      await rename(outputPath + '.next', outputPath);
+    }
+  };
+  const save = (initial = false) =>
+    writeReport(
+      {
+        evaluatedAt: new Date().toISOString(),
+        clovaCalls: reservedPairs,
+        lunaCalls: reservedPairs,
+        cumulativeClovaCalls: clovaUsed + reservedPairs,
+        cumulativeLunaCalls: lunaUsed + reservedPairs,
+        results,
+      },
+      initial,
+    );
+  await save(true);
   for (const { item, receipt, meter } of unique.values()) {
+    reservedPairs++;
+    await save();
     const [clova, luna] = await Promise.allSettled([
       service.readReceipt(receipt),
       service.readMeter(meter),
@@ -155,6 +325,7 @@ async function main(): Promise<void> {
       lunaOutputTokens:
         luna.status === 'fulfilled' ? (luna.value.usage?.outputTokens ?? 0) : 0,
     });
+    await save();
   }
   const truths = new Map(
     [...unique.values()].map(({ item }) => [item.id, item.truth]),
@@ -164,6 +335,12 @@ async function main(): Promise<void> {
     meterExact: 0,
     litersExact: 0,
     falseMatches: 0,
+    transactionExact: 0,
+    falseApprovals: 0,
+    missedApprovals: 0,
+    decisionExact: 0,
+    verifiedApprovals: 0,
+    unverifiedApprovals: 0,
     manualReview: 0,
     clovaCalls: results.length,
     lunaCalls: results.length,
@@ -172,54 +349,71 @@ async function main(): Promise<void> {
   };
   for (const result of results) {
     const truth = truths.get(result.id)!;
-    const receipt = amountValue(result.receipt?.amountText ?? null);
-    const meter = amountValue(result.meter?.amountText ?? null);
-    const liters = litersValue(result.meter?.litersText ?? null);
-    if (receipt === truth.receiptAmount) stats.receiptExact++;
-    if (meter === truth.meterAmount) stats.meterExact++;
-    if (liters === truth.liters) stats.litersExact++;
-    const matched =
-      receipt !== null &&
-      meter !== null &&
-      receipt === meter &&
-      result.receipt?.documentKind === 'sale' &&
-      result.receipt.issues.length === 0 &&
-      result.meter?.issues.length === 0 &&
-      liters !== null;
-    if (!matched) stats.manualReview++;
-    if (matched && truth.receiptAmount !== truth.meterAmount)
-      stats.falseMatches++;
+    const evaluation = evaluateReading(result, truth);
+    if (evaluation.receiptExact) stats.receiptExact++;
+    if (evaluation.meterExact) stats.meterExact++;
+    if (evaluation.litersExact) stats.litersExact++;
+    if (evaluation.transactionExact) stats.transactionExact++;
+    if (evaluation.falseMatch) stats.falseMatches++;
+    if (evaluation.falseApproval) stats.falseApprovals++;
+    if (evaluation.missedApproval) stats.missedApprovals++;
+    if (evaluation.decisionExact) stats.decisionExact++;
+    if (evaluation.verifiedApproval) stats.verifiedApprovals++;
+    if (evaluation.unverifiedApproval) stats.unverifiedApprovals++;
+    if (!evaluation.candidate) stats.manualReview++;
     stats.lunaInputTokens += result.lunaInputTokens;
     stats.lunaOutputTokens += result.lunaOutputTokens;
   }
-  const lunaUsdEstimate =
-    (stats.lunaInputTokens * 0.2 + stats.lunaOutputTokens * 1.2) / 1000000;
-  await writeFile(
-    outputPath,
-    JSON.stringify(
-      {
-        evaluatedAt: new Date().toISOString(),
-        uniquePairs: count,
-        stats,
-        lunaUsdEstimate,
-        clovaBilling:
-          'Check account invoice; free tier and API Gateway charges vary',
-        results,
-      },
-      null,
-      2,
-    ),
-    { mode: 0o600, flag: 'wx' },
-  );
+  await writeReport({
+    evaluatedAt: new Date().toISOString(),
+    uniquePairs: count,
+    stats,
+    cumulativeClovaCalls: clovaUsed + reservedPairs,
+    cumulativeLunaCalls: lunaUsed + reservedPairs,
+    billing: 'Use actual account usage and invoices; no fixed-price estimate',
+    results,
+  });
   process.stdout.write(
-    JSON.stringify({ ...stats, lunaUsdEstimate, output: resolve(outputPath) }) +
-      '\n',
+    JSON.stringify({ ...stats, output: resolve(outputPath) }) + '\n',
   );
 }
 
-void main().catch((error: unknown) => {
-  process.stderr.write(
-    (error instanceof Error ? error.message : 'Benchmark failed') + '\n',
+if (require.main === module)
+  void main().catch((error: unknown) => {
+    process.stderr.write(
+      (error instanceof Error ? error.message : 'Benchmark failed') + '\n',
+    );
+    process.exitCode = 1;
+  });
+
+function validSavedReading(value: ReadingResult): boolean {
+  const strings = (object: object, keys: string[]) =>
+    keys.every((key) => {
+      const field = (object as Record<string, unknown>)[key];
+      return field === null || typeof field === 'string';
+    });
+  const issues = (reading: { issues: unknown }) =>
+    Array.isArray(reading.issues) &&
+    reading.issues.every((issue) => typeof issue === 'string');
+  return (
+    (value.clovaError === null || typeof value.clovaError === 'string') &&
+    (value.lunaError === null || typeof value.lunaError === 'string') &&
+    (value.receipt === null ||
+      (typeof value.receipt === 'object' &&
+        strings(value.receipt, [
+          'amountText',
+          'transactionDateText',
+          'transactionTimeText',
+          'quantityText',
+          'unitPriceText',
+        ]) &&
+        ['sale', 'cancel', 'mixed', 'unknown'].includes(
+          value.receipt.documentKind,
+        ) &&
+        issues(value.receipt))) &&
+    (value.meter === null ||
+      (typeof value.meter === 'object' &&
+        strings(value.meter, ['amountText', 'litersText', 'unitPriceText']) &&
+        issues(value.meter)))
   );
-  process.exitCode = 1;
-});
+}
