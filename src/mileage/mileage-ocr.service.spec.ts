@@ -440,14 +440,21 @@ describe('OCR benchmark approval truth', () => {
       unverifiedApproval: true,
     });
   });
-  it('excludes provider failures even when cached readings look valid', () => {
-    expect(
-      evaluateReading(
-        { receipt, meter, clovaError: 'CLOVA_FAILED', lunaError: null },
-        truth,
-      ),
-    ).toMatchObject({ candidate: false, verifiedApproval: false });
-  });
+  it.each([
+    { clovaError: 'CLOVA_FAILED', lunaError: null },
+    { clovaError: '', lunaError: null },
+    { clovaError: null, lunaError: '' },
+  ])(
+    'excludes provider failures %j even when cached readings look valid',
+    (errors) => {
+      expect(
+        evaluateReading({ receipt, meter, ...errors }, truth),
+      ).toMatchObject({
+        candidate: false,
+        verifiedApproval: false,
+      });
+    },
+  );
 });
 
 describe('benchmark CLI without external calls', () => {

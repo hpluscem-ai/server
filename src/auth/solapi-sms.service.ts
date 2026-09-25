@@ -9,9 +9,12 @@ import {
 @Injectable()
 export class SolapiSmsService {
   async sendVerificationCode(phone: string, code: string): Promise<void> {
-    const apiKey = process.env.SOLAPI_API_KEY?.trim();
-    const apiSecret = process.env.SOLAPI_API_SECRET?.trim();
-    const sender = process.env.SOLAPI_SENDER_PHONE?.trim();
+    // Vercel Preview must keep using dev credentials even when NODE_ENV is production.
+    const environment = process.env.VERCEL_ENV ?? process.env.NODE_ENV;
+    const suffix = environment === 'production' ? '_LIVE' : '';
+    const apiKey = process.env[`SOLAPI_API_KEY${suffix}`]?.trim();
+    const apiSecret = process.env[`SOLAPI_API_SECRET${suffix}`]?.trim();
+    const sender = process.env[`SOLAPI_SENDER_PHONE${suffix}`]?.trim();
 
     if (!apiKey || !apiSecret || !sender || !/^\d{8,11}$/.test(sender)) {
       throw new ServiceUnavailableException({

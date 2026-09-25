@@ -40,8 +40,8 @@ export function evaluateReading(result: ReadingResult, truth: Case['truth']) {
   const liters = litersValue(result.meter?.litersText ?? null);
   const at = transactionAt(result.receipt);
   const candidate =
-    !result.clovaError &&
-    !result.lunaError &&
+    result.clovaError === null &&
+    result.lunaError === null &&
     automaticApprovalAmounts(result.receipt, result.meter, at) !== null;
   const receiptExact =
     truth.receiptAmount !== null && receipt === truth.receiptAmount;
