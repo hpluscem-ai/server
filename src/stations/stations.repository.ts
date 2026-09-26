@@ -6,6 +6,7 @@ import {
   eq,
   gte,
   inArray,
+  ilike,
   lt,
   lte,
   or,
@@ -35,12 +36,12 @@ export class StationDevicesConflictError extends Error {
 export class StationsRepository {
   constructor(private readonly database: DatabaseService) {}
 
-  findAll(
+  async findAll(
     query: AdminStationListQueryDto = {},
     appOnly = false,
     bounds?: StationBoundsQueryDto,
-  ): StationRecord[] {
-    const rows = this.database.db
+  ): Promise<StationRecord[]> {
+    const rows = await this.database.db
       .select({ station: installationSites, device: installationSiteDevices })
       .from(installationSites)
       .leftJoin(
@@ -52,14 +53,20 @@ export class StationsRepository {
           appOnly ? eq(installationSites.active, true) : undefined,
           query.createdFrom
             ? gte(
-                sql`julianday(${installationSites.createdAt})`,
-                sql`julianday(${query.createdFrom})`,
+                sql`${installationSites.createdAt}::timestamptz`,
+                sql`${query.createdFrom}::timestamptz`,
               )
             : undefined,
           query.createdBefore
             ? lt(
-                sql`julianday(${installationSites.createdAt})`,
-                sql`julianday(${query.createdBefore})`,
+                sql`${installationSites.createdAt}::timestamptz`,
+                sql`${query.createdBefore}::timestamptz`,
+              )
+            : undefined,
+          query.stationQuery
+            ? ilike(
+                installationSites.businessName,
+                `%${escapeLike(query.stationQuery)}%`,
               )
             : undefined,
           bounds
@@ -83,8 +90,7 @@ export class StationsRepository {
         desc(installationSites.createdAt),
         asc(installationSites.id),
         asc(installationSiteDevices.id),
-      )
-      .all();
+      );
     const stations = new Map<string, StationRecord>();
     for (const { station, device } of rows) {
       let record = stations.get(station.id);
@@ -94,18 +100,16 @@ export class StationsRepository {
       }
       if (device) record.devices.push(device);
     }
-    // ponytail: Unicode contains search scans selected stations; index search when volume warrants it.
-    const name = query.stationQuery?.toLocaleLowerCase('ko-KR');
-    return [...stations.values()].filter(
-      (row) =>
-        !name || row.businessName.toLocaleLowerCase('ko-KR').includes(name),
-    );
+    return [...stations.values()];
   }
 
-  findOne(id: string, appOnly = false): StationRecord | undefined {
+  async findOne(
+    id: string,
+    appOnly = false,
+  ): Promise<StationRecord | undefined> {
     // 부모와 기기를 같은 읽기 스냅샷에서 조회한다.
-    return this.database.db.transaction((tx) => {
-      const station = tx
+    return this.database.db.transaction(async (tx) => {
+      const [station] = await tx
         .select()
         .from(installationSites)
         .where(
@@ -114,112 +118,108 @@ export class StationsRepository {
             appOnly ? eq(installationSites.active, true) : undefined,
           ),
         )
-        .get();
+        .limit(1);
       if (!station) return undefined;
-      const devices = tx
+      const devices = await tx
         .select()
         .from(installationSiteDevices)
         .where(eq(installationSiteDevices.installationSiteId, id))
-        .orderBy(asc(installationSiteDevices.id))
-        .all();
+        .orderBy(asc(installationSiteDevices.id));
       return { ...station, devices };
     });
   }
 
-  create(input: CreateStationDto): StationRecord {
-    return this.database.db.transaction(
-      (tx) => {
-        const { devices: inputs, note, ...fields } = input;
-        const station = tx
-          .insert(installationSites)
-          .values({ id: randomUUID(), ...fields, note: note ?? null })
-          .returning()
-          .get();
-        const devices = inputs.map((device) =>
-          tx
-            .insert(installationSiteDevices)
-            .values({
-              ...device,
-              id: randomUUID(),
-              installationSiteId: station.id,
-            })
-            .returning()
-            .get(),
-        );
-        return { ...station, devices };
-      },
-      { behavior: 'immediate' },
-    );
-  }
-
-  remove(id: string): boolean {
-    // FK ON DELETE CASCADE removes only this station's devices in the same statement.
-    return (
-      this.database.db
-        .delete(installationSites)
-        .where(eq(installationSites.id, id))
-        .run().changes > 0
-    );
-  }
-
-  update(id: string, input: UpdateStationDto): StationRecord {
-    return this.database.db.transaction(
-      (tx) => {
-        const previous = tx
-          .select()
-          .from(installationSites)
-          .where(eq(installationSites.id, id))
-          .get();
-        if (!previous) throw new StationNotFoundError();
-        const existing = tx
-          .select()
-          .from(installationSiteDevices)
-          .where(eq(installationSiteDevices.installationSiteId, id))
-          .all();
-        const submittedIds = input.devices.flatMap((device) =>
-          device.id === undefined ? [] : [device.id],
-        );
-        const uniqueIds = new Set(submittedIds);
-        if (uniqueIds.size !== submittedIds.length)
-          throw new StationDevicesConflictError('DUPLICATE_DEVICE_ID');
-        const existingIds = new Set(existing.map((device) => device.id));
-        if (submittedIds.some((deviceId) => !existingIds.has(deviceId)))
-          throw new StationDevicesConflictError('UNKNOWN_DEVICE');
-        const removedIds = existing
-          .filter((device) => !uniqueIds.has(device.id))
-          .map((device) => device.id);
-
-        const { devices: inputs, note, ...fields } = input;
-        const locationChanged =
-          previous.roadAddress !== fields.roadAddress ||
-          previous.latitude !== fields.latitude ||
-          previous.longitude !== fields.longitude;
-        const station = tx
-          .update(installationSites)
-          .set({
-            ...fields,
-            note: note ?? null,
-            updatedAt: sql`CURRENT_TIMESTAMP`,
-            ...(locationChanged
-              ? { coordinateSource: null, coordinateVerifiedAt: null }
-              : {}),
+  async create(input: CreateStationDto): Promise<StationRecord> {
+    return this.database.db.transaction(async (tx) => {
+      const { devices: inputs, note, ...fields } = input;
+      const [station] = await tx
+        .insert(installationSites)
+        .values({ id: randomUUID(), ...fields, note: note ?? null })
+        .returning();
+      const devices = [] as (typeof installationSiteDevices.$inferSelect)[];
+      for (const device of inputs) {
+        const [created] = await tx
+          .insert(installationSiteDevices)
+          .values({
+            ...device,
+            id: randomUUID(),
+            installationSiteId: station.id,
           })
-          .where(eq(installationSites.id, id))
-          .returning()
-          .get();
-        if (removedIds.length) {
-          tx.delete(installationSiteDevices)
-            .where(
-              and(
-                eq(installationSiteDevices.installationSiteId, id),
-                inArray(installationSiteDevices.id, removedIds),
-              ),
-            )
-            .run();
-        }
-        const devices = inputs.map((device) =>
+          .returning();
+        devices.push(created);
+      }
+      return { ...station, devices };
+    });
+  }
+
+  async remove(id: string): Promise<boolean> {
+    // FK ON DELETE CASCADE removes only this station's devices in the same statement.
+    const [station] = await this.database.db
+      .delete(installationSites)
+      .where(eq(installationSites.id, id))
+      .returning({ id: installationSites.id });
+    return station !== undefined;
+  }
+
+  async update(id: string, input: UpdateStationDto): Promise<StationRecord> {
+    return this.database.db.transaction(async (tx) => {
+      const [previous] = await tx
+        .select()
+        .from(installationSites)
+        .where(eq(installationSites.id, id))
+        .for('update')
+        .limit(1);
+      if (!previous) throw new StationNotFoundError();
+      const existing = await tx
+        .select()
+        .from(installationSiteDevices)
+        .where(eq(installationSiteDevices.installationSiteId, id))
+        .for('update');
+      const submittedIds = input.devices.flatMap((device) =>
+        device.id === undefined ? [] : [device.id],
+      );
+      const uniqueIds = new Set(submittedIds);
+      if (uniqueIds.size !== submittedIds.length)
+        throw new StationDevicesConflictError('DUPLICATE_DEVICE_ID');
+      const existingIds = new Set(existing.map((device) => device.id));
+      if (submittedIds.some((deviceId) => !existingIds.has(deviceId)))
+        throw new StationDevicesConflictError('UNKNOWN_DEVICE');
+      const removedIds = existing
+        .filter((device) => !uniqueIds.has(device.id))
+        .map((device) => device.id);
+
+      const { devices: inputs, note, ...fields } = input;
+      const locationChanged =
+        previous.roadAddress !== fields.roadAddress ||
+        previous.latitude !== fields.latitude ||
+        previous.longitude !== fields.longitude;
+      const [station] = await tx
+        .update(installationSites)
+        .set({
+          ...fields,
+          note: note ?? null,
+          updatedAt: sql`CURRENT_TIMESTAMP`,
+          ...(locationChanged
+            ? { coordinateSource: null, coordinateVerifiedAt: null }
+            : {}),
+        })
+        .where(eq(installationSites.id, id))
+        .returning();
+      if (removedIds.length) {
+        await tx
+          .delete(installationSiteDevices)
+          .where(
+            and(
+              eq(installationSiteDevices.installationSiteId, id),
+              inArray(installationSiteDevices.id, removedIds),
+            ),
+          );
+      }
+      const devices = [] as (typeof installationSiteDevices.$inferSelect)[];
+      for (const device of inputs) {
+        const [saved] =
           device.id === undefined
-            ? tx
+            ? await tx
                 .insert(installationSiteDevices)
                 .values({
                   id: randomUUID(),
@@ -228,8 +228,7 @@ export class StationsRepository {
                   capacityLiters: device.capacityLiters,
                 })
                 .returning()
-                .get()
-            : tx
+            : await tx
                 .update(installationSiteDevices)
                 .set({
                   model: device.model,
@@ -242,12 +241,14 @@ export class StationsRepository {
                     eq(installationSiteDevices.installationSiteId, id),
                   ),
                 )
-                .returning()
-                .get(),
-        );
-        return { ...station, devices };
-      },
-      { behavior: 'immediate' },
-    );
+                .returning();
+        devices.push(saved);
+      }
+      return { ...station, devices };
+    });
   }
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
 }

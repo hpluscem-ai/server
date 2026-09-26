@@ -37,6 +37,7 @@ import type {
   MileageDetailDto,
   MileageListDto,
 } from '../src/mileage/mileage.dto';
+import { createTestDatabase } from './helpers/create-test-database';
 import { seedAdminSession } from './helpers/seed-admin-session';
 
 const URL = '/api/v1/mileage/applications';
@@ -46,7 +47,7 @@ class TestStorage {
   failAt = 0;
   failCleanup = false;
   beforePut?: () => Promise<void>;
-  beforeGet?: () => void;
+  beforeGet?: () => Promise<void>;
   ensureConfigured() {}
   async put(key: string, path: string) {
     this.writes++;
@@ -63,16 +64,13 @@ class TestStorage {
     this.objects.delete(key);
     return Promise.resolve();
   }
-  get(key: string) {
-    this.beforeGet?.();
+  async get(key: string) {
+    await this.beforeGet?.();
     const data = this.objects.get(key);
-    return data
-      ? Promise.resolve(data)
-      : Promise.reject(
-          new ServiceUnavailableException({
-            code: 'PHOTO_STORAGE_UNAVAILABLE',
-          }),
-        );
+    if (data) return data;
+    throw new ServiceUnavailableException({
+      code: 'PHOTO_STORAGE_UNAVAILABLE',
+    });
   }
 }
 
@@ -89,27 +87,22 @@ describe('Mileage applications (e2e)', () => {
   const previousOrigin = process.env.WEB_ORIGINS;
   beforeAll(async () => {
     process.env.WEB_ORIGINS = 'http://localhost:4000';
-    const previousPath = process.env.DATABASE_PATH;
-    process.env.DATABASE_PATH = ':memory:';
     storage = new TestStorage();
-    try {
-      const module = await Test.createTestingModule({ imports: [AppModule] })
-        .overrideProvider(PhotoStorageService)
-        .useValue(storage)
-        .compile();
-      app = module.createNestApplication<INestApplication<App>>();
-      configureApp(app);
-      // Never start a paid OCR worker from an environment configured on this machine.
-      const configured = jest
-        .spyOn(app.get(MileageOcrService), 'isConfigured')
-        .mockReturnValue(false);
-      await app.init();
-      configured.mockRestore();
-    } finally {
-      if (previousPath === undefined) delete process.env.DATABASE_PATH;
-      else process.env.DATABASE_PATH = previousPath;
-    }
-    database = app.get(DatabaseService);
+    database = await createTestDatabase();
+    const module = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(DatabaseService)
+      .useValue(database)
+      .overrideProvider(PhotoStorageService)
+      .useValue(storage)
+      .compile();
+    app = module.createNestApplication<INestApplication<App>>();
+    configureApp(app);
+    // Never start a paid OCR worker from an environment configured on this machine.
+    const configured = jest
+      .spyOn(app.get(MileageOcrService), 'isConfigured')
+      .mockReturnValue(false);
+    await app.init();
+    configured.mockRestore();
     receipt = await sharp({
       create: { width: 64, height: 32, channels: 3, background: '#cc3322' },
     })
@@ -122,14 +115,21 @@ describe('Mileage applications (e2e)', () => {
       .png()
       .toBuffer();
   });
-  beforeEach(() => {
+  beforeEach(async () => {
     jest
       .spyOn(app.get(MileageOcrService), 'isConfigured')
       .mockReturnValue(false);
     // Also clears approved rows while respecting the production photo protection trigger.
-    database.connection.exec(
-      "UPDATE mileage_applications SET approval_status='pending', settlement_id=NULL; DELETE FROM mileage_application_photos; DELETE FROM mileage_applications; DELETE FROM mileage_upload_attempts; DELETE FROM settlements; DELETE FROM users; DELETE FROM logistics_companies;",
-    );
+    for (const statement of [
+      "UPDATE app.mileage_applications SET approval_status='pending', settlement_id=NULL",
+      'DELETE FROM app.mileage_application_photos',
+      'DELETE FROM app.mileage_applications',
+      'DELETE FROM app.mileage_upload_attempts',
+      'DELETE FROM app.settlements',
+      'DELETE FROM app.users',
+      'DELETE FROM app.logistics_companies',
+    ])
+      await database.connection.unsafe(statement);
     storage.objects.clear();
     storage.writes = 0;
     storage.failAt = 0;
@@ -139,57 +139,49 @@ describe('Mileage applications (e2e)', () => {
     key = randomUUID();
     companyId = randomUUID();
     userId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '테스트 물류사',
-        businessNumber: randomUUID(),
-        corporateRegistrationNumber: randomUUID(),
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1111-2222',
-        bankCode: '19',
-        accountNumber: '123',
-        accountHolder: '테스트',
-      })
-      .run();
-    authorization = driver(userId, 'first');
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '테스트 물류사',
+      businessNumber: randomUUID(),
+      corporateRegistrationNumber: randomUUID(),
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1111-2222',
+      bankCode: '19',
+      accountNumber: '123',
+      accountHolder: '테스트',
+    });
+    authorization = await driver(userId, 'first');
   });
   afterEach(() => jest.restoreAllMocks());
   afterAll(async () => {
     await app.close();
+    await database.onModuleDestroy();
     if (previousOrigin === undefined) delete process.env.WEB_ORIGINS;
     else process.env.WEB_ORIGINS = previousOrigin;
   });
 
-  function driver(id: string, suffix: string) {
-    database.db
-      .insert(users)
-      .values({
-        id,
-        role: 'driver',
-        email: `${suffix}@example.com`,
-        name: '테스트 기사',
-        phone: `010-${suffix}`,
-        passwordHash: 'isolated-unused-hash',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+  async function driver(id: string, suffix: string) {
+    await database.db.insert(users).values({
+      id,
+      role: 'driver',
+      email: `${suffix}@example.com`,
+      name: '테스트 기사',
+      phone: `010-${suffix}`,
+      passwordHash: 'isolated-unused-hash',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId: id,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      userId: id,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 600000),
+    });
     return `Bearer ${token}`;
   }
   function submit(
@@ -220,7 +212,7 @@ describe('Mileage applications (e2e)', () => {
 
   async function rejected() {
     const result = await saved();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({
         approvalStatus: 'rejected',
@@ -231,8 +223,7 @@ describe('Mileage applications (e2e)', () => {
         matchStatus: 'mismatched',
         decidedAt: '2026-09-23T00:00:00.000Z',
       })
-      .where(eq(mileageApplications.id, result.id))
-      .run();
+      .where(eq(mileageApplications.id, result.id));
     return (await get(`${URL}/${result.id}`).expect(200))
       .body as MileageDetailDto;
   }
@@ -254,8 +245,10 @@ describe('Mileage applications (e2e)', () => {
 
   it('resubmits only the selected photo, preserving originals, the first date and creation key', async () => {
     const original = await rejected();
-    const before = database.db.select().from(mileageApplications).get()!;
-    const photos = database.db.select().from(mileagePhotos).all();
+    const before = (
+      await database.db.select().from(mileageApplications).limit(1)
+    )[0];
+    const photos = await database.db.select().from(mileagePhotos);
     const objects = new Map(storage.objects);
     const result = await resubmit(original, randomUUID(), receipt).expect(200);
     expect(result.body).toMatchObject({
@@ -267,7 +260,9 @@ describe('Mileage applications (e2e)', () => {
     const updated = result.body as MileageDetailDto;
     expect(updated.submissionVersion).toMatch(/^[a-f0-9]{64}$/);
     expect(updated.submissionVersion).not.toBe(original.submissionVersion);
-    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toMatchObject({
       idempotencyKey: before.idempotencyKey,
       requestHash: before.requestHash,
       receiptAmount: null,
@@ -278,7 +273,7 @@ describe('Mileage applications (e2e)', () => {
       mileageAmount: null,
       matchStatus: 'pending',
     });
-    const after = database.db.select().from(mileagePhotos).all();
+    const after = await database.db.select().from(mileagePhotos);
     expect(after.find((photo) => photo.kind === 'meter')).toEqual(
       photos.find((photo) => photo.kind === 'meter'),
     );
@@ -289,11 +284,13 @@ describe('Mileage applications (e2e)', () => {
     for (const [path, content] of objects)
       expect(storage.objects.get(path)).toEqual(content);
     expect(
-      database.connection
-        .prepare('SELECT previous_rejection_reason FROM mileage_resubmissions')
-        .get(),
+      (
+        await database.connection.unsafe(
+          'SELECT previous_rejection_reason FROM app.mileage_resubmissions',
+        )
+      )[0],
     ).toMatchObject({ previous_rejection_reason: '기존에 저장된 사유' });
-    expect(database.db.select().from(mileageUploadAttempts).all()).toHaveLength(
+    expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       0,
     );
   });
@@ -318,19 +315,18 @@ describe('Mileage applications (e2e)', () => {
     await resubmit(original, randomUUID(), receipt).expect(409);
     expect(storage.writes).toBe(8);
     await submit().expect(201).expect(current.body);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
-    expect(database.db.select().from(mileageOcrJobs).all()).toHaveLength(2);
+    expect(await database.db.select().from(mileageOcrJobs)).toHaveLength(2);
   });
 
   it('does not treat missing legacy creation hashes and failed OCR as duplicate evidence', async () => {
     const original = await rejected();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({ requestHash: null })
-      .where(eq(mileageApplications.id, original.id))
-      .run();
+      .where(eq(mileageApplications.id, original.id));
     key = randomUUID();
     await saved();
     const legacy = (await get(`${URL}/${original.id}`).expect(200))
@@ -340,8 +336,8 @@ describe('Mileage applications (e2e)', () => {
       .mockReturnValue(true);
     await resubmit(legacy, randomUUID(), receipt).expect(200);
     const repository = app.get(MileageRepository);
-    const job = repository.claimOcrJob()!;
-    repository.finishOcrJob(job, {
+    const job = (await repository.claimOcrJob())!;
+    await repository.finishOcrJob(job, {
       receipt: null,
       meter: null,
       clovaError: 'test failure',
@@ -351,7 +347,7 @@ describe('Mileage applications (e2e)', () => {
       lunaInputTokens: null,
       lunaOutputTokens: null,
     });
-    expect(repository.findOne(userId, original.id)?.matchStatus).toBe(
+    expect((await repository.findOne(userId, original.id))?.matchStatus).toBe(
       'ocr_failed',
     );
   });
@@ -372,7 +368,7 @@ describe('Mileage applications (e2e)', () => {
       .set('Authorization', '')
       .expect(401);
     await resubmit(original, randomUUID(), receipt)
-      .set('Authorization', driver(randomUUID(), 'other'))
+      .set('Authorization', await driver(randomUUID(), 'other'))
       .expect(404);
     await resubmit(
       { ...original, id: randomUUID() },
@@ -390,20 +386,16 @@ describe('Mileage applications (e2e)', () => {
       .set('Cookie', cookie)
       .set('Origin', 'https://untrusted.test')
       .expect(403);
-    database.db
+    await database.db
       .update(mileageApplications)
-      .set({ approvalStatus: 'pending' })
-      .run();
+      .set({ approvalStatus: 'pending' });
     await resubmit(original, randomUUID(), receipt).expect(409);
-    database.db
-      .update(mileageApplications)
-      .set({
-        approvalStatus: 'approved',
-        finalAmount: 1000,
-        mileageAmount: 100,
-        decidedAt: new Date().toISOString(),
-      })
-      .run();
+    await database.db.update(mileageApplications).set({
+      approvalStatus: 'approved',
+      finalAmount: 1000,
+      mileageAmount: 100,
+      decidedAt: new Date().toISOString(),
+    });
     await resubmit(original, randomUUID(), receipt).expect(409);
     expect(storage.writes).toBe(4);
   });
@@ -413,25 +405,23 @@ describe('Mileage applications (e2e)', () => {
     const firstKey = randomUUID();
     await resubmit(original, firstKey, receipt).expect(200);
     const admin = app.get(AdminMileageService);
-    admin.reject(original.id, {
+    await admin.reject(original.id, {
       rejectionReason: '금액 불일치',
-      reviewVersion: admin.detail(original.id).reviewVersion,
+      reviewVersion: (await admin.detail(original.id)).reviewVersion,
     });
     const next = (await get(`${URL}/${original.id}`).expect(200))
       .body as MileageDetailDto;
     const latest = await resubmit(next, randomUUID(), undefined, meter).expect(
       200,
     );
-    const photos = database.db.select().from(mileagePhotos).all();
+    const photos = await database.db.select().from(mileagePhotos);
     await resubmit(original, firstKey, receipt).expect(200).expect(latest.body);
-    expect(database.db.select().from(mileagePhotos).all()).toEqual(photos);
+    expect(await database.db.select().from(mileagePhotos)).toEqual(photos);
     expect(storage.writes).toBe(8);
     expect(
-      database.connection
-        .prepare(
-          'SELECT previous_rejection_reason FROM mileage_resubmissions ORDER BY rowid',
-        )
-        .all(),
+      await database.connection.unsafe(
+        'SELECT previous_rejection_reason FROM app.mileage_resubmissions ORDER BY id',
+      ),
     ).toEqual([
       { previous_rejection_reason: '기존에 저장된 사유' },
       { previous_rejection_reason: '금액 불일치' },
@@ -444,18 +434,25 @@ describe('Mileage applications (e2e)', () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
       const original = await rejected();
-      const row = database.db.select().from(mileageApplications).get();
-      const photos = database.db.select().from(mileagePhotos).all();
+      const row = (
+        await database.db.select().from(mileageApplications).limit(1)
+      )[0];
+      const photos = await database.db.select().from(mileagePhotos);
       const objects = new Map(storage.objects);
       if (failure === 'storage') storage.failAt = 6;
       if (failure === 'session')
-        storage.beforePut = () => {
-          database.db.delete(authSessions).run();
-          return Promise.resolve();
+        storage.beforePut = async () => {
+          await database.db.delete(authSessions);
         };
       if (failure === 'transaction')
-        database.connection.exec(
-          "CREATE TRIGGER fail_resubmit BEFORE INSERT ON mileage_resubmissions BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        await database.connection.unsafe(
+          `CREATE FUNCTION app.fail_resubmit() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'test failure'; END;
+           $$`,
+        );
+      if (failure === 'transaction')
+        await database.connection.unsafe(
+          'CREATE TRIGGER fail_resubmit BEFORE INSERT ON app.mileage_resubmissions FOR EACH ROW EXECUTE FUNCTION app.fail_resubmit()',
         );
       try {
         await resubmit(original, randomUUID(), receipt).expect(
@@ -463,18 +460,24 @@ describe('Mileage applications (e2e)', () => {
         );
       } finally {
         if (failure === 'transaction')
-          database.connection.exec('DROP TRIGGER fail_resubmit');
+          await database.connection.unsafe(
+            'DROP TRIGGER fail_resubmit ON app.mileage_resubmissions',
+          );
+        if (failure === 'transaction')
+          await database.connection.unsafe('DROP FUNCTION app.fail_resubmit()');
       }
-      expect(database.db.select().from(mileageApplications).get()).toEqual(row);
-      expect(database.db.select().from(mileagePhotos).all()).toEqual(photos);
+      expect(
+        (await database.db.select().from(mileageApplications).limit(1))[0],
+      ).toEqual(row);
+      expect(await database.db.select().from(mileagePhotos)).toEqual(photos);
       expect(storage.objects).toEqual(objects);
       expect(
-        database.connection
-          .prepare('SELECT * FROM mileage_resubmissions')
-          .all(),
+        await database.connection.unsafe(
+          'SELECT * FROM app.mileage_resubmissions',
+        ),
       ).toHaveLength(0);
       expect(
-        database.db.select().from(mileageUploadAttempts).all(),
+        await database.db.select().from(mileageUploadAttempts),
       ).toHaveLength(1);
     },
   );
@@ -494,7 +497,7 @@ describe('Mileage applications (e2e)', () => {
     const resubmitKey = randomUUID();
     await resubmit(original, resubmitKey, receipt).expect(500);
     expect(storage.objects.size).toBe(6);
-    expect(database.db.select().from(mileageUploadAttempts).all()).toHaveLength(
+    expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       0,
     );
     await resubmit(original, resubmitKey, receipt).expect(200);
@@ -541,11 +544,11 @@ describe('Mileage applications (e2e)', () => {
       expect(firstResult.status).toBe(sameKey ? 200 : 409);
       expect(storage.objects.size).toBe(6);
       expect(
-        database.connection
-          .prepare('SELECT * FROM mileage_resubmissions')
-          .all(),
+        await database.connection.unsafe(
+          'SELECT * FROM app.mileage_resubmissions',
+        ),
       ).toHaveLength(1);
-      expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+      expect(await database.db.select().from(mileageApplications)).toHaveLength(
         1,
       );
     },
@@ -557,15 +560,17 @@ describe('Mileage applications (e2e)', () => {
       .mockReturnValue(true);
     const original = await rejected();
     const repository = app.get(MileageRepository);
-    const oldJob = repository.claimOcrJob()!;
+    const oldJob = (await repository.claimOcrJob())!;
     const admin = app.get(AdminMileageService);
-    const reviewVersion = admin.detail(original.id).reviewVersion;
+    const reviewVersion = (await admin.detail(original.id)).reviewVersion;
     const current = (
       await resubmit(original, randomUUID(), receipt).expect(200)
     ).body as MileageDetailDto;
-    const before = database.db.select().from(mileageApplications).get();
-    expect(repository.ocrSource(oldJob)).toBeNull();
-    repository.finishOcrJob(oldJob, {
+    const before = (
+      await database.db.select().from(mileageApplications).limit(1)
+    )[0];
+    expect(await repository.ocrSource(oldJob)).toBeNull();
+    await repository.finishOcrJob(oldJob, {
       receipt: null,
       meter: null,
       clovaError: null,
@@ -575,24 +580,24 @@ describe('Mileage applications (e2e)', () => {
       lunaInputTokens: null,
       lunaOutputTokens: null,
     });
-    expect(database.db.select().from(mileageApplications).get()).toEqual(
-      before,
-    );
-    expect(() =>
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toEqual(before);
+    await expect(
       admin.reject(original.id, {
         rejectionReason: '금액 불일치',
         reviewVersion,
       }),
-    ).toThrow();
-    const nextJob = repository.claimOcrJob()!;
+    ).rejects.toThrow();
+    const nextJob = (await repository.claimOcrJob())!;
     expect(nextJob.sourceVersion).toBe(current.submissionVersion);
-    expect(repository.ocrSource(nextJob)?.receiptKey).toContain(
+    expect((await repository.ocrSource(nextJob))?.receiptKey).toContain(
       '/resubmissions/',
     );
-    expect(repository.ocrSource(nextJob)?.meterKey).toBe(
+    expect((await repository.ocrSource(nextJob))?.meterKey).toBe(
       `mileage/${original.id}/meter.jpg`,
     );
-    expect(database.db.select().from(mileageOcrJobs).all()).toHaveLength(2);
+    expect(await database.db.select().from(mileageOcrJobs)).toHaveLength(2);
   });
 
   it('commits both photos as pending, normalizes orientation/metadata and protects original keys', async () => {
@@ -607,11 +612,11 @@ describe('Mileage applications (e2e)', () => {
     expect(result).not.toHaveProperty('requestHash');
     expect(JSON.stringify(result)).not.toContain('original');
     expect(storage.objects.size).toBe(4);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(2);
-    expect(database.db.select().from(mileageUploadAttempts).all()).toHaveLength(
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(2);
+    expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       0,
     );
     const normalized = storage.objects.get(`mileage/${result.id}/receipt.jpg`)!;
@@ -650,20 +655,20 @@ describe('Mileage applications (e2e)', () => {
     const first = (await single().expect(201)).body as MileageDetailDto;
     expect(first.photoMode).toBe('single');
     expect(storage.writes).toBe(2);
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(1);
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(1);
     await single().expect(201).expect(first);
     expect(storage.writes).toBe(2);
     const one = await get(`${URL}/${first.id}/photos/receipt`).expect(200);
     const two = await get(`${URL}/${first.id}/photos/meter`).expect(200);
     expect(one.body).toEqual(two.body);
     const admin = app.get(AdminMileageService);
-    expect(admin.detail(first.id).photos.meter).toBeTruthy();
-    const reject = () =>
+    expect((await admin.detail(first.id)).photos.meter).toBeTruthy();
+    const reject = async () =>
       admin.reject(first.id, {
         rejectionReason: '금액 불일치',
-        reviewVersion: admin.detail(first.id).reviewVersion,
+        reviewVersion: (await admin.detail(first.id)).reviewVersion,
       });
-    reject();
+    await reject();
     const original = (await get(`${URL}/${first.id}`).expect(200))
       .body as MileageDetailDto;
     await resubmit(original, randomUUID(), receipt)
@@ -676,8 +681,8 @@ describe('Mileage applications (e2e)', () => {
         .expect(200)
     ).body as MileageDetailDto;
     expect(separate.photoMode).toBe('separate');
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(2);
-    reject();
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(2);
+    await reject();
     const combinedKey = randomUUID();
     const combined = (
       await resubmit(separate, combinedKey, receipt)
@@ -685,7 +690,7 @@ describe('Mileage applications (e2e)', () => {
         .expect(200)
     ).body as MileageDetailDto;
     expect(combined.photoMode).toBe('single');
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(1);
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(1);
     const writes = storage.writes;
     await resubmit(original, separateKey, receipt, meter)
       .field('photoMode', 'separate')
@@ -696,21 +701,20 @@ describe('Mileage applications (e2e)', () => {
       ((await get(`${URL}/${first.id}`).expect(200)).body as MileageDetailDto)
         .photoMode,
     ).toBe('single');
-    admin.approve(first.id, {
-      reviewVersion: admin.detail(first.id).reviewVersion,
+    await admin.approve(first.id, {
+      reviewVersion: (await admin.detail(first.id)).reviewVersion,
       finalAmount: 13000,
       liters: '10',
     });
-    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toMatchObject({
       approvalStatus: 'approved',
       mileageAmount: 200,
     });
-    expect(() =>
-      database.db
-        .update(mileageApplications)
-        .set({ photoMode: 'separate' })
-        .run(),
-    ).toThrow();
+    await expect(
+      database.db.update(mileageApplications).set({ photoMode: 'separate' }),
+    ).rejects.toThrow();
   });
 
   it('rejects invalid photo mode/file combinations without storage writes', async () => {
@@ -731,7 +735,7 @@ describe('Mileage applications (e2e)', () => {
     [false, 'single'],
     [true, 'single'],
   ] as const)(
-    'runs saved photos through OCR with automatic approval enabled=%s, mode=%s',
+    'runs readable totals through OCR despite unknown reprint metadata, enabled=%s, mode=%s',
     async (enabled, photoMode) => {
       const previousAutoApprove = process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
       process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = String(enabled);
@@ -743,12 +747,13 @@ describe('Mileage applications (e2e)', () => {
           receipt: {
             amountText: '11700',
             transactionDateText: '2026-09-23',
-            transactionTimeText: '12:34:56+09:00',
+            transactionTimeText: '12:34:56',
             quantityText: '11.000',
             quantityUnit: 'L',
             unitPriceText: null,
-            documentKind: 'sale',
-            issues: [],
+            documentKind: 'unknown',
+            reprinted: null,
+            issues: ['REPRINT_UNCLEAR'],
           },
           meter: {
             amountText: '11,700원',
@@ -776,18 +781,21 @@ describe('Mileage applications (e2e)', () => {
                   .expect(201)
               ).body as MileageDetailDto);
         expect(accepted.status).toBe('pending');
-        expect(database.db.select().from(mileageOcrJobs).get()?.status).toBe(
-          'queued',
-        );
+        expect(
+          (await database.db.select().from(mileageOcrJobs).limit(1))[0]?.status,
+        ).toBe('queued');
         expect(await app.get(MileageOcrWorkerService).processOne()).toBe(true);
         expect(read).toHaveBeenCalledTimes(1);
         expect(read.mock.calls[0][0]).toHaveLength(
           photoMode === 'single' ? 1 : 2,
         );
-        expect(app.get(AdminMileageService).detail(accepted.id)).toMatchObject({
+        expect(
+          await app.get(AdminMileageService).detail(accepted.id),
+        ).toMatchObject({
           receiptAmount: 11700,
           meterAmount: 11700,
           matchStatus: 'matched',
+          receiptAt: '2026-09-23T03:34:56.000Z',
           status: enabled ? 'approved' : 'pending',
         });
         const userDetail = await get(URL + '/' + accepted.id).expect(200);
@@ -919,7 +927,9 @@ describe('Mileage applications (e2e)', () => {
   });
   it('rejects an absent session and an administrator session', async () => {
     await get(URL, 'Bearer invalid').expect(401);
-    await submit(receipt, meter, key, seedAdminSession(database)).expect(401);
+    await submit(receipt, meter, key, await seedAdminSession(database)).expect(
+      401,
+    );
   });
   it('enforces Origin for cookie writes and accepts the existing web session', async () => {
     const cookie = `${WEB_SESSION_COOKIE}=${authorization.slice(7)}`;
@@ -947,13 +957,13 @@ describe('Mileage applications (e2e)', () => {
     );
     expect(storage.writes).toBe(count);
     await submit(meter, meter).expect(409);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
   });
   it('isolates the same key by owner and hides other users applications and photos', async () => {
     const first = await saved();
-    const other = driver(randomUUID(), 'second');
+    const other = await driver(randomUUID(), 'second');
     await get(`${URL}/${first.id}`, other).expect(404);
     await get(first.photos.receipt!, other).expect(404);
     await get(URL, other).expect(200).expect({ items: [], nextCursor: null });
@@ -967,23 +977,23 @@ describe('Mileage applications (e2e)', () => {
       .delete('/api/v1/users/me')
       .set('Authorization', authorization)
       .expect(204);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
     await get(first.photos.receipt!).expect(401);
-    const newAuth = driver(randomUUID(), 'rejoined');
+    const newAuth = await driver(randomUUID(), 'rejoined');
     await get(URL, newAuth).expect(200).expect({ items: [], nextCursor: null });
   });
   it('rolls back a failed storage write and keeps its attempt for reconciliation', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     storage.failAt = 2;
     await submit().expect(503);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       0,
     );
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(0);
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(0);
     expect(storage.objects.size).toBe(0);
-    expect(database.db.select().from(mileageUploadAttempts).all()).toHaveLength(
+    expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       1,
     );
     storage.failAt = 0;
@@ -994,38 +1004,50 @@ describe('Mileage applications (e2e)', () => {
     storage.failAt = 2;
     storage.failCleanup = true;
     await submit().expect(503);
-    const attempt = database.db.select().from(mileageUploadAttempts).get()!;
+    const attempt = (
+      await database.db.select().from(mileageUploadAttempts).limit(1)
+    )[0];
     expect(attempt.storageKeys).toHaveLength(4);
     expect(storage.objects.size).toBe(1);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       0,
     );
   });
   it('rolls back both metadata rows if the second photo insert fails', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      "CREATE TRIGGER reject_meter BEFORE INSERT ON mileage_application_photos WHEN NEW.kind='meter' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+    await database.connection.unsafe(
+      `CREATE FUNCTION app.reject_meter() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.kind = 'meter' THEN RAISE EXCEPTION 'test failure'; END IF;
+           RETURN NEW;
+         END;
+       $$`,
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER reject_meter BEFORE INSERT ON app.mileage_application_photos FOR EACH ROW EXECUTE FUNCTION app.reject_meter()',
     );
     try {
       await submit().expect(500);
     } finally {
-      database.connection.exec('DROP TRIGGER reject_meter');
+      await database.connection.unsafe(
+        'DROP TRIGGER reject_meter ON app.mileage_application_photos',
+      );
+      await database.connection.unsafe('DROP FUNCTION app.reject_meter()');
     }
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       0,
     );
-    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(0);
+    expect(await database.db.select().from(mileagePhotos)).toHaveLength(0);
     expect(storage.objects.size).toBe(0);
   });
   it('rejects a session revoked during upload and cleans only uncommitted files', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    storage.beforePut = () => {
-      database.db.delete(authSessions).run();
-      return Promise.resolve();
+    storage.beforePut = async () => {
+      await database.db.delete(authSessions);
     };
     await submit().expect(401);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       0,
     );
     expect(storage.objects.size).toBe(0);
@@ -1042,7 +1064,7 @@ describe('Mileage applications (e2e)', () => {
       .mockImplementation(original);
     await submit().expect(500);
     expect(storage.objects.size).toBe(4);
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
     await submit().expect(201);
@@ -1074,11 +1096,11 @@ describe('Mileage applications (e2e)', () => {
     expect((firstResult.body as MileageDetailDto).id).toBe(
       (second.body as MileageDetailDto).id,
     );
-    expect(database.db.select().from(mileageApplications).all()).toHaveLength(
+    expect(await database.db.select().from(mileageApplications)).toHaveLength(
       1,
     );
     expect(storage.objects.size).toBe(4);
-    expect(database.db.select().from(mileageUploadAttempts).all()).toHaveLength(
+    expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       0,
     );
   });
@@ -1086,16 +1108,14 @@ describe('Mileage applications (e2e)', () => {
     const one = await saved();
     key = randomUUID();
     const two = await saved();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({ submittedAt: '2026-09-01T00:00:00.000Z' })
-      .where(eq(mileageApplications.id, one.id))
-      .run();
-    database.db
+      .where(eq(mileageApplications.id, one.id));
+    await database.db
       .update(mileageApplications)
       .set({ submittedAt: '2026-09-02T00:00:00.000Z' })
-      .where(eq(mileageApplications.id, two.id))
-      .run();
+      .where(eq(mileageApplications.id, two.id));
     const page = (await get().query({ limit: 1 }).expect(200))
       .body as MileageListDto;
     expect(page.items[0].id).toBe(two.id);
@@ -1123,8 +1143,8 @@ describe('Mileage applications (e2e)', () => {
   });
   it('rechecks a revoked session after reading storage', async () => {
     const application = await saved();
-    storage.beforeGet = () => {
-      database.db.delete(authSessions).run();
+    storage.beforeGet = async () => {
+      await database.db.delete(authSessions);
     };
     await get(application.photos.receipt!).expect(401);
   });
@@ -1218,16 +1238,13 @@ describe('Mileage applications (e2e)', () => {
   it('retains transfer-pending approvals and hides completed settlements in list/detail/photo', async () => {
     const application = await saved();
     const settlementId = randomUUID();
-    database.db
-      .insert(settlements)
-      .values({
-        id: settlementId,
-        logisticsCompanyId: companyId,
-        settlementMonth: '2026-09',
-        transferStatus: 'pending',
-      })
-      .run();
-    database.db
+    await database.db.insert(settlements).values({
+      id: settlementId,
+      logisticsCompanyId: companyId,
+      settlementMonth: '2026-09',
+      transferStatus: 'pending',
+    });
+    await database.db
       .update(mileageApplications)
       .set({
         approvalStatus: 'approved',
@@ -1236,8 +1253,7 @@ describe('Mileage applications (e2e)', () => {
         decidedAt: new Date().toISOString(),
         settlementId,
       })
-      .where(eq(mileageApplications.id, application.id))
-      .run();
+      .where(eq(mileageApplications.id, application.id));
     await resubmit(application, randomUUID(), receipt).expect(409);
     await get()
       .expect(200)
@@ -1247,14 +1263,13 @@ describe('Mileage applications (e2e)', () => {
           mileageAmount: 200,
         }),
       );
-    database.db
+    await database.db
       .update(settlements)
       .set({
         transferStatus: 'completed',
         transferredAt: new Date().toISOString(),
       })
-      .where(eq(settlements.id, settlementId))
-      .run();
+      .where(eq(settlements.id, settlementId));
     await get().expect(200).expect({ items: [], nextCursor: null });
     await get(`${URL}/${application.id}`).expect(404);
     await get(application.photos.receipt!).expect(404);

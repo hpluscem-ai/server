@@ -38,58 +38,49 @@ describe('Stations (e2e)', () => {
     app = await createTestApp();
     database = app.get(DatabaseService);
   });
-  beforeEach(() => {
-    database.db.delete(installationSites).run();
-    database.db.delete(users).run();
-    database.db.delete(logisticsCompanies).run();
-    authorization = seedAdminSession(database);
+  beforeEach(async () => {
+    await database.db.delete(installationSites);
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
+    authorization = await seedAdminSession(database);
     companyId = randomUUID();
     const userId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '테스트 물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1234-5678',
-        bankCode: '19',
-        accountNumber: '12345',
-        accountHolder: '물류사',
-      })
-      .run();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: 'driver@example.com',
-        name: '기사',
-        passwordHash: 'test-only-unused-hash',
-        phone: '010-2222-3333',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '테스트 물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '12345',
+      accountHolder: '물류사',
+    });
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: 'driver@example.com',
+      name: '기사',
+      passwordHash: 'test-only-unused-hash',
+      phone: '010-2222-3333',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      userId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 600000),
+    });
     driverAuthorization = `Bearer ${token}`;
   });
   afterEach(() => jest.restoreAllMocks());
-  afterAll(async () => app.close());
+  afterAll(async () => app?.close());
 
   function create(body: object = input, auth = authorization) {
     return request(app.getHttpServer())
@@ -128,14 +119,16 @@ describe('Stations (e2e)', () => {
       .set('Authorization', auth)
       .query(query);
   }
-  function snapshot() {
+  async function snapshot() {
     return {
-      stations: database.connection
-        .prepare('SELECT * FROM installation_sites ORDER BY id')
-        .all(),
-      devices: database.connection
-        .prepare('SELECT * FROM installation_site_devices ORDER BY id')
-        .all(),
+      stations: await database.db
+        .select()
+        .from(installationSites)
+        .orderBy(installationSites.id),
+      devices: await database.db
+        .select()
+        .from(installationSiteDevices)
+        .orderBy(installationSiteDevices.id),
     };
   }
   function editBody(station: StationResponseDto) {
@@ -148,16 +141,36 @@ describe('Stations (e2e)', () => {
       })),
     };
   }
-  function verifyCoordinates(id: string) {
+  async function verifyCoordinates(id: string) {
     // 실제 검수 워크플로를 흉내내는 런타임 API가 아니라, 격리 테스트의 기존 검증 데이터다.
-    database.db
+    await database.db
       .update(installationSites)
       .set({
         coordinateSource: 'isolated-test-survey',
         coordinateVerifiedAt: '2026-09-01 01:00:00',
       })
-      .where(eq(installationSites.id, id))
-      .run();
+      .where(eq(installationSites.id, id));
+  }
+
+  async function createFailureTrigger(
+    name: string,
+    timing: string,
+    table: string,
+    condition = '',
+  ) {
+    await database.connection.unsafe(`
+      CREATE FUNCTION app.${name}_function() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'test-only failure'; END;
+      $$;
+      CREATE TRIGGER ${name} ${timing} ON app.${table}
+      FOR EACH ROW ${condition} EXECUTE FUNCTION app.${name}_function();
+    `);
+  }
+
+  async function dropFailureTrigger(name: string, table: string) {
+    await database.connection.unsafe(
+      `DROP TRIGGER IF EXISTS ${name} ON app.${table}; DROP FUNCTION IF EXISTS app.${name}_function();`,
+    );
   }
 
   it('saves a station and its devices together without fabricating coordinate verification', async () => {
@@ -175,11 +188,11 @@ describe('Stations (e2e)', () => {
         expect(body.coordinateVerifiedAt).toBeNull();
         expect(body.devices).toHaveLength(1);
       });
-    const state = snapshot();
+    const state = await snapshot();
     expect(state.stations).toHaveLength(1);
     expect(state.devices).toHaveLength(1);
-    expect(state.devices[0].installation_site_id).toBe(state.stations[0].id);
-    expect(state.devices[0].capacity_liters).toBe(2000);
+    expect(state.devices[0].installationSiteId).toBe(state.stations[0].id);
+    expect(state.devices[0].capacityLiters).toBe(2000);
   });
 
   it('updates stable station and device ids, adds a device, and returns only public device fields', async () => {
@@ -226,8 +239,8 @@ describe('Stations (e2e)', () => {
         .sort(),
     ).toEqual(updated.devices.map((device) => device.id).sort());
     expect(
-      snapshot().devices.every(
-        (device) => device.installation_site_id === station.id,
+      (await snapshot()).devices.every(
+        (device) => device.installationSiteId === station.id,
       ),
     ).toBe(true);
   });
@@ -264,7 +277,7 @@ describe('Stations (e2e)', () => {
     'rejects missing, invalid, or protected registration fields: %j',
     async (fields) => {
       await create({ ...input, ...fields }).expect(400);
-      expect(snapshot()).toEqual({ stations: [], devices: [] });
+      expect(await snapshot()).toEqual({ stations: [], devices: [] });
     },
   );
 
@@ -272,7 +285,7 @@ describe('Stations (e2e)', () => {
     'rejects nested device arrays before persistence: %j',
     async ({ devices }) => {
       const station = await saved();
-      const before = snapshot();
+      const before = await snapshot();
       await create({ ...input, devices })
         .expect(400)
         .expect(({ body }: { body: { code: string } }) =>
@@ -286,14 +299,14 @@ describe('Stations (e2e)', () => {
         .expect(({ body }: { body: { code: string } }) =>
           expect(body.code).toBe('VALIDATION_ERROR'),
         );
-      expect(snapshot()).toEqual(before);
+      expect(await snapshot()).toEqual(before);
     },
   );
 
   it('rejects foreign and duplicate existing device ids without any mutation', async () => {
     const station = await saved();
     const other = await saved({ ...input, businessName: '다른 주유소' });
-    const before = snapshot();
+    const before = await snapshot();
     for (const [devices, code] of [
       [[{ ...input.devices[0], id: other.devices[0].id }], 'UNKNOWN_DEVICE'],
       [[{ ...input.devices[0], id: randomUUID() }], 'UNKNOWN_DEVICE'],
@@ -311,7 +324,7 @@ describe('Stations (e2e)', () => {
         .expect(({ body }: { body: { code: string } }) =>
           expect(body.code).toBe(code),
         );
-      expect(snapshot()).toEqual(before);
+      expect(await snapshot()).toEqual(before);
     }
     await update(station.id, {
       ...editBody(station),
@@ -330,22 +343,25 @@ describe('Stations (e2e)', () => {
         },
       ],
     }).expect(400);
-    expect(snapshot()).toEqual(before);
+    expect(await snapshot()).toEqual(before);
   });
 
   it('rolls back the new parent and every device when a later insert fails', async () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      "CREATE TRIGGER fail_device BEFORE INSERT ON installation_site_devices WHEN NEW.model = 'fail' BEGIN SELECT RAISE(ABORT, 'test-only failure'); END",
+    await createFailureTrigger(
+      'fail_device',
+      'BEFORE INSERT',
+      'installation_site_devices',
+      "WHEN (NEW.model = 'fail')",
     );
     try {
       await create({
         ...input,
         devices: [input.devices[0], { model: 'fail', capacityLiters: 1 }],
       }).expect(500);
-      expect(snapshot()).toEqual({ stations: [], devices: [] });
+      expect(await snapshot()).toEqual({ stations: [], devices: [] });
     } finally {
-      database.connection.exec('DROP TRIGGER fail_device');
+      await dropFailureTrigger('fail_device', 'installation_site_devices');
     }
   });
 
@@ -353,16 +369,20 @@ describe('Stations (e2e)', () => {
     'rolls back a %s failure including coordinate verification and sibling devices',
     async (failure) => {
       const station = await saved();
-      verifyCoordinates(station.id);
-      const before = snapshot();
+      await verifyCoordinates(station.id);
+      const before = await snapshot();
       const trigger =
         failure === 'parent'
           ? 'BEFORE UPDATE ON installation_sites'
           : failure === 'device_update'
             ? 'BEFORE UPDATE ON installation_site_devices'
             : 'BEFORE INSERT ON installation_site_devices';
-      database.connection.exec(
-        `CREATE TRIGGER fail_write ${trigger} BEGIN SELECT RAISE(ABORT, 'test-only failure'); END`,
+      await createFailureTrigger(
+        'fail_write',
+        trigger.replace(/ ON installation_(sites|site_devices)$/, ''),
+        trigger.endsWith('installation_sites')
+          ? 'installation_sites'
+          : 'installation_site_devices',
       );
       const logs = jest
         .spyOn(Logger.prototype, 'error')
@@ -376,12 +396,17 @@ describe('Stations (e2e)', () => {
             { model: '추가 모델', capacityLiters: 500 },
           ],
         }).expect(500);
-        expect(snapshot()).toEqual(before);
+        expect(await snapshot()).toEqual(before);
         expect(JSON.stringify(logs.mock.calls)).not.toContain(
           input.roadAddress,
         );
       } finally {
-        database.connection.exec('DROP TRIGGER fail_write');
+        await dropFailureTrigger(
+          'fail_write',
+          trigger.endsWith('installation_sites')
+            ? 'installation_sites'
+            : 'installation_site_devices',
+        );
       }
     },
   );
@@ -398,8 +423,8 @@ describe('Stations (e2e)', () => {
       ),
     );
     expect(responses.map((response) => response.status)).toEqual([200, 200]);
-    const state = snapshot();
-    expect(state.stations[0].business_name).toBe(state.devices[0].model);
+    const state = await snapshot();
+    expect(state.stations[0].businessName).toBe(state.devices[0].model);
     const additions = await Promise.all(
       ['C', 'D'].map((label) =>
         update(station.id, {
@@ -415,19 +440,19 @@ describe('Stations (e2e)', () => {
     expect(additions.map((response) => response.status).sort()).toEqual([
       200, 200,
     ]);
-    expect(snapshot().devices).toHaveLength(2);
-    const final = snapshot();
+    expect((await snapshot()).devices).toHaveLength(2);
+    const final = await snapshot();
     const addition = final.devices.find(
       (device) => device.id !== station.devices[0].id,
     )!;
-    expect(final.stations[0].business_name).toBe(addition.model);
+    expect(final.stations[0].businessName).toBe(addition.model);
   });
 
   it.each(['roadAddress', 'latitude', 'longitude'])(
     'clears coordinate verification on %s changes',
     async (field) => {
       const station = await saved();
-      verifyCoordinates(station.id);
+      await verifyCoordinates(station.id);
       const changes = {
         roadAddress: '서울시 강남구 새주소 2',
         latitude: 38,
@@ -440,8 +465,8 @@ describe('Stations (e2e)', () => {
       expect((response.body as StationResponseDto).coordinateVerified).toBe(
         false,
       );
-      expect(snapshot().stations[0].coordinate_source).toBeNull();
-      expect(snapshot().stations[0].coordinate_verified_at).toBeNull();
+      expect((await snapshot()).stations[0].coordinateSource).toBeNull();
+      expect((await snapshot()).stations[0].coordinateVerifiedAt).toBeNull();
       await appGet(`${APP_PATH}/map`, bounds)
         .expect(200)
         .expect(({ body }: { body: StationResponseDto[] }) => {
@@ -456,17 +481,15 @@ describe('Stations (e2e)', () => {
 
   it('preserves trusted location metadata and operating states for non-location edits', async () => {
     const station = await saved();
-    verifyCoordinates(station.id);
-    database.db
+    await verifyCoordinates(station.id);
+    await database.db
       .update(installationSites)
       .set({ active: false })
-      .where(eq(installationSites.id, station.id))
-      .run();
-    database.db
+      .where(eq(installationSites.id, station.id));
+    await database.db
       .update(installationSiteDevices)
       .set({ active: false })
-      .where(eq(installationSiteDevices.id, station.devices[0].id))
-      .run();
+      .where(eq(installationSiteDevices.id, station.devices[0].id));
     const result = await update(station.id, {
       ...editBody(station),
       businessName: '변경',
@@ -483,11 +506,10 @@ describe('Stations (e2e)', () => {
 
   it('searches literal Unicode names and applies normalized half-open registration periods', async () => {
     const station = await saved({ ...input, businessName: 'ÉLODIE 주유소' });
-    database.db
+    await database.db
       .update(installationSites)
       .set({ createdAt: '2026-09-07 15:00:00' })
-      .where(eq(installationSites.id, station.id))
-      .run();
+      .where(eq(installationSites.id, station.id));
     await list({
       stationQuery: ' élodie ',
       createdFrom: '2026-09-08T00:00:00+09:00',
@@ -550,11 +572,10 @@ describe('Stations (e2e)', () => {
         expect(body[0].coordinateSource).toBeNull();
         expect(body[0].coordinateVerifiedAt).toBeNull();
       });
-    database.db
+    await database.db
       .update(installationSites)
       .set({ latitude: null, longitude: null })
-      .where(eq(installationSites.id, station.id))
-      .run();
+      .where(eq(installationSites.id, station.id));
     await appGet(`${APP_PATH}/${station.id}`)
       .expect(200)
       .expect(({ body }: { body: StationResponseDto }) =>
@@ -565,7 +586,7 @@ describe('Stations (e2e)', () => {
 
   it('maps only active stations with trusted coordinates inside inclusive bounds', async () => {
     const station = await saved();
-    verifyCoordinates(station.id);
+    await verifyCoordinates(station.id);
     const atEdge = {
       south: input.latitude,
       north: input.latitude,
@@ -583,11 +604,10 @@ describe('Stations (e2e)', () => {
     await appGet(`${APP_PATH}/map`, { ...bounds, west: 127.2 })
       .expect(200)
       .expect([]);
-    database.db
+    await database.db
       .update(installationSites)
       .set({ active: false })
-      .where(eq(installationSites.id, station.id))
-      .run();
+      .where(eq(installationSites.id, station.id));
     await appGet(`${APP_PATH}/map`, bounds).expect(200).expect([]);
     await list()
       .expect(200)
@@ -604,12 +624,11 @@ describe('Stations (e2e)', () => {
     'does not treat incomplete or invalid provenance as verified: %j',
     async (changes) => {
       const station = await saved();
-      verifyCoordinates(station.id);
-      database.db
+      await verifyCoordinates(station.id);
+      await database.db
         .update(installationSites)
         .set(changes)
-        .where(eq(installationSites.id, station.id))
-        .run();
+        .where(eq(installationSites.id, station.id));
       await appGet(`${APP_PATH}/map`, bounds)
         .expect(200)
         .expect(({ body }: { body: StationResponseDto[] }) => {
@@ -628,8 +647,8 @@ describe('Stations (e2e)', () => {
   it('supports zero, negative coordinates and bounds crossing the antimeridian', async () => {
     const a = await saved({ ...input, latitude: 0, longitude: 179 });
     const b = await saved({ ...input, latitude: -1, longitude: -179 });
-    verifyCoordinates(a.id);
-    verifyCoordinates(b.id);
+    await verifyCoordinates(a.id);
+    await verifyCoordinates(b.id);
     await appGet(`${APP_PATH}/map`, {
       south: -2,
       north: 0,
@@ -679,11 +698,10 @@ describe('Stations (e2e)', () => {
         await appGet(path, path.endsWith('/map') ? bounds : {}, auth).expect(
           401,
         );
-    database.db
+    await database.db
       .update(logisticsCompanies)
       .set({ active: false })
-      .where(eq(logisticsCompanies.id, companyId))
-      .run();
+      .where(eq(logisticsCompanies.id, companyId));
     await appGet().expect(401);
   });
 
@@ -709,7 +727,7 @@ describe('Stations (e2e)', () => {
         expect(body.code).toBe('BAD_REQUEST'),
       );
     const station = await saved();
-    const before = snapshot();
+    const before = await snapshot();
     for (const path of [
       `${ADMIN_PATH}/${station.id}/devices/${station.devices[0].id}`,
     ])
@@ -717,15 +735,15 @@ describe('Stations (e2e)', () => {
         .delete(path)
         .set('Authorization', authorization)
         .expect(404);
-    expect(snapshot()).toEqual(before);
+    expect(await snapshot()).toEqual(before);
   });
 
   it('propagates read failures instead of returning an empty admin or app result', async () => {
     const station = await saved();
-    verifyCoordinates(station.id);
+    await verifyCoordinates(station.id);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      'ALTER TABLE installation_site_devices RENAME TO unavailable_devices',
+    await database.connection.unsafe(
+      'ALTER TABLE app.installation_site_devices RENAME TO unavailable_devices',
     );
     try {
       await list().expect(500);
@@ -740,8 +758,8 @@ describe('Stations (e2e)', () => {
       ])
         await appGet(path, path.endsWith('/map') ? bounds : {}).expect(500);
     } finally {
-      database.connection.exec(
-        'ALTER TABLE unavailable_devices RENAME TO installation_site_devices',
+      await database.connection.unsafe(
+        'ALTER TABLE app.unavailable_devices RENAME TO installation_site_devices',
       );
     }
   });
@@ -819,13 +837,15 @@ describe('Stations (e2e)', () => {
       devices: [input.devices[0], { model: 'extra', capacityLiters: 100 }],
     });
     const other = await saved();
-    const originalUsers = database.db.select().from(users).all();
+    const originalUsers = await database.db.select().from(users);
     await remove(station.id).expect(204).expect('Cache-Control', 'no-store');
-    expect(snapshot().stations.map((row) => row.id)).toEqual([other.id]);
-    expect(snapshot().devices.map((row) => row.id)).toEqual(
+    expect((await snapshot()).stations.map((row) => row.id)).toEqual([
+      other.id,
+    ]);
+    expect((await snapshot()).devices.map((row) => row.id)).toEqual(
       other.devices.map((device) => device.id),
     );
-    expect(database.db.select().from(users).all()).toEqual(originalUsers);
+    expect(await database.db.select().from(users)).toEqual(originalUsers);
     await remove(station.id).expect(404);
     await request(app.getHttpServer())
       .get(`${ADMIN_PATH}/${station.id}`)
@@ -837,19 +857,16 @@ describe('Stations (e2e)', () => {
       .expect(({ body }: { body: StationResponseDto[] }) =>
         expect(body.map((row) => row.id)).toEqual([other.id]),
       );
-    expect(
-      database.connection.prepare('PRAGMA foreign_key_check').all(),
-    ).toEqual([]);
   });
 
   it('only permits admin deletion and validates IDs without modifying data', async () => {
     const station = await saved();
-    const before = snapshot();
+    const before = await snapshot();
     for (const auth of ['', driverAuthorization, 'Bearer expired'])
       await remove(station.id, auth).expect(401);
     await remove('invalid').expect(400);
     await remove(randomUUID()).expect(404);
-    expect(snapshot()).toEqual(before);
+    expect(await snapshot()).toEqual(before);
   });
 
   it.each(['installation_sites', 'installation_site_devices'])(
@@ -859,16 +876,14 @@ describe('Stations (e2e)', () => {
         ...input,
         devices: [input.devices[0], { model: 'extra', capacityLiters: 100 }],
       });
-      const before = snapshot();
+      const before = await snapshot();
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-      database.connection.exec(
-        `CREATE TRIGGER fail_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, 'test-only failure'); END;`,
-      );
+      await createFailureTrigger('fail_delete', 'BEFORE DELETE', table);
       try {
         await remove(station.id).expect(500);
-        expect(snapshot()).toEqual(before);
+        expect(await snapshot()).toEqual(before);
       } finally {
-        database.connection.exec('DROP TRIGGER fail_delete');
+        await dropFailureTrigger('fail_delete', table);
       }
     },
   );
@@ -878,7 +893,7 @@ describe('Stations (e2e)', () => {
     const results = await Promise.all([remove(station.id), remove(station.id)]);
     expect(results.map((result) => result.status).sort()).toEqual([204, 404]);
     await update(station.id, editBody(station)).expect(404);
-    expect(snapshot()).toEqual({ stations: [], devices: [] });
+    expect(await snapshot()).toEqual({ stations: [], devices: [] });
   });
 
   it('removes omitted devices within the full station update, preserving retained IDs and unrelated stations', async () => {
@@ -900,24 +915,28 @@ describe('Stations (e2e)', () => {
     expect(result.devices).toHaveLength(2);
     expect(result.devices[0].id).toBe(retained.id);
     expect(
-      snapshot().devices.some((row) => row.id === station.devices[1].id),
+      (await snapshot()).devices.some(
+        (row) => row.id === station.devices[1].id,
+      ),
     ).toBe(false);
     expect(
-      snapshot().devices.some((row) => row.id === other.devices[0].id),
+      (await snapshot()).devices.some((row) => row.id === other.devices[0].id),
     ).toBe(true);
-    const before = snapshot();
+    const before = await snapshot();
     await update(station.id, { ...editBody(result), devices: [] }).expect(400);
-    expect(snapshot()).toEqual(before);
+    expect(await snapshot()).toEqual(before);
   });
 
   it.each(['delete', 'insert'])(
     'rolls back removed devices and parent changes when device %s fails',
     async (operation) => {
       const station = await saved();
-      const before = snapshot();
+      const before = await snapshot();
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-      database.connection.exec(
-        `CREATE TRIGGER fail_replace BEFORE ${operation.toUpperCase()} ON installation_site_devices BEGIN SELECT RAISE(ABORT, 'test-only failure'); END;`,
+      await createFailureTrigger(
+        'fail_replace',
+        `BEFORE ${operation.toUpperCase()}`,
+        'installation_site_devices',
       );
       try {
         await update(station.id, {
@@ -925,9 +944,9 @@ describe('Stations (e2e)', () => {
           businessName: '실패',
           devices: [{ model: 'replacement', capacityLiters: 100 }],
         }).expect(500);
-        expect(snapshot()).toEqual(before);
+        expect(await snapshot()).toEqual(before);
       } finally {
-        database.connection.exec('DROP TRIGGER fail_replace');
+        await dropFailureTrigger('fail_replace', 'installation_site_devices');
       }
     },
   );

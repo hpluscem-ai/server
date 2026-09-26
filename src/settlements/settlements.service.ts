@@ -20,7 +20,7 @@ import {
 type Snapshot = ExportRow & {
   settlement_id: string;
   settlement_month: string;
-  transfer_status: string;
+  transfer_status: 'pending' | 'completed';
 };
 type Company = {
   id: string;
@@ -33,15 +33,24 @@ type Company = {
   bankCode: string;
   accountNumber: string;
   accountHolder: string;
-  active: number;
+  active: boolean;
 };
-const companiesSql = `SELECT id, business_name AS businessName, business_number AS businessNumber,
- corporate_registration_number AS corporateRegistrationNumber, business_address AS businessAddress,
- manager_name AS managerName, manager_phone AS managerPhone, bank_code AS bankCode,
- account_number AS accountNumber, account_holder AS accountHolder, active FROM logistics_companies`;
-const eligible = `approval_status = 'approved' AND settlement_id IS NULL AND julianday(decided_at) < julianday(?)`;
-const unpaid = `(s.id IS NULL OR s.transfer_status = 'pending')`;
-const snapshotSql = `SELECT p.*, s.settlement_month, s.transfer_status FROM settlement_snapshots p JOIN settlements s ON s.id = p.settlement_id`;
+type Amount = { amount: string | number };
+type Settlement = {
+  id: string;
+  status: 'pending' | 'completed';
+  bank_code: string | null;
+  account_number: string | null;
+  account_holder: string | null;
+  amount: string | number;
+};
+
+const companiesSql = `SELECT id, business_name AS "businessName", business_number AS "businessNumber",
+ corporate_registration_number AS "corporateRegistrationNumber", business_address AS "businessAddress",
+ manager_name AS "managerName", manager_phone AS "managerPhone", bank_code AS "bankCode",
+ account_number AS "accountNumber", account_holder AS "accountHolder", active FROM app.logistics_companies`;
+const snapshotSql = `SELECT p.*, s.settlement_month, s.transfer_status
+  FROM app.settlement_snapshots p JOIN app.settlements s ON s.id = p.settlement_id`;
 
 @Injectable()
 export class SettlementsService {
@@ -49,157 +58,163 @@ export class SettlementsService {
     private readonly database: DatabaseService,
     private readonly admins: AdminAuthRepository,
   ) {}
+
   private get db() {
     return this.database.connection;
   }
 
-  private transaction<T>(action: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = action();
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-
-  list(month: string) {
+  async list(month: string) {
     const before = monthEnd(month);
-    const candidates = new Map(
-      (
-        this.db
-          .prepare(
-            `SELECT logistics_company_id AS id, CAST(SUM(mileage_amount) AS TEXT) AS amount FROM mileage_applications WHERE ${eligible} GROUP BY logistics_company_id`,
-          )
-          .all(before) as { id: string; amount: string }[]
-      ).map((row) => [row.id, integer(row.amount)]),
+    const [candidates, existing, companies] = await Promise.all([
+      this.db<{ id: string; amount: string | number }[]>`
+        SELECT logistics_company_id AS id, SUM(mileage_amount)::text AS amount
+        FROM app.mileage_applications
+        WHERE approval_status = 'approved' AND settlement_id IS NULL
+          AND decided_at::timestamptz < ${before}::timestamptz
+        GROUP BY logistics_company_id`,
+      this.db<Settlement[]>`
+        SELECT s.logistics_company_id AS id, s.transfer_status AS status, p.bank_code, p.account_number, p.account_holder,
+          COALESCE(p.mileage_amount, (
+            SELECT SUM(mileage_amount) FROM app.mileage_applications WHERE settlement_id = s.id
+          ), 0)::text AS amount
+        FROM app.settlements s
+        LEFT JOIN app.settlement_snapshots p ON p.settlement_id = s.id
+        WHERE s.settlement_month = ${month}`,
+      this.db<
+        Company[]
+      >`${this.db.unsafe(companiesSql)} ORDER BY business_name, id`,
+    ]);
+    const candidateAmounts = new Map(
+      candidates.map((row) => [row.id, integer(row.amount)]),
     );
-    const existing = new Map(
-      (
-        this.db
-          .prepare(
-            `SELECT s.logistics_company_id AS id, s.transfer_status AS status, p.bank_code, p.account_number, p.account_holder,
-      CAST(COALESCE(p.mileage_amount, (SELECT SUM(mileage_amount) FROM mileage_applications WHERE settlement_id = s.id), 0) AS TEXT) AS amount
-      FROM settlements s LEFT JOIN settlement_snapshots p ON p.settlement_id = s.id WHERE s.settlement_month = ?`,
-          )
-          .all(month) as {
-          id: string;
-          status: string;
-          bank_code: string | null;
-          account_number: string | null;
-          account_holder: string | null;
-          amount: string;
-        }[]
-      ).map((row) => [row.id, row]),
-    );
-    const companies = this.db
-      .prepare(`${companiesSql} ORDER BY business_name, id`)
-      .all() as Company[];
+    const savedSettlements = new Map(existing.map((row) => [row.id, row]));
     return companies
-      .filter((c) => c.active || candidates.has(c.id) || existing.has(c.id))
-      .map((c) => {
-        const saved = existing.get(c.id);
+      .filter(
+        (company) =>
+          company.active ||
+          candidateAmounts.has(company.id) ||
+          savedSettlements.has(company.id),
+      )
+      .map((company) => {
+        const saved = savedSettlements.get(company.id);
         return {
-          ...c,
-          active: Boolean(c.active),
+          ...company,
           bankCode:
             bankCodeOptions.find(
-              (b) => Number(b.code) === Number(saved?.bank_code ?? c.bankCode),
+              (bank) =>
+                Number(bank.code) ===
+                Number(saved?.bank_code ?? company.bankCode),
             )?.code ??
             saved?.bank_code ??
-            c.bankCode,
-          accountNumber: saved?.account_number ?? c.accountNumber,
-          accountHolder: saved?.account_holder ?? c.accountHolder,
-          mileage: saved ? integer(saved.amount) : (candidates.get(c.id) ?? 0),
+            company.bankCode,
+          accountNumber: saved?.account_number ?? company.accountNumber,
+          accountHolder: saved?.account_holder ?? company.accountHolder,
+          mileage: saved
+            ? integer(saved.amount)
+            : (candidateAmounts.get(company.id) ?? 0),
           transferStatus:
-            saved?.status ?? (candidates.has(c.id) ? 'pending' : null),
+            saved?.status ??
+            (candidateAmounts.has(company.id) ? 'pending' : null),
         };
       });
   }
 
-  export(month: string, adminId: string) {
+  async export(month: string, adminId: string) {
     const before = monthEnd(month);
     if (Date.parse(before) > Date.now()) invalid('SETTLEMENT_MONTH_NOT_CLOSED');
-    return this.transaction(() => {
-      const legacy = this.db
-        .prepare(
-          `SELECT s.id FROM settlements s LEFT JOIN settlement_snapshots p ON p.settlement_id=s.id WHERE s.settlement_month=? AND s.transfer_status='pending' AND p.settlement_id IS NULL LIMIT 1`,
-        )
-        .get(month);
-      if (legacy) invalid('SETTLEMENT_SNAPSHOT_MISSING');
-      const groups = this.db
-        .prepare(
-          `SELECT logistics_company_id AS id, CAST(SUM(mileage_amount) AS TEXT) AS amount FROM mileage_applications WHERE ${eligible} GROUP BY logistics_company_id`,
-        )
-        .all(before) as { id: string; amount: string }[];
+    return this.db.begin(async (tx) => {
+      // This makes repeated exports of the same month one atomic capture.
+      await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;
+      const legacy = await tx<{ id: string }[]>`
+        SELECT s.id
+        FROM app.settlements s
+        LEFT JOIN app.settlement_snapshots p ON p.settlement_id = s.id
+        WHERE s.settlement_month = ${month}
+          AND s.transfer_status = 'pending'
+          AND p.settlement_id IS NULL
+        LIMIT 1`;
+      if (legacy.length) invalid('SETTLEMENT_SNAPSHOT_MISSING');
+
+      const groups = await tx<{ id: string }[]>`
+        SELECT logistics_company_id AS id
+        FROM app.mileage_applications
+        WHERE approval_status = 'approved' AND settlement_id IS NULL
+          AND decided_at::timestamptz < ${before}::timestamptz
+        GROUP BY logistics_company_id`;
       for (const group of groups) {
-        if (
-          this.db
-            .prepare(
-              'SELECT id FROM settlements WHERE logistics_company_id=? AND settlement_month=?',
-            )
-            .get(group.id, month)
-        )
-          continue;
-        const company = this.db
-          .prepare(`${companiesSql} WHERE id=?`)
-          .get(group.id) as Company;
+        const existing = await tx<{ id: string }[]>`
+          SELECT id FROM app.settlements
+          WHERE logistics_company_id = ${group.id} AND settlement_month = ${month}
+          FOR UPDATE`;
+        if (existing.length) continue;
+
+        const companies = await tx<
+          Company[]
+        >`${tx.unsafe(companiesSql)} WHERE id = ${group.id}`;
+        const company = companies[0];
+        if (!company) continue;
         const bank = bankCodeOptions.find(
-          (b) => Number(b.code) === Number(company.bankCode),
+          (candidate) => Number(candidate.code) === Number(company.bankCode),
         );
         if (!bank || !company.accountHolder.trim())
           invalid('SETTLEMENT_ACCOUNT_INVALID');
-        const accountNumber = account(company.accountNumber);
-        const amount = integer(group.amount);
         const id = randomUUID();
-        let reference: string;
-        do {
-          reference = String(randomInt(1_000_000_000, 10_000_000_000));
-        } while (
-          this.db
-            .prepare('SELECT 1 FROM settlement_snapshots WHERE reference=?')
-            .get(reference)
-        );
         const now = new Date().toISOString();
-        this.db
-          .prepare(
-            'INSERT INTO settlements(id,logistics_company_id,settlement_month,created_at,updated_at) VALUES(?,?,?,?,?)',
-          )
-          .run(id, company.id, month, now, now);
-        this.db
-          .prepare(
-            `UPDATE mileage_applications SET settlement_id=? WHERE logistics_company_id=? AND ${eligible}`,
-          )
-          .run(id, company.id, before);
-        this.db
-          .prepare(
-            `INSERT INTO settlement_snapshots(settlement_id,reference,bank_code,account_number,account_holder,mileage_amount,captured_at,captured_by) VALUES(?,?,?,?,?,?,?,?)`,
-          )
-          .run(
-            id,
-            reference,
-            bank.code,
-            accountNumber,
-            company.accountHolder,
-            amount,
-            now,
-            adminId,
-          );
+        await tx`
+          INSERT INTO app.settlements(
+            id, logistics_company_id, settlement_month, transfer_status, created_at, updated_at
+          ) VALUES (${id}, ${company.id}, ${month}, 'pending', ${now}, ${now})`;
+        const captured = await tx<Amount[]>`
+          UPDATE app.mileage_applications
+          SET settlement_id = ${id}
+          WHERE logistics_company_id = ${company.id}
+            AND approval_status = 'approved'
+            AND settlement_id IS NULL
+            AND decided_at::timestamptz < ${before}::timestamptz
+          RETURNING mileage_amount::text AS amount`;
+        const amount = integer(
+          captured
+            .reduce((total, row) => total + BigInt(String(row.amount)), 0n)
+            .toString(),
+        );
+        if (!captured.length)
+          throw new Error('Settlement capture lost its eligible applications');
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const reference = String(randomInt(1_000_000_000, 10_000_000_000));
+          const inserted = await tx<{ reference: string }[]>`
+            INSERT INTO app.settlement_snapshots(
+              settlement_id, reference, bank_code, account_number, account_holder,
+              mileage_amount, captured_at, captured_by
+            ) VALUES (
+              ${id}, ${reference}, ${bank.code}, ${account(company.accountNumber)},
+              ${company.accountHolder}, ${amount}, ${now}, ${adminId}
+            )
+            ON CONFLICT (reference) DO NOTHING
+            RETURNING reference`;
+          if (inserted.length) break;
+          if (attempt === 9)
+            throw new Error('Unable to allocate settlement reference');
+        }
       }
-      const rows = this.db
-        .prepare(
-          `${snapshotSql} WHERE s.settlement_month=? AND s.transfer_status='pending' ORDER BY p.reference`,
-        )
-        .all(month) as Snapshot[];
-      return exportWorkbook(rows);
+      const rows = await tx<Snapshot[]>`
+        ${tx.unsafe(snapshotSql)}
+        WHERE s.settlement_month = ${month} AND s.transfer_status = 'pending'
+        ORDER BY p.reference`;
+      return exportWorkbook(
+        rows.map((row) => ({
+          ...row,
+          mileage_amount: integer(row.mileage_amount),
+        })),
+      );
     });
   }
 
   private bankMatches(bank: string, code: string) {
     if (/^\d{1,3}$/.test(bank)) return Number(bank) === Number(code);
-    const name = bankCodeOptions.find((b) => b.code === code)?.name;
+    const name = bankCodeOptions.find(
+      (candidate) => candidate.code === code,
+    )?.name;
     if (bank === name) return true;
     const aliases: Record<string, string[]> = {
       '81': ['하나', '하나은행'],
@@ -219,11 +234,11 @@ export class SettlementsService {
       ? `r:${row.reference}`
       : `d:${row.account}:${row.amount}`;
     const matches = (snapshots.get(key) ?? []).filter(
-      (s) =>
-        (!row.reference || s.reference === row.reference) &&
-        s.account_number === row.account &&
-        s.mileage_amount === row.amount &&
-        this.bankMatches(row.bank, s.bank_code),
+      (snapshot) =>
+        (!row.reference || snapshot.reference === row.reference) &&
+        snapshot.account_number === row.account &&
+        integer(snapshot.mileage_amount) === row.amount &&
+        this.bankMatches(row.bank, snapshot.bank_code),
     );
     // Without CMS, match across all months so an old file cannot pay the next month's identical amount.
     if (matches.length !== 1 || matches[0].settlement_month !== month)
@@ -234,14 +249,17 @@ export class SettlementsService {
   async import(month: string, bytes: Buffer, tokenHash: string) {
     monthEnd(month);
     const rows = await importWorkbook(bytes);
-    const admin = this.admins.findSession(tokenHash);
+    const admin = await this.admins.findSession(tokenHash);
     if (!admin)
       throw new UnauthorizedException({
         code: 'INVALID_ADMIN_SESSION',
         message: '관리자 로그인이 필요합니다.',
       });
-    return this.transaction(() => {
-      const snapshots = this.db.prepare(snapshotSql).all() as Snapshot[];
+    return this.db.begin(async (tx) => {
+      // Lock the settlement rows before interpreting their completion state.
+      const snapshots = await tx<Snapshot[]>`
+        ${tx.unsafe(snapshotSql)}
+        FOR UPDATE OF s`;
       const index = new Map<string, Snapshot[]>();
       for (const snapshot of snapshots) {
         for (const key of [
@@ -254,24 +272,26 @@ export class SettlementsService {
         }
       }
       const targets = rows.map((row) => this.resolveRow(row, index, month));
-      if (new Set(targets.map((s) => s.settlement_id)).size !== targets.length)
+      if (
+        new Set(targets.map((target) => target.settlement_id)).size !==
+        targets.length
+      )
         invalid('SETTLEMENT_DUPLICATE_ROW');
+
       const now = new Date().toISOString();
       const fileHash = createHash('sha256').update(bytes).digest('hex');
       let completed = 0;
       for (const target of targets) {
         if (target.transfer_status === 'completed') continue;
-        this.db
-          .prepare(
-            'INSERT INTO settlement_completions(settlement_id,file_hash,completed_by,completed_at) VALUES(?,?,?,?)',
-          )
-          .run(target.settlement_id, fileHash, admin.id, now);
-        const changed = this.db
-          .prepare(
-            "UPDATE settlements SET transfer_status='completed',transferred_at=?,updated_at=? WHERE id=? AND transfer_status='pending'",
-          )
-          .run(now, now, target.settlement_id);
-        if (changed.changes !== 1)
+        await tx`
+          INSERT INTO app.settlement_completions(settlement_id, file_hash, completed_by, completed_at)
+          VALUES (${target.settlement_id}, ${fileHash}, ${admin.id}, ${now})`;
+        const changed = await tx<{ id: string }[]>`
+          UPDATE app.settlements
+          SET transfer_status = 'completed', transferred_at = ${now}, updated_at = ${now}
+          WHERE id = ${target.settlement_id} AND transfer_status = 'pending'
+          RETURNING id`;
+        if (changed.length !== 1)
           throw new Error('Concurrent settlement change');
         completed++;
       }
@@ -279,18 +299,18 @@ export class SettlementsService {
     });
   }
 
-  balance(userId: string) {
-    const row = this.db
-      .prepare(
-        `SELECT CAST(COALESCE(SUM(a.mileage_amount),0) AS TEXT) AS amount
-      FROM mileage_applications a LEFT JOIN settlements s ON s.id=a.settlement_id
-      WHERE a.user_id=? AND a.approval_status='approved' AND ${unpaid}`,
-      )
-      .get(userId) as { amount: string };
-    return { accumulatedMileage: integer(row.amount) };
+  async balance(userId: string) {
+    const rows = await this.db<Amount[]>`
+      SELECT COALESCE(SUM(a.mileage_amount), 0)::text AS amount
+      FROM app.mileage_applications a
+      LEFT JOIN app.settlements s ON s.id = a.settlement_id
+      WHERE a.user_id = ${userId}
+        AND a.approval_status = 'approved'
+        AND (s.id IS NULL OR s.transfer_status = 'pending')`;
+    return { accumulatedMileage: integer(rows[0].amount) };
   }
 
-  dashboard(from: string, through: string, companyId?: string) {
+  async dashboard(from: string, through: string, companyId?: string) {
     const start = dayStart(from);
     const before = new Date(
       Date.parse(dayStart(through)) + 86400_000,
@@ -300,50 +320,66 @@ export class SettlementsService {
       Date.parse(before) - Date.parse(start) > 10001 * 86400_000
     )
       invalid('VALIDATION_ERROR');
-    const totals = this.db
-      .prepare(
-        `SELECT
-      CAST(COALESCE(SUM(CASE WHEN a.approval_status='approved' AND ${unpaid} AND julianday(a.decided_at)>=julianday(?) AND julianday(a.decided_at)<julianday(?) THEN a.mileage_amount ELSE 0 END),0) AS TEXT) AS accumulatedMileage,
-      CAST(COALESCE(SUM(CASE WHEN a.approval_status='approved' AND ${unpaid} AND julianday(a.decided_at)<julianday(?) THEN a.mileage_amount ELSE 0 END),0) AS TEXT) AS settlementMileage,
-      SUM(CASE WHEN a.match_status='matched' AND julianday(a.submitted_at)>=julianday(?) AND julianday(a.submitted_at)<julianday(?) THEN 1 ELSE 0 END) AS matchedCount,
-      SUM(CASE WHEN a.match_status='mismatched' AND julianday(a.submitted_at)>=julianday(?) AND julianday(a.submitted_at)<julianday(?) THEN 1 ELSE 0 END) AS mismatchedCount
-      FROM mileage_applications a LEFT JOIN settlements s ON s.id=a.settlement_id`,
-      )
-      .get(start, before, before, start, before, start, before) as Record<
-      string,
-      string | number | null
-    >;
-    const chart = this.db
-      .prepare(
-        `SELECT date(decided_at, '+9 hours') AS date, CAST(SUM(mileage_amount) AS TEXT) AS common,
-      CAST(SUM(CASE WHEN logistics_company_id=? THEN mileage_amount ELSE 0 END) AS TEXT) AS affiliation
-      FROM mileage_applications WHERE approval_status='approved' AND julianday(decided_at)>=julianday(?) AND julianday(decided_at)<julianday(?)
-      GROUP BY date(decided_at, '+9 hours') ORDER BY date`,
-      )
-      .all(companyId ?? '', start, before) as {
-      date: string;
-      common: string;
-      affiliation: string;
-    }[];
-    const receipts = this.db
-      .prepare(
-        `SELECT a.id, u.name AS driverName, date(a.submitted_at, '+9 hours') AS date,
-      a.approval_status AS status, CASE WHEN a.approval_status='approved' THEN CAST(a.mileage_amount AS TEXT) END AS mileage
-      FROM mileage_applications a JOIN users u ON u.id=a.user_id
-      WHERE julianday(a.submitted_at)>=julianday(?) AND julianday(a.submitted_at)<julianday(?) ORDER BY julianday(a.submitted_at) DESC, a.id DESC LIMIT 5`,
-      )
-      .all(start, before) as {
-      id: string;
-      driverName: string;
-      date: string;
-      status: string;
-      mileage: string | null;
-    }[];
-    const affiliations = this.db
-      .prepare(
-        'SELECT id AS value, business_name AS label FROM logistics_companies ORDER BY business_name, id',
-      )
-      .all() as { value: string; label: string }[];
+    const [totalsRows, chart, receipts, affiliations] = await Promise.all([
+      this.db<Record<string, string | number | null>[]>`
+        SELECT
+          COALESCE(SUM(CASE WHEN a.approval_status = 'approved'
+            AND (s.id IS NULL OR s.transfer_status = 'pending')
+            AND a.decided_at::timestamptz >= ${start}::timestamptz
+            AND a.decided_at::timestamptz < ${before}::timestamptz
+            THEN a.mileage_amount ELSE 0 END), 0)::text AS "accumulatedMileage",
+          COALESCE(SUM(CASE WHEN a.approval_status = 'approved'
+            AND (s.id IS NULL OR s.transfer_status = 'pending')
+            AND a.decided_at::timestamptz < ${before}::timestamptz
+            THEN a.mileage_amount ELSE 0 END), 0)::text AS "settlementMileage",
+          COALESCE(SUM(CASE WHEN a.match_status = 'matched'
+            AND a.submitted_at::timestamptz >= ${start}::timestamptz
+            AND a.submitted_at::timestamptz < ${before}::timestamptz
+            THEN 1 ELSE 0 END), 0)::text AS "matchedCount",
+          COALESCE(SUM(CASE WHEN a.match_status = 'mismatched'
+            AND a.submitted_at::timestamptz >= ${start}::timestamptz
+            AND a.submitted_at::timestamptz < ${before}::timestamptz
+            THEN 1 ELSE 0 END), 0)::text AS "mismatchedCount"
+        FROM app.mileage_applications a
+        LEFT JOIN app.settlements s ON s.id = a.settlement_id`,
+      this.db<
+        {
+          date: string;
+          common: string | number;
+          affiliation: string | number;
+        }[]
+      >`
+        SELECT (decided_at::timestamptz AT TIME ZONE 'Asia/Seoul')::date::text AS date,
+          SUM(mileage_amount)::text AS common,
+          SUM(CASE WHEN logistics_company_id = ${companyId ?? ''} THEN mileage_amount ELSE 0 END)::text AS affiliation
+        FROM app.mileage_applications
+        WHERE approval_status = 'approved'
+          AND decided_at::timestamptz >= ${start}::timestamptz
+          AND decided_at::timestamptz < ${before}::timestamptz
+        GROUP BY (decided_at::timestamptz AT TIME ZONE 'Asia/Seoul')::date
+        ORDER BY date`,
+      this.db<
+        {
+          id: string;
+          driverName: string;
+          date: string;
+          status: string;
+          mileage: string | number | null;
+        }[]
+      >`
+        SELECT a.id, u.name AS "driverName",
+          (a.submitted_at::timestamptz AT TIME ZONE 'Asia/Seoul')::date::text AS date,
+          a.approval_status AS status,
+          CASE WHEN a.approval_status = 'approved' THEN a.mileage_amount::text END AS mileage
+        FROM app.mileage_applications a JOIN app.users u ON u.id = a.user_id
+        WHERE a.submitted_at::timestamptz >= ${start}::timestamptz
+          AND a.submitted_at::timestamptz < ${before}::timestamptz
+        ORDER BY a.submitted_at::timestamptz DESC, a.id DESC LIMIT 5`,
+      this.db<{ value: string; label: string }[]>`
+        SELECT id AS value, business_name AS label
+        FROM app.logistics_companies ORDER BY business_name, id`,
+    ]);
+    const totals = totalsRows[0];
     return {
       accumulatedMileage: integer(totals.accumulatedMileage),
       settlementMileage: integer(totals.settlementMileage),

@@ -67,7 +67,9 @@ export class AdminStationsController {
       '주유소명·등록 기간 검색. 운영 여부와 관계없이 최신 등록순·동일 시각 ID순으로 조회합니다. 기간 생략 시 임의 기본값을 적용하지 않습니다. 기기는 부모 아래 배열로 제공합니다. 입력 좌표는 별도 검수 없이 반환하며 검증 출처·시각을 만들지 않습니다. 운영 상태 변경은 정책 미정으로 미제공입니다.',
   })
   @ApiOkResponse({ type: StationResponseDto, isArray: true })
-  findAll(@Query() query: AdminStationListQueryDto): StationResponseDto[] {
+  findAll(
+    @Query() query: AdminStationListQueryDto,
+  ): Promise<StationResponseDto[]> {
     return this.stations.findAdminList(query);
   }
 
@@ -81,7 +83,7 @@ export class AdminStationsController {
   })
   findOne(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): StationResponseDto {
+  ): Promise<StationResponseDto> {
     return this.stations.findOne(id, false);
   }
 
@@ -96,7 +98,7 @@ export class AdminStationsController {
       '주유소와 1개 이상의 기기를 함께 저장하거나 함께 롤백합니다. 주소는 도로명 주소 하나로 저장합니다. 좌표는 미검증 상태로 저장하며 출처·확인 시각을 만들지 않습니다.',
   })
   @ApiCreatedResponse({ type: StationResponseDto })
-  create(@Body() input: CreateStationDto): StationResponseDto {
+  create(@Body() input: CreateStationDto): Promise<StationResponseDto> {
     return this.stations.create(input);
   }
 
@@ -123,7 +125,7 @@ export class AdminStationsController {
   update(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
     @Body() input: UpdateStationDto,
-  ): StationResponseDto {
+  ): Promise<StationResponseDto> {
     return this.stations.update(id, input);
   }
 
@@ -144,8 +146,10 @@ export class AdminStationsController {
     type: ApiErrorResponseDto,
     description: 'STATION_NOT_FOUND',
   })
-  remove(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string): void {
-    this.stations.remove(id);
+  remove(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+  ): Promise<void> {
+    return this.stations.remove(id);
   }
 }
 
@@ -172,7 +176,7 @@ export class StationsController {
       '운영 중인 주유소만 최신 등록순·동일 시각 ID순으로 반환합니다. 입력된 좌표는 별도 검수 없이 제공하며 없는 좌표는 null입니다. 검증 완료로 가장하지 않고 coordinateVerified는 기존 검증 정보 유무를 나타냅니다. 기기는 운영 여부와 함께 배열로 제공합니다. 캐시·증분 갱신은 미제공입니다.',
   })
   @ApiOkResponse({ type: StationResponseDto, isArray: true })
-  findAll(): StationResponseDto[] {
+  findAll(): Promise<StationResponseDto[]> {
     return this.stations.findAppList();
   }
 
@@ -187,7 +191,9 @@ export class StationsController {
     description: 'VALIDATION_ERROR | INVALID_MAP_BOUNDS',
   })
   @ApiOkResponse({ type: StationResponseDto, isArray: true })
-  findMap(@Query() query: StationBoundsQueryDto): StationResponseDto[] {
+  findMap(
+    @Query() query: StationBoundsQueryDto,
+  ): Promise<StationResponseDto[]> {
     return this.stations.findMap(query);
   }
 
@@ -206,7 +212,7 @@ export class StationsController {
   @ApiOkResponse({ type: StationResponseDto })
   findOne(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): StationResponseDto {
+  ): Promise<StationResponseDto> {
     return this.stations.findOne(id, true);
   }
 }

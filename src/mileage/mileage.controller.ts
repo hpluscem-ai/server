@@ -220,10 +220,10 @@ export class MileageController {
       '신청 시각 기준 시작 포함·끝 제외. UTC/명시적 오프셋을 사용하며 기간 생략 시 제한하지 않습니다. 기본 최신순 20건, 최대 100건. 시각과 ID를 같은 방향으로 정렬합니다. nextCursor는 동일 기간·정렬에만 사용합니다. 본인 내역 중 정산 완료 건만 제외하며 정산 대기 건은 유지합니다. 조회 실패를 빈 내역으로 반환하지 않습니다.',
   })
   @ApiOkResponse({ type: MileageListDto })
-  list(
+  async list(
     @Req() request: AuthenticatedRequest,
     @Query() query: MileageListQueryDto,
-  ): MileageListDto {
+  ): Promise<MileageListDto> {
     return this.mileage.findList(request.authSession.user.id, query);
   }
 
@@ -239,10 +239,10 @@ export class MileageController {
     type: ApiErrorResponseDto,
     description: 'MILEAGE_APPLICATION_NOT_FOUND',
   })
-  detail(
+  async detail(
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): MileageDetailDto {
+  ): Promise<MileageDetailDto> {
     return this.mileage.findOne(request.authSession.user.id, id);
   }
 

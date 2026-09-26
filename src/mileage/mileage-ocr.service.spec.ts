@@ -231,54 +231,63 @@ describe('automatic approval evidence', () => {
     ['2026-09-23', '12:00:00+24:00', null],
     ['2026-09-23', '12:00:00+09:60', null],
     ['2026-09-23', '12:00+09:00', null],
-    ['2026-09-23', '12:00:00', null],
-  ])('validates calendar and explicit time %s %s', (date, time, expected) => {
-    expect(
-      transactionAt({
-        ...receipt,
-        transactionDateText: date,
-        transactionTimeText: time,
-      }),
-    ).toBe(expected);
-  });
+    ['2026-09-23', '12:00:00', '2026-09-23T03:00:00.000Z'],
+    ['2026-09-23', '00:00:00', '2026-09-22T15:00:00.000Z'],
+  ])(
+    'normalizes Korean time and validates explicit offsets %s %s',
+    (date, time, expected) => {
+      expect(
+        transactionAt({
+          ...receipt,
+          transactionDateText: date,
+          transactionTimeText: time,
+        }),
+      ).toBe(expected);
+    },
+  );
   it('uses meter liters and matching total, regardless of receipt quantity', () => {
-    expect(
-      automaticApprovalAmounts(receipt, meter, transactionAt(receipt)),
-    ).toEqual({ finalAmount: 11700, mileageAmount: 220 });
+    expect(automaticApprovalAmounts(receipt, meter)).toEqual({
+      finalAmount: 11700,
+      mileageAmount: 220,
+    });
     expect(
       automaticApprovalAmounts(
         { ...receipt, quantityText: null, quantityUnit: 'unknown' },
         meter,
-        transactionAt(receipt),
       ),
     ).toEqual({ finalAmount: 11700, mileageAmount: 220 });
   });
-  it('requires the actual complete evidence, including the same valid timestamp', () => {
+  it('requires readable matching amounts and meter liters, not ancillary metadata', () => {
     for (const invalid of [
       null,
-      { ...receipt, issues: ['unclear'] },
-      { ...receipt, documentKind: 'cancel' as const },
+      { ...receipt, amountText: null },
       { ...receipt, amountText: '12000' },
-      { ...receipt, transactionTimeText: null },
     ]) {
-      expect(
-        automaticApprovalAmounts(invalid, meter, transactionAt(receipt)),
-      ).toBeNull();
+      expect(automaticApprovalAmounts(invalid, meter)).toBeNull();
     }
     for (const invalid of [
       null,
-      { ...meter, issues: ['unclear'] },
+      { ...meter, litersText: null },
       { ...meter, litersText: '11' },
+      { ...meter, amountText: null },
       { ...meter, amountText: '12000' },
     ]) {
-      expect(
-        automaticApprovalAmounts(receipt, invalid, transactionAt(receipt)),
-      ).toBeNull();
+      expect(automaticApprovalAmounts(receipt, invalid)).toBeNull();
     }
-    expect(automaticApprovalAmounts(receipt, meter, null)).toBeNull();
     expect(
-      automaticApprovalAmounts(receipt, meter, '2026-09-23T03:34:57.000Z'),
-    ).toBeNull();
+      automaticApprovalAmounts(
+        {
+          ...receipt,
+          transactionDateText: null,
+          transactionTimeText: null,
+          documentKind: 'unknown',
+          reprinted: null,
+          approvalNumber: null,
+          issues: ['REPRINT_UNCLEAR'],
+        },
+        { ...meter, unitPriceText: null, issues: ['단가 판독 불가'] },
+      ),
+    ).toEqual({ finalAmount: 11700, mileageAmount: 220 });
   });
   it.each([
     '재출력',
@@ -288,16 +297,20 @@ describe('automatic approval evidence', () => {
     '주유 안내',
     '결제 취소',
     '영수증 사본',
-  ])('keeps %s out of automatic approval', (heading) => {
-    const reading = parseReceiptFields([
-      field(heading, 0, 0),
-      field('결제금액 11700원', 0, 20),
-      field('거래일시 2026-09-23 12:34:56+09:00', 0, 40),
-    ]);
-    expect(
-      automaticApprovalAmounts(reading, meter, transactionAt(reading)),
-    ).toBeNull();
-  });
+  ])(
+    'does not use %s document metadata to block readable amounts',
+    (heading) => {
+      const reading = parseReceiptFields([
+        field(heading, 0, 0),
+        field('결제금액 11700원', 0, 20),
+        field('거래일시 2026-09-23 12:34:56+09:00', 0, 40),
+      ]);
+      expect(automaticApprovalAmounts(reading, meter)).toEqual({
+        finalAmount: 11700,
+        mileageAmount: 220,
+      });
+    },
+  );
   it.each(['-11700원', '11700.0원', '11700abc', '11700원 / 12000원'])(
     'does not turn unclear amount %s into a positive total',
     (amount) => {
@@ -306,9 +319,7 @@ describe('automatic approval evidence', () => {
         field('결제금액 ' + amount, 0, 20),
         field('거래일시 2026-09-23 12:34:56+09:00', 0, 40),
       ]);
-      expect(
-        automaticApprovalAmounts(reading, meter, transactionAt(reading)),
-      ).toBeNull();
+      expect(automaticApprovalAmounts(reading, meter)).toBeNull();
     },
   );
   it('does not combine incomplete timestamps from separate labelled rows', () => {
@@ -318,11 +329,13 @@ describe('automatic approval evidence', () => {
       field('거래일시 2026-09-23', 0, 40),
       field('승인일시 12:34:56+09:00', 0, 60),
     ]);
-    expect(
-      automaticApprovalAmounts(reading, meter, transactionAt(reading)),
-    ).toBeNull();
+    expect(transactionAt(reading)).toBeNull();
+    expect(automaticApprovalAmounts(reading, meter)).toEqual({
+      finalAmount: 11700,
+      mileageAmount: 220,
+    });
   });
-  it('keeps truncated documents pending instead of ignoring their unread remainder', () => {
+  it('retains truncation warnings without blocking clear totals', () => {
     const reading = parseReceiptFields([
       field('승인', 0, 0),
       field('결제금액 11700원', 0, 20),
@@ -330,25 +343,31 @@ describe('automatic approval evidence', () => {
       field('a'.repeat(121) + '취소', 0, 60),
       ...Array.from({ length: 2000 }, () => field('문자', 0, 80)),
     ]);
-    expect(
-      automaticApprovalAmounts(reading, meter, transactionAt(reading)),
-    ).toBeNull();
+    expect(automaticApprovalAmounts(reading, meter)).toEqual({
+      finalAmount: 11700,
+      mileageAmount: 220,
+    });
   });
   it.each([
     '29:12:34+09:00',
     '12:34:99+09:00',
     '12:34:56+99:00',
     '12:34:56.123+09:00',
-  ])('does not truncate malformed time %s into a valid one', (time) => {
-    const reading = parseReceiptFields([
-      field('승인', 0, 0),
-      field('결제금액 11700원', 0, 20),
-      field('거래일시 2026-09-23 ' + time, 0, 40),
-    ]);
-    expect(
-      automaticApprovalAmounts(reading, meter, transactionAt(reading)),
-    ).toBeNull();
-  });
+  ])(
+    'does not turn malformed time %s into a valid one or block clear amounts',
+    (time) => {
+      const reading = parseReceiptFields([
+        field('승인', 0, 0),
+        field('결제금액 11700원', 0, 20),
+        field('거래일시 2026-09-23 ' + time, 0, 40),
+      ]);
+      expect(transactionAt(reading)).toBeNull();
+      expect(automaticApprovalAmounts(reading, meter)).toEqual({
+        finalAmount: 11700,
+        mileageAmount: 220,
+      });
+    },
+  );
 });
 
 describe('OCR benchmark approval truth', () => {
@@ -394,15 +413,36 @@ describe('OCR benchmark approval truth', () => {
       transactionExact: true,
     });
   });
-  it.each(['amount', 'liters', 'time', 'sale', 'uncertainty', 'decision'])(
+  it('reports time accuracy separately from amount-based approval truth', () => {
+    expect(
+      evaluateReading(
+        {
+          receipt: {
+            ...receipt,
+            transactionTimeText: null,
+            documentKind: 'unknown',
+            issues: ['REPRINT_UNCLEAR'],
+          },
+          meter,
+          clovaError: null,
+          lunaError: null,
+        },
+        { ...truth, documentKind: 'unknown' },
+      ),
+    ).toMatchObject({
+      candidate: true,
+      verifiedApproval: true,
+      falseApproval: false,
+      transactionExact: false,
+    });
+  });
+  it.each(['amount', 'liters', 'uncertainty', 'decision'])(
     'flags a wrong %s even if both OCR totals match',
     (kind) => {
       const expected = { ...truth };
       if (kind === 'amount')
         expected.receiptAmount = expected.meterAmount = 12000;
       if (kind === 'liters') expected.liters = '12';
-      if (kind === 'time') expected.transactionAt = '2026-09-23T03:35:56.000Z';
-      if (kind === 'sale') expected.documentKind = 'cancel' as 'sale';
       if (kind === 'uncertainty') expected.uncertain = true;
       if (kind === 'decision') expected.autoApprove = false;
       expect(

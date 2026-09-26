@@ -24,42 +24,47 @@ import {
 export class StationsService {
   constructor(private readonly stations: StationsRepository) {}
 
-  findAdminList(query: AdminStationListQueryDto): StationResponseDto[] {
-    return this.stations
-      .findAll({ ...query, ...normalizeDateRange(query) })
-      .map((station) => this.present(station));
+  async findAdminList(
+    query: AdminStationListQueryDto,
+  ): Promise<StationResponseDto[]> {
+    return (
+      await this.stations.findAll({ ...query, ...normalizeDateRange(query) })
+    ).map((station) => this.present(station));
   }
 
-  findAppList(): StationResponseDto[] {
-    return this.stations
-      .findAll({}, true)
-      .map((station) => this.present(station));
+  async findAppList(): Promise<StationResponseDto[]> {
+    return (await this.stations.findAll({}, true)).map((station) =>
+      this.present(station),
+    );
   }
 
-  findMap(bounds: StationBoundsQueryDto): StationResponseDto[] {
+  async findMap(bounds: StationBoundsQueryDto): Promise<StationResponseDto[]> {
     if (bounds.south > bounds.north)
       throw new BadRequestException({
         code: 'INVALID_MAP_BOUNDS',
         message: '남쪽 위도는 북쪽 위도보다 클 수 없습니다.',
       });
-    return this.stations
-      .findAll({}, true, bounds)
-      .map((station) => this.present(station));
+    return (await this.stations.findAll({}, true, bounds)).map((station) =>
+      this.present(station),
+    );
   }
 
-  findOne(id: string, appOnly: boolean): StationResponseDto {
-    const station = this.stations.findOne(id, appOnly);
+  async findOne(id: string, appOnly: boolean): Promise<StationResponseDto> {
+    const station = await this.stations.findOne(id, appOnly);
     if (!station) throw this.notFound();
     return this.present(station);
   }
 
-  create(input: CreateStationDto): StationResponseDto {
-    return this.present(this.stations.create(input));
+  async create(input: CreateStationDto): Promise<StationResponseDto> {
+    return this.present(await this.stations.create(input));
   }
 
-  update(id: string, input: UpdateStationDto): StationResponseDto {
+  async update(
+    id: string,
+    input: UpdateStationDto,
+  ): Promise<StationResponseDto> {
     try {
-      return this.present(this.stations.update(id, input));
+      return this.present(await this.stations.update(id, input));
     } catch (error) {
       if (error instanceof StationNotFoundError) throw this.notFound();
       if (error instanceof StationDevicesConflictError)
@@ -78,8 +83,8 @@ export class StationsService {
     });
   }
 
-  remove(id: string): void {
-    if (!this.stations.remove(id)) throw this.notFound();
+  async remove(id: string): Promise<void> {
+    if (!(await this.stations.remove(id))) throw this.notFound();
   }
 
   private present(station: StationRecord): StationResponseDto {
@@ -122,9 +127,11 @@ export class StationsService {
 
 function isoTimestamp(value: string): string | null {
   const normalized = value.replace(' ', 'T');
-  const withZone = /(?:Z|[+-]\d{2}:\d{2})$/.test(normalized)
-    ? normalized
-    : `${normalized}Z`;
+  const withZone = /[+-]\d{2}$/.test(normalized)
+    ? `${normalized}:00`
+    : /(?:Z|[+-]\d{2}(?::?\d{2})?)$/.test(normalized)
+      ? normalized
+      : `${normalized}Z`;
   const milliseconds = Date.parse(withZone);
   return isISO8601(withZone, { strict: true, strictSeparator: true }) &&
     Number.isFinite(milliseconds)

@@ -41,12 +41,12 @@ describe('Auth sessions (e2e)', () => {
     passwordHash = await argon2.hash('Password!1', { type: argon2.argon2id });
   });
 
-  beforeEach(() => {
-    database.db.delete(users).run();
-    database.db.delete(logisticsCompanies).run();
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
     jest.spyOn(Date, 'now').mockReturnValue(NOW);
-    companyId = seedCompany();
-    userId = seedDriver(companyId);
+    companyId = await seedCompany();
+    userId = await seedDriver(companyId);
   });
 
   afterEach(() => {
@@ -59,48 +59,42 @@ describe('Auth sessions (e2e)', () => {
     else process.env.WEB_ORIGINS = previousWebOrigins;
   });
 
-  function seedCompany() {
+  async function seedCompany() {
     const id = randomUUID();
     sequence += 1;
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id,
-        businessName: '(주)경인물류',
-        businessNumber: `${String(sequence).padStart(3, '0')}-45-67890`,
-        corporateRegistrationNumber: `${String(sequence).padStart(6, '0')}-1234567`,
-        businessAddress: '서울시 강남구',
-        managerName: '김담당',
-        managerPhone: '010-1111-2222',
-        bankCode: '19',
-        accountNumber: '110-123-456789',
-        accountHolder: '김담당',
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id,
+      businessName: '(주)경인물류',
+      businessNumber: `${String(sequence).padStart(3, '0')}-45-67890`,
+      corporateRegistrationNumber: `${String(sequence).padStart(6, '0')}-1234567`,
+      businessAddress: '서울시 강남구',
+      managerName: '김담당',
+      managerPhone: '010-1111-2222',
+      bankCode: '19',
+      accountNumber: '110-123-456789',
+      accountHolder: '김담당',
+    });
     return id;
   }
 
-  function seedDriver(forCompanyId: string) {
+  async function seedDriver(forCompanyId: string) {
     const id = randomUUID();
     sequence += 1;
-    database.db
-      .insert(users)
-      .values({
-        id,
-        role: 'driver',
-        email: `${id}@example.com`,
-        passwordHash,
-        name: '김기사',
-        phone: `010-${String(sequence).padStart(4, '0')}-5678`,
-        logisticsCompanyId: forCompanyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(users).values({
+      id,
+      role: 'driver',
+      email: `${id}@example.com`,
+      passwordHash,
+      name: '김기사',
+      phone: `010-${String(sequence).padStart(4, '0')}-5678`,
+      logisticsCompanyId: forCompanyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     return id;
   }
 
-  function seedSession({
+  async function seedSession({
     forUserId = userId,
     createdAt = new Date(NOW - 2 * DAY),
     lastUsedAt = new Date(NOW - DAY),
@@ -119,16 +113,17 @@ describe('Auth sessions (e2e)', () => {
       lastUsedAt,
       expiresAt,
     };
-    database.db.insert(authSessions).values(row).run();
+    await database.db.insert(authSessions).values(row);
     return { token, row };
   }
 
-  function storedSession(tokenHash: string) {
-    return database.db
+  async function storedSession(tokenHash: string) {
+    const [session] = await database.db
       .select()
       .from(authSessions)
       .where(eq(authSessions.tokenHash, tokenHash))
-      .get();
+      .limit(1);
+    return session;
   }
 
   function me(token: string) {
@@ -163,20 +158,19 @@ describe('Auth sessions (e2e)', () => {
       .expect(204)
       .expect('');
     await me(token).expect(401).expect(invalidSession);
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
   });
 
   it('returns current user data and touches only the requesting session', async () => {
-    const current = seedSession();
-    const other = seedSession();
-    database.db
+    const current = await seedSession();
+    const other = await seedSession();
+    await database.db
       .update(users)
       .set({ name: '이기사' })
-      .where(eq(users.id, userId))
-      .run();
+      .where(eq(users.id, userId));
 
     await me(current.token)
-      .query({ userId: seedDriver(companyId) })
+      .query({ userId: await seedDriver(companyId) })
       .expect(200)
       .expect({
         id: userId,
@@ -184,11 +178,11 @@ describe('Auth sessions (e2e)', () => {
         name: '이기사',
         logisticsCompanyId: companyId,
       });
-    expect(storedSession(current.row.tokenHash)).toEqual({
+    expect(await storedSession(current.row.tokenHash)).toEqual({
       ...current.row,
       lastUsedAt: new Date(NOW),
     });
-    expect(storedSession(other.row.tokenHash)).toEqual(other.row);
+    expect(await storedSession(other.row.tokenHash)).toEqual(other.row);
   });
 
   it.each([
@@ -204,7 +198,7 @@ describe('Auth sessions (e2e)', () => {
   ])(
     'rejects a missing, malformed, or unknown authorization header: %p',
     async (header) => {
-      const current = seedSession();
+      const current = await seedSession();
       const pending = request(app.getHttpServer()).get('/api/v1/auth/me');
       if (header !== undefined) pending.set('Authorization', header);
       await pending
@@ -212,23 +206,23 @@ describe('Auth sessions (e2e)', () => {
         .expect(invalidSession)
         .expect('Cache-Control', 'no-store')
         .expect('WWW-Authenticate', 'Bearer');
-      expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+      expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
     },
   );
 
   it('does not accept a token from the query string or unrelated cookies', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     await request(app.getHttpServer())
       .get('/api/v1/auth/me')
       .query({ token: current.token })
       .set('Cookie', `token=${current.token}`)
       .expect(401)
       .expect(invalidSession);
-    expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+    expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
   });
 
   it('accepts a case-insensitive Bearer scheme with spaces', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     await request(app.getHttpServer())
       .get('/api/v1/auth/me')
       .set('Authorization', `bEaReR   ${current.token}`)
@@ -243,16 +237,16 @@ describe('Auth sessions (e2e)', () => {
     ['idle expired', NOW - 10 * DAY, NOW - 7 * DAY - 1, 401],
     ['idle just valid', NOW - 10 * DAY, NOW - 7 * DAY + 1, 200],
   ] as const)('enforces %s', async (_name, createdAt, lastUsedAt, status) => {
-    const current = seedSession({
+    const current = await seedSession({
       createdAt: new Date(createdAt),
       lastUsedAt: new Date(lastUsedAt),
     });
     const response = await me(current.token).expect(status);
     if (status === 401) {
       expect(response.body).toEqual(invalidSession);
-      expect(storedSession(current.row.tokenHash)).toBeUndefined();
+      expect(await storedSession(current.row.tokenHash)).toBeUndefined();
     } else {
-      expect(storedSession(current.row.tokenHash)).toEqual({
+      expect(await storedSession(current.row.tokenHash)).toEqual({
         ...current.row,
         lastUsedAt: new Date(NOW),
       });
@@ -260,14 +254,14 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('never extends the absolute deadline when activity extends the idle deadline', async () => {
-    const current = seedSession({
+    const current = await seedSession({
       createdAt: new Date(NOW - 28 * DAY),
       lastUsedAt: new Date(NOW - 6 * DAY),
     });
     await me(current.token).expect(200);
     jest.spyOn(Date, 'now').mockReturnValue(NOW + DAY);
     await me(current.token).expect(200);
-    expect(storedSession(current.row.tokenHash)?.expiresAt).toEqual(
+    expect((await storedSession(current.row.tokenHash))?.expiresAt).toEqual(
       current.row.expiresAt,
     );
     jest.spyOn(Date, 'now').mockReturnValue(NOW + 2 * DAY);
@@ -275,32 +269,31 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('does not move last use backwards if the server clock moves backwards', async () => {
-    const current = seedSession({ lastUsedAt: new Date(NOW + 1000) });
+    const current = await seedSession({ lastUsedAt: new Date(NOW + 1000) });
     await me(current.token).expect(200);
-    expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+    expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
   });
 
   it.each(['user', 'company', 'role'])(
     'rechecks the current %s state on every request',
     async (target) => {
-      const current = seedSession();
+      const current = await seedSession();
       if (target === 'company')
-        database.db.update(logisticsCompanies).set({ active: false }).run();
+        await database.db.update(logisticsCompanies).set({ active: false });
       else if (target === 'user')
-        database.db
+        await database.db
           .update(users)
-          .set({ deactivatedAt: new Date(NOW).toISOString() })
-          .run();
-      else database.db.update(users).set({ role: 'admin' }).run();
+          .set({ deactivatedAt: new Date(NOW).toISOString() });
+      else await database.db.update(users).set({ role: 'admin' });
 
       await me(current.token).expect(401).expect(invalidSession);
-      expect(storedSession(current.row.tokenHash)).toBeUndefined();
+      expect(await storedSession(current.row.tokenHash)).toBeUndefined();
     },
   );
 
   it('logs out only the authenticated session, ignoring other tokens in the body', async () => {
-    const current = seedSession();
-    const other = seedSession();
+    const current = await seedSession();
+    const other = await seedSession();
     await request(app.getHttpServer())
       .post('/api/v1/auth/logout')
       .set('Authorization', `Bearer ${current.token}`)
@@ -308,8 +301,8 @@ describe('Auth sessions (e2e)', () => {
       .expect(204)
       .expect('Cache-Control', 'no-store')
       .expect('');
-    expect(storedSession(current.row.tokenHash)).toBeUndefined();
-    expect(storedSession(other.row.tokenHash)).toEqual(other.row);
+    expect(await storedSession(current.row.tokenHash)).toBeUndefined();
+    expect(await storedSession(other.row.tokenHash)).toEqual(other.row);
     await request(app.getHttpServer())
       .post('/api/v1/auth/logout')
       .set('Authorization', `Bearer ${current.token}`)
@@ -319,20 +312,24 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('revokes all drivers in a deactivated company immediately, but preserves other companies', async () => {
-    const first = seedSession();
-    const second = seedSession();
-    const colleague = seedSession({ forUserId: seedDriver(companyId) });
-    const unrelated = seedSession({ forUserId: seedDriver(seedCompany()) });
+    const first = await seedSession();
+    const second = await seedSession();
+    const colleague = await seedSession({
+      forUserId: await seedDriver(companyId),
+    });
+    const unrelated = await seedSession({
+      forUserId: await seedDriver(await seedCompany()),
+    });
 
     await request(app.getHttpServer())
       .delete(`/api/v1/admin/logistics-companies/${companyId}`)
-      .set('Authorization', seedAdminSession(database))
+      .set('Authorization', await seedAdminSession(database))
       .expect(204);
-    expect(database.db.select().from(authSessions).all()).toEqual([
+    expect(await database.db.select().from(authSessions)).toEqual([
       unrelated.row,
     ]);
     expect(
-      database.db.select().from(users).where(eq(users.role, 'driver')).all(),
+      await database.db.select().from(users).where(eq(users.role, 'driver')),
     ).toHaveLength(3);
     const login = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
@@ -341,11 +338,10 @@ describe('Auth sessions (e2e)', () => {
     expect(login.body).toMatchObject({ code: 'ACCOUNT_UNAVAILABLE' });
 
     // 비활성화 후 재활성화되더라도 폐기된 토큰을 되살리지 않는다.
-    database.db
+    await database.db
       .update(logisticsCompanies)
       .set({ active: true })
-      .where(eq(logisticsCompanies.id, companyId))
-      .run();
+      .where(eq(logisticsCompanies.id, companyId));
     for (const session of [first, second, colleague]) {
       await me(session.token).expect(401).expect(invalidSession);
     }
@@ -353,45 +349,55 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('rolls back company deactivation if deleting sessions fails', async () => {
-    const first = seedSession();
-    const second = seedSession();
-    const company = database.db
+    const first = await seedSession();
+    const second = await seedSession();
+    const [company] = await database.db
       .select()
       .from(logisticsCompanies)
       .where(eq(logisticsCompanies.id, companyId))
-      .get();
+      .limit(1);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection
-      .exec(`CREATE TRIGGER fail_session_revocation AFTER DELETE ON auth_sessions
-      BEGIN SELECT RAISE(FAIL, 'forced revocation failure'); END;`);
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_session_revocation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced revocation failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_session_revocation AFTER DELETE ON app.auth_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_session_revocation()',
+    );
     try {
       const response = await request(app.getHttpServer())
         .delete(`/api/v1/admin/logistics-companies/${companyId}`)
-        .set('Authorization', seedAdminSession(database))
+        .set('Authorization', await seedAdminSession(database))
         .expect(500);
       expect(response.body).toMatchObject({ code: 'INTERNAL_SERVER_ERROR' });
-      expect(
-        database.db
-          .select()
-          .from(logisticsCompanies)
-          .where(eq(logisticsCompanies.id, companyId))
-          .get(),
-      ).toEqual(company);
-      expect(storedSession(first.row.tokenHash)).toEqual(first.row);
-      expect(storedSession(second.row.tokenHash)).toEqual(second.row);
+      const [storedCompany] = await database.db
+        .select()
+        .from(logisticsCompanies)
+        .where(eq(logisticsCompanies.id, companyId))
+        .limit(1);
+      expect(storedCompany).toEqual(company);
+      expect(await storedSession(first.row.tokenHash)).toEqual(first.row);
+      expect(await storedSession(second.row.tokenHash)).toEqual(second.row);
     } finally {
-      database.connection.exec('DROP TRIGGER fail_session_revocation');
+      await database.connection.unsafe(
+        'DROP TRIGGER fail_session_revocation ON app.auth_sessions',
+      );
+      await database.connection.unsafe(
+        'DROP FUNCTION app.fail_session_revocation()',
+      );
     }
   });
 
   it('returns a server error and rolls back a failed last-use update', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     const log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
-    database.connection
-      .exec(`CREATE TRIGGER fail_session_touch AFTER UPDATE OF last_used_at ON auth_sessions
-      BEGIN SELECT RAISE(FAIL, 'forced session update failure'); END;`);
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_session_touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced session update failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_session_touch AFTER UPDATE OF last_used_at ON app.auth_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_session_touch()',
+    );
     try {
       const response = await me(current.token)
         .expect(500)
@@ -401,21 +407,29 @@ describe('Auth sessions (e2e)', () => {
         code: 'INTERNAL_SERVER_ERROR',
         message: '서버 오류가 발생했습니다.',
       });
-      expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+      expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
       expect(log).toHaveBeenCalled();
       expect(JSON.stringify(log.mock.calls)).not.toContain(current.token);
     } finally {
-      database.connection.exec('DROP TRIGGER fail_session_touch');
+      await database.connection.unsafe(
+        'DROP TRIGGER fail_session_touch ON app.auth_sessions',
+      );
+      await database.connection.unsafe(
+        'DROP FUNCTION app.fail_session_touch()',
+      );
     }
     await me(current.token).expect(200);
   });
 
   it('does not report logout success when deleting the session fails', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection
-      .exec(`CREATE TRIGGER fail_logout BEFORE DELETE ON auth_sessions
-      BEGIN SELECT RAISE(ABORT, 'forced logout failure'); END;`);
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_logout() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced logout failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_logout BEFORE DELETE ON app.auth_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_logout()',
+    );
     try {
       const response = await request(app.getHttpServer())
         .post('/api/v1/auth/logout')
@@ -426,9 +440,12 @@ describe('Auth sessions (e2e)', () => {
         code: 'INTERNAL_SERVER_ERROR',
         message: '서버 오류가 발생했습니다.',
       });
-      expect(storedSession(current.row.tokenHash)?.userId).toBe(userId);
+      expect((await storedSession(current.row.tokenHash))?.userId).toBe(userId);
     } finally {
-      database.connection.exec('DROP TRIGGER fail_logout');
+      await database.connection.unsafe(
+        'DROP TRIGGER fail_logout ON app.auth_sessions',
+      );
+      await database.connection.unsafe('DROP FUNCTION app.fail_logout()');
     }
     await me(current.token).expect(200);
   });
@@ -494,7 +511,7 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('accepts only the named cookie and never falls back from malformed Bearer auth', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     const cookie = `hpluseco_driver_session=${current.token}`;
     const rejected = await request(app.getHttpServer())
       .get('/api/v1/auth/me')
@@ -502,7 +519,7 @@ describe('Auth sessions (e2e)', () => {
       .set('Authorization', 'Bearer invalid')
       .expect(401);
     expect(rejected.headers['set-cookie']).toBeUndefined();
-    expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+    expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
     await request(app.getHttpServer())
       .get('/api/v1/auth/me')
       .set('Cookie', cookie)
@@ -521,7 +538,7 @@ describe('Auth sessions (e2e)', () => {
   it.each([undefined, 'null', 'https://untrusted.example'])(
     'blocks cookie mutations before touching the session for Origin %p',
     async (origin) => {
-      const current = seedSession();
+      const current = await seedSession();
       for (const path of [
         '/api/v1/auth/logout',
         '/api/v1/auth/change-password',
@@ -534,14 +551,14 @@ describe('Auth sessions (e2e)', () => {
         const response = await pending.expect(403);
         expect(response.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
         expect(response.headers['set-cookie']).toBeUndefined();
-        expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+        expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
       }
     },
   );
 
   it('does not clear a newer login cookie when an expired-session response arrives', async () => {
     jest.spyOn(Date, 'now').mockRestore();
-    const expired = seedSession({
+    const expired = await seedSession({
       createdAt: new Date(Date.now() - 10 * DAY),
       lastUsedAt: new Date(Date.now() - 8 * DAY),
     });
@@ -574,20 +591,26 @@ describe('Auth sessions (e2e)', () => {
   });
 
   it('preserves cookies when the database fails', async () => {
-    const current = seedSession();
+    const current = await seedSession();
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection
-      .exec(`CREATE TRIGGER fail_cookie_touch AFTER UPDATE OF last_used_at ON auth_sessions
-      BEGIN SELECT RAISE(FAIL, 'forced cookie update failure'); END;`);
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_cookie_touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced cookie update failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_cookie_touch AFTER UPDATE OF last_used_at ON app.auth_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_cookie_touch()',
+    );
     try {
       const response = await request(app.getHttpServer())
         .get('/api/v1/auth/me')
         .set('Cookie', `hpluseco_driver_session=${current.token}`)
         .expect(500);
       expect(response.headers['set-cookie']).toBeUndefined();
-      expect(storedSession(current.row.tokenHash)).toEqual(current.row);
+      expect(await storedSession(current.row.tokenHash)).toEqual(current.row);
     } finally {
-      database.connection.exec('DROP TRIGGER fail_cookie_touch');
+      await database.connection.unsafe(
+        'DROP TRIGGER fail_cookie_touch ON app.auth_sessions',
+      );
+      await database.connection.unsafe('DROP FUNCTION app.fail_cookie_touch()');
     }
   });
 });

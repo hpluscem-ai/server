@@ -28,7 +28,7 @@ const emptyResult = (): OcrResult => ({
 export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MileageOcrWorkerService.name);
   private timer?: NodeJS.Timeout;
-  private busy = false;
+  private draining?: Promise<void>;
 
   constructor(
     private readonly repository: MileageRepository,
@@ -36,39 +36,44 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
     private readonly storage: PhotoStorageService,
   ) {}
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
     // A previous process may have sent a paid request before its response was lost.
-    this.repository.interruptRunningOcrJobs();
+    await this.repository.interruptRunningOcrJobs();
     if (!this.ocr.isConfigured()) return;
     this.timer = setInterval(() => void this.drain(), 5000);
     this.timer.unref();
     void this.drain();
   }
 
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    await this.draining;
   }
 
-  private async drain(): Promise<void> {
-    if (this.busy) return;
-    this.busy = true;
+  private drain(): Promise<void> {
+    if (this.draining) return this.draining;
+    this.draining = this.runDrain().finally(() => {
+      this.draining = undefined;
+    });
+    return this.draining;
+  }
+
+  private async runDrain(): Promise<void> {
     try {
       while (await this.processOne()) continue;
     } catch {
       this.logger.error('Mileage OCR worker stopped after an internal error');
-    } finally {
-      this.busy = false;
     }
   }
 
   async processOne(): Promise<boolean> {
     if (!this.ocr.isConfigured()) return false;
-    const job = this.repository.claimOcrJob();
+    const job = await this.repository.claimOcrJob();
     if (!job) return false;
     const result = emptyResult();
-    const source = this.repository.ocrSource(job);
+    const source = await this.repository.ocrSource(job);
     if (!source) {
-      this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
+      await this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
       return true;
     }
     let images: Buffer[];
@@ -79,24 +84,24 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
         ),
       );
     } catch {
-      this.repository.finishOcrJob(job, result, 'PHOTO_READ_FAILED');
+      await this.repository.finishOcrJob(job, result, 'PHOTO_READ_FAILED');
       return true;
     }
-    if (!this.repository.ocrSource(job)) {
-      this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
+    if (!(await this.repository.ocrSource(job))) {
+      await this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
       return true;
     }
     const lunaLimit = positiveLimit(process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT);
     if (
       lunaLimit === null ||
-      !this.repository.reserveOcrCall(job.id, lunaLimit)
+      !(await this.repository.reserveOcrCall(job.id, lunaLimit))
     ) {
-      this.repository.finishOcrJob(job, result, 'DAILY_LIMIT_REACHED');
+      await this.repository.finishOcrJob(job, result, 'DAILY_LIMIT_REACHED');
       return true;
     }
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        if (!this.repository.ocrSource(job))
+        if (!(await this.repository.ocrSource(job)))
           throw new OcrFailure('STALE_SOURCE');
         const response = await this.ocr.readApplication(images);
         result.receipt = response.reading.receipt;
@@ -124,15 +129,15 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
               : image,
           ),
         );
-        if (!this.repository.ocrSource(job))
+        if (!(await this.repository.ocrSource(job)))
           throw new OcrFailure('STALE_SOURCE');
-        if (!this.repository.reserveOcrCall(job.id, lunaLimit, true))
+        if (!(await this.repository.reserveOcrCall(job.id, lunaLimit, true)))
           throw new OcrFailure('DAILY_LIMIT_REACHED');
       }
     } catch (error) {
       result.lunaError = errorCode(error, 'LUNA_FAILED');
     }
-    this.repository.finishOcrJob(job, result);
+    await this.repository.finishOcrJob(job, result);
     return true;
   }
 }

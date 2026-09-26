@@ -16,13 +16,15 @@ import { AdminAuthService } from './admin-auth.service';
 
 export type AdminAuthenticatedRequest = Request & {
   authMethod: 'bearer' | 'cookie';
-  adminSession: NonNullable<ReturnType<AdminAuthService['authenticate']>>;
+  adminSession: NonNullable<
+    Awaited<ReturnType<AdminAuthService['authenticate']>>
+  >;
 };
 
 @Injectable()
 export class AdminSessionGuard implements CanActivate {
   constructor(private readonly auth: AdminAuthService) {}
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const http = context.switchToHttp();
     const request = http.getRequest<AdminAuthenticatedRequest>();
     const response = http.getResponse<Response>();
@@ -42,7 +44,7 @@ export class AdminSessionGuard implements CanActivate {
     ) {
       assertWebOrigin(request);
     }
-    const session = this.auth.authenticate(token);
+    const session = await this.auth.authenticate(token);
     if (!session) {
       response.setHeader('WWW-Authenticate', 'Bearer');
       throw new UnauthorizedException({

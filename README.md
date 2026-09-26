@@ -31,6 +31,27 @@
 $ pnpm install
 ```
 
+## PostgreSQL and Supabase configuration
+
+Local and deployed servers use PostgreSQL through Drizzle and `postgres`. Copy `.env.example` to `.env` and set `DATABASE_URL`; there is no local file database fallback. Existing Nest authentication and API contracts are unchanged; Supabase Auth and the browser Data API are not used.
+
+- Runtime: use the Supabase Session pooler URL (port 5432) with this Postgres.js driver. Supabase warns that Postgres.js pipelining is incompatible with its shared Transaction pooler (port 6543), which the server rejects. Vercel uses one connection per warm instance; a persistent server uses a pool of five. Prepared statements remain disabled. A persistent server can also use a Direct URL.
+- Remote runtime and migration connections require TLS with certificate and hostname verification; only loopback development connections use plaintext. The public Supabase Root 2021 CA from the official Dashboard download is bundled for Supabase database hosts. Other PostgreSQL hosts use Node's trusted roots; a private CA can be supplied with `NODE_EXTRA_CA_CERTS` before starting the process. Do not disable certificate verification.
+- Migrations: set `DATABASE_MIGRATION_URL` to a Direct or Session pooler connection, then run `pnpm db:migrate` before starting the server. Startup does not create or migrate tables. The initial migration targets an empty application schema; it does not import legacy data.
+- Application tables live in the private `app` schema. Do not expose this schema through the Supabase Data API or grant `anon` / `authenticated` access. Database credentials stay on the API server.
+- Tests: set `TEST_DATABASE_URL` to a dedicated local PostgreSQL database with permission to create databases. Each test application gets its own randomly named database, migrates it, and drops only that database on close. Tests never use `DATABASE_URL`.
+
+```sh
+pnpm db:migrate
+pnpm build
+pnpm exec jest --runInBand --watchman=false
+pnpm exec jest --config test/jest-e2e.json --runInBand --watchman=false
+```
+
+Keep existing database files and photo objects until a separate data transfer has reconciled record counts, financial totals, relationships and photo keys. Changing configuration does not transfer data. For a cutover, stop writes or reconcile changes made after the snapshot before switching the API connection.
+
+See the official [PostgreSQL connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres) and [S3 configuration guide](https://supabase.com/docs/guides/storage/s3/authentication).
+
 ## Compile and run the project
 
 ```bash
@@ -109,21 +130,23 @@ Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
 
 The same user/key/original bytes replay the existing application. Different original bytes with the same key return `409 IDEMPOTENCY_CONFLICT`. Keys remain with application records. Concurrent processing can return `503`; retry with the same key and the same original bytes. Photo acceptance does not promise approval; OCR uses the asynchronous worker described below.
 
-Set `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` for an existing private bucket. Keep public access disabled and scope credentials to that bucket. Missing configuration fails photo operations with `503`; startup and existing APIs continue to work. The server never provisions a bucket. Tests replace only the storage boundary and do not contact R2.
+Set `SUPABASE_S3_ENDPOINT`, `SUPABASE_S3_REGION`, `SUPABASE_STORAGE_BUCKET`, `SUPABASE_S3_ACCESS_KEY_ID`, and `SUPABASE_S3_SECRET_ACCESS_KEY` for an existing private Supabase Storage bucket. Copy the endpoint, region and generated S3 key pair from Storage > S3; Auth/service-role keys are not S3 credentials. S3 keys bypass RLS and must remain server-only; existing Nest session and photo ownership checks still protect access. Missing or invalid configuration fails photo operations with `503`. The server never provisions a bucket or enables public access. API tests replace the storage boundary and do not contact hosted storage.
+
+Set both the project and bucket upload limits to allow the existing exact maximum of 52,428,800 bytes (50 MiB) per photo. Use HTTPS for hosted storage. Local Supabase can use `http://127.0.0.1:54321/storage/v1/s3` and region `local` outside production. Preserve every original and normalized object key when transferring existing photos. A storage migration alone does not bypass Vercel's 4.5 MB function request limit; large multipart uploads and the persistent OCR worker still require the separately planned API hosting change.
 
 Originals and normalized copies remain private. Normalization corrects orientation, converts to sRGB JPEG quality 90, limits the long edge to 4096px and removes EXIF/GPS. Image decoding runs in a timed worker with bounded pixel/memory use; one decoder and at most two multipart requests run per server process. Excess concurrent requests return a retryable `503`. HEIC decoding uses ImageMagick WASM, retaining its source color profile through conversion to sharp. The worker asset is copied by the Nest build.
 
-Schema migration 6 adds request fingerprints, original-photo metadata and `mileage_upload_attempts`. An attempt with all candidate storage keys is recorded before remote writes. Application/photo metadata and removal of the attempt commit together. Failed attempts retain their records, including ambiguous remote writes; cleanup only targets that attempt's uncommitted objects. A process interruption may leave an attempt requiring manual reconciliation. There is no automatic retention or deletion job, and accepted application/settlement records are preserved.
+The PostgreSQL schema includes request fingerprints, original-photo metadata and `mileage_upload_attempts`. An attempt with all candidate storage keys is recorded before remote writes. Application/photo metadata and removal of the attempt commit together. Failed attempts retain their records, including ambiguous remote writes; cleanup only targets that attempt's uncommitted objects. A process interruption may leave an attempt requiring manual reconciliation. There is no automatic retention or deletion job, and accepted application/settlement records are preserved.
 
-The committed HEIC test fixture is a generated solid-color image, not a user receipt. Live R2 credentials, bucket configuration and live upload/read validation are separate from the isolated tests.
+The committed HEIC test fixture is a generated solid-color image, not a user receipt. Hosted Supabase credentials, bucket configuration and hosted upload/read validation are separate from the isolated tests.
 
 ## OCR automatic approval (disabled by default)
 
-The existing SQLite worker reads receipts with GPT-6 Luna and meters with `gpt-6-luna`. Its existing `MILEAGE_OCR_ENABLED`, provider credentials and positive `MILEAGE_OCR_CLOVA_DAILY_LIMIT` / `MILEAGE_OCR_LUNA_DAILY_LIMIT` settings still control paid reading. `MILEAGE_OCR_AUTO_APPROVE_ENABLED=true` is a separate, exact opt-in; missing, false or misspelled values disable automatic approval. Keep it disabled until the time policy, labelled sample evaluation and activation approval are complete. This change does not modify a real environment file or database.
+The PostgreSQL-backed worker reads receipts and meters with `gpt-6-luna`. `MILEAGE_OCR_ENABLED`, `OPENAI_API_KEY` and a positive `MILEAGE_OCR_LUNA_DAILY_LIMIT` control paid reading. `MILEAGE_OCR_AUTO_APPROVE_ENABLED=true` is a separate, exact opt-in; missing, false or misspelled values disable automatic approval.
 
-For a current running job, `finishOcrJob` stores OCR evidence, completes the job and approves/credits the application in one immediate transaction. It requires the current extractor and photo version, both photos, pending/unsettled state, no job/provider error, confirmed sale, empty issues, a valid printed transaction timestamp, identical complete totals and explicit meter liters. `finalAmount` is the matching displayed total; `mileageAmount` is meter liters × 20, rounded with decimal integer arithmetic. Receipt quantity/count is not a requirement. No amount-to-liter inference or automatic rejection is performed.
+For a current running job, `finishOcrJob` stores OCR evidence, completes the job and approves/credits the application in one database transaction. It requires the current extractor and photo version, the required photo(s), pending/unsettled state, no job/provider error, identical readable totals and explicit meter liters. `finalAmount` is the matching displayed total; `mileageAmount` is meter liters × 20, rounded with decimal integer arithmetic. Receipt quantity, document kind, reprint metadata, ancillary warnings and transaction timestamp availability do not gate approval. Unreadable amounts/liters must be null, never guessed. No amount-to-liter inference or automatic rejection is performed.
 
-Until the Korean timezone decision is confirmed, timestamps require printed seconds and an explicit `Z` or numeric offset. Missing seconds/timezone and impossible dates remain pending. Reprints, unpaid documents, cancellations, mixed/ambiguous/truncated readings also remain pending. Historical current evidence is normalized for duplicate comparison across all users, including withdrawn users. Old submission evidence and creation hashes after resubmission are not treated as current photos. Repeated completion, resubmission, review and settlement do not rewrite a completed decision. Existing balances sum approved records; there is no separate increment or new queue.
+Timestamps without an offset use Korean time (`+09:00`). Missing seconds, ambiguous or impossible timestamps remain null without blocking readable matching amounts. Across all users (including withdrawn users), matching receipt amount, meter amount and transaction time, or the existing identical-photo request hash, trigger duplicate review. Independently, matching totals from the same driver's immediately previous current OCR result trigger duplicate review even if the transaction time differs. Results are ordered by completion time; another driver's result does not interrupt that sequence. A failed preceding OCR result does not cause a search for an older equal amount. Old submission evidence and creation hashes after resubmission are not treated as current photos. Repeated completion, resubmission, review and settlement do not rewrite a completed decision. Existing balances sum approved records; there is no separate increment or new queue.
 
 The extractor evidence version changes with these validation rules. Old queued jobs are discarded before paid calls, and completed jobs are never automatically reread or retroactively approved. Each application sends one GPT-6 Luna request containing its combined photo or separate receipt/meter photos. If a photo is explicitly identified as mirrored, only that in-memory image is flipped and the request is repeated once. Both attempts reserve from `MILEAGE_OCR_LUNA_DAILY_LIMIT` (UTC day) before calling. Transport failures are not automatically retried. Cached and cache-write token counts are recorded in the job result. CLOVA credentials are no longer used; its historical columns remain readable.
 
@@ -140,7 +163,7 @@ pnpm exec ts-node scripts/benchmark-mileage-ocr.ts --manifest /private/path/mani
 
 Live evaluation additionally requires `--live`, `--max-luna-calls` and `--used-luna-calls`. Maxima are the approved cumulative ceilings; used counts include prior failures and uncertain attempts. The earlier 11-call ceilings are not a fresh allowance. Confirm remaining usage before supplying these values. Conflicting truths for duplicate pairs and insufficient budgets fail before calling. Attempt counts are saved before requests; atomic report replacements preserve the previous checkpoint on interruption. Existing output files are never used to start a new paid run. Reported calls are attempts/reservations, not proof of provider billing; use account usage/invoices for actual cost.
 
-The evaluator flags matching but incorrect totals, incorrect liters/time, unsafe approval candidates and missed approvals; unknown truth cannot count as a verified approval. Automated tests use synthetic readings and provider doubles. Real labelled sample accuracy and permission to enable automatic approval remain outstanding.
+The evaluator reports amount, liter and timestamp accuracy separately. Approval verification uses labelled amounts/liters and the human-labelled decision; transaction time and document kind are informational. Unknown required truth cannot count as a verified approval. Automated tests use synthetic readings and provider doubles; they do not establish real labelled sample accuracy.
 
 ### Combined mileage photos
 
@@ -152,4 +175,4 @@ A rejected application can change modes. Switching to single requires a new comb
 
 `POST /api/v1/admin/mileage/applications/:id/reject` requires `{ reviewVersion, rejectionReason }`. The reason is trimmed and must contain 1–150 characters. It is stored in the existing `rejection_reason` column and returned to the driver's detail view. Replaying the same version and reason preserves the decision timestamp; a different reason returns `409 MILEAGE_REVIEW_CONFLICT`. Existing historical reasons remain unchanged. Deploy the administrator form and API together; older clients that omit the reason receive a validation error. No database migration is required.
 
-Database v11 adds the mode and a second Luna reservation timestamp, preserving existing applications as separate. Start the updated server to apply the migration. Configure `OPENAI_API_KEY`, `MILEAGE_OCR_ENABLED=true` and an approved positive `MILEAGE_OCR_LUNA_DAILY_LIMIT` to enable new OCR jobs. Automatic approval remains independently gated; timezone policy is unchanged. The benchmark performs one pass only; the production worker handles mirrored correction.
+The PostgreSQL baseline includes the photo mode and second Luna reservation timestamp. Apply the explicit database migration before starting the updated server. Configure `OPENAI_API_KEY`, `MILEAGE_OCR_ENABLED=true` and an approved positive `MILEAGE_OCR_LUNA_DAILY_LIMIT` to enable new OCR jobs. Automatic approval remains independently gated. The benchmark performs one pass only; the production worker handles mirrored correction.

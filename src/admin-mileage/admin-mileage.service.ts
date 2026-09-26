@@ -41,8 +41,8 @@ export class AdminMileageService {
     private readonly auth: AdminAuthRepository,
   ) {}
 
-  list(query: AdminMileageQueryDto): AdminMileageResponseDto[] {
-    const rows = this.records(query);
+  async list(query: AdminMileageQueryDto): Promise<AdminMileageResponseDto[]> {
+    const rows = await this.records(query);
     const name = query.nameQuery?.toLocaleLowerCase('ko-KR');
     // ponytail: existing admin tables load all matching rows; add pagination when measured volume requires it.
     return name
@@ -50,13 +50,19 @@ export class AdminMileageService {
       : rows;
   }
 
-  detail(id: string): AdminMileageResponseDto {
-    const row = this.records({}, id)[0];
+  async detail(
+    id: string,
+    database: Pick<DatabaseService['db'], 'select'> = this.database.db,
+  ): Promise<AdminMileageResponseDto> {
+    const row = (await this.records({}, id, database))[0];
     if (!row) throw this.notFound();
     return row;
   }
 
-  reject(id: string, input: RejectAdminMileageDto): AdminMileageResponseDto {
+  async reject(
+    id: string,
+    input: RejectAdminMileageDto,
+  ): Promise<AdminMileageResponseDto> {
     return this.review(id, input, {
       approvalStatus: 'rejected',
       rejectionReason: input.rejectionReason,
@@ -65,7 +71,10 @@ export class AdminMileageService {
     });
   }
 
-  approve(id: string, input: ApproveAdminMileageDto): AdminMileageResponseDto {
+  async approve(
+    id: string,
+    input: ApproveAdminMileageDto,
+  ): Promise<AdminMileageResponseDto> {
     const mileageAmount = mileageFromLiters(`${input.liters} L`);
     if (mileageAmount === null) {
       throw new BadRequestException({
@@ -81,7 +90,7 @@ export class AdminMileageService {
     });
   }
 
-  private review(
+  private async review(
     id: string,
     input: Pick<RejectAdminMileageDto, 'reviewVersion'>,
     decision: {
@@ -90,52 +99,52 @@ export class AdminMileageService {
       finalAmount: number | null;
       mileageAmount: number | null;
     },
-  ): AdminMileageResponseDto {
-    return this.database.db.transaction(
-      (tx) => {
-        const current = this.detail(id);
-        if (
-          current.settlementId !== null ||
-          current.reviewVersion !== input.reviewVersion
-        ) {
-          throw this.conflict();
-        }
-        // A lost response can be retried without rewriting the decision or its timestamp.
-        if (
-          current.status === decision.approvalStatus &&
-          current.rejectionReason === decision.rejectionReason &&
-          current.finalAmount === decision.finalAmount &&
-          current.mileageAmount === decision.mileageAmount
+  ): Promise<AdminMileageResponseDto> {
+    const retained = await this.database.db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT ${applications.id} FROM ${applications} WHERE ${applications.id} = ${id} FOR UPDATE`,
+      );
+      const current = await this.detail(id, tx);
+      if (
+        current.settlementId !== null ||
+        current.reviewVersion !== input.reviewVersion
+      ) {
+        throw this.conflict();
+      }
+      // A lost response can be retried without rewriting the decision or its timestamp.
+      if (
+        current.status === decision.approvalStatus &&
+        current.rejectionReason === decision.rejectionReason &&
+        current.finalAmount === decision.finalAmount &&
+        current.mileageAmount === decision.mileageAmount
+      )
+        return current;
+      if (current.status !== 'pending') throw this.conflict();
+      if (
+        decision.approvalStatus === 'approved' &&
+        (!current.photos.receipt || !current.photos.meter)
+      )
+        throw this.conflict();
+      const now = new Date().toISOString();
+      const changed = await tx
+        .update(applications)
+        .set({
+          ...decision,
+          decidedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(applications.id, id),
+            eq(applications.approvalStatus, 'pending'),
+            isNull(applications.settlementId),
+          ),
         )
-          return current;
-        if (current.status !== 'pending') throw this.conflict();
-        if (
-          decision.approvalStatus === 'approved' &&
-          (!current.photos.receipt || !current.photos.meter)
-        )
-          throw this.conflict();
-        const now = new Date().toISOString();
-        const changed = tx
-          .update(applications)
-          .set({
-            ...decision,
-            decidedAt: now,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(applications.id, id),
-              eq(applications.approvalStatus, 'pending'),
-              isNull(applications.settlementId),
-            ),
-          )
-          .returning({ id: applications.id })
-          .get();
-        if (!changed) throw this.conflict();
-        return this.detail(id);
-      },
-      { behavior: 'immediate' },
-    );
+        .returning({ id: applications.id });
+      if (!changed.length) throw this.conflict();
+      return null;
+    });
+    return retained ?? this.detail(id);
   }
 
   private conflict() {
@@ -151,157 +160,151 @@ export class AdminMileageService {
     kind: string,
   ): Promise<Buffer> {
     if (kind !== 'receipt' && kind !== 'meter') throw this.notFound();
-    const find = () =>
-      this.database.db
-        .select({ id: photos.id, key: photos.storageKey })
-        .from(photos)
-        .innerJoin(
-          applications,
-          eq(photos.mileageApplicationId, applications.id),
-        )
-        .where(
-          and(
-            eq(applications.id, id),
-            sql`${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE ${kind} END`,
-          ),
-        )
-        .get();
-    const photo = find();
+    const find = async () =>
+      (
+        await this.database.db
+          .select({ id: photos.id, key: photos.storageKey })
+          .from(photos)
+          .innerJoin(
+            applications,
+            eq(photos.mileageApplicationId, applications.id),
+          )
+          .where(
+            and(
+              eq(applications.id, id),
+              sql`${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE ${kind} END`,
+            ),
+          )
+          .limit(1)
+      )[0];
+    const photo = await find();
     if (!photo) throw this.notFound();
     const content = await this.storage.get(photo.key);
-    const currentAdmin = this.auth.findSession(session.tokenHash);
+    const currentAdmin = await this.auth.findSession(session.tokenHash);
     if (!currentAdmin || currentAdmin.id !== session.user.id) {
       throw new UnauthorizedException({
         code: 'INVALID_ADMIN_SESSION',
         message: '관리자 로그인이 필요합니다.',
       });
     }
-    const current = find();
+    const current = await find();
     if (!current || current.id !== photo.id || current.key !== photo.key)
       throw this.notFound();
     return content;
   }
 
-  private records(
+  private async records(
     query: AdminMileageQueryDto,
     id?: string,
-  ): AdminMileageResponseDto[] {
-    return this.database.db
-      .select({
-        id: applications.id,
-        requestHash: applications.requestHash,
-        idempotencyKey: applications.idempotencyKey,
-        userId: applications.userId,
-        logisticsCompanyId: applications.logisticsCompanyId,
-        logisticsCompanyName: logisticsCompanies.businessName,
-        name: users.name,
-        phone: users.phone,
-        receiptAmount: applications.receiptAmount,
-        meterAmount: applications.meterAmount,
-        finalAmount: applications.finalAmount,
-        mileageAmount: applications.mileageAmount,
-        receiptAt: applications.receiptAt,
-        matchStatus: applications.matchStatus,
-        status: applications.approvalStatus,
-        rejectionReason: applications.rejectionReason,
-        submittedAt: applications.submittedAt,
-        decidedAt: applications.decidedAt,
-        settlementId: applications.settlementId,
-        // Late OCR after a rejection of unread photos is not applied to the application.
-        ocrEvidence: sql<
-          string | null
-        >`(SELECT json_array(${ocrJobs.sourceVersion}, ${ocrJobs.extractorVersion}, ${ocrJobs.result}, ${ocrJobs.errorCode})
+    database: Pick<DatabaseService['db'], 'select'> = this.database.db,
+  ): Promise<AdminMileageResponseDto[]> {
+    return (
+      await database
+        .select({
+          id: applications.id,
+          requestHash: applications.requestHash,
+          idempotencyKey: applications.idempotencyKey,
+          userId: applications.userId,
+          logisticsCompanyId: applications.logisticsCompanyId,
+          logisticsCompanyName: logisticsCompanies.businessName,
+          name: users.name,
+          phone: users.phone,
+          receiptAmount: applications.receiptAmount,
+          meterAmount: applications.meterAmount,
+          finalAmount: applications.finalAmount,
+          mileageAmount: applications.mileageAmount,
+          receiptAt: applications.receiptAt,
+          matchStatus: applications.matchStatus,
+          status: applications.approvalStatus,
+          rejectionReason: applications.rejectionReason,
+          submittedAt: applications.submittedAt,
+          decidedAt: applications.decidedAt,
+          settlementId: applications.settlementId,
+          // Late OCR after a rejection of unread photos is not applied to the application.
+          ocrEvidence: sql<unknown>`(SELECT jsonb_build_array(${ocrJobs.sourceVersion}, ${ocrJobs.extractorVersion}, ${ocrJobs.result}, ${ocrJobs.errorCode})
           FROM ${ocrJobs} WHERE ${ocrJobs.applicationId} = ${applications.id}
           AND ${ocrJobs.extractorVersion} = ${OCR_VERSION} AND ${ocrJobs.status} = 'completed'
           AND ${applications.matchStatus} <> 'pending'
           AND ${ocrJobs.sourceVersion} = COALESCE((SELECT ${resubmissions.submissionVersion} FROM ${resubmissions}
             WHERE ${resubmissions.applicationId} = ${applications.id} ORDER BY ${resubmissions.id} DESC LIMIT 1), ${ocrJobs.sourceVersion}) LIMIT 1)`,
-        receiptPhotoIdentity: sql<
-          string | null
-        >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = 'receipt')`,
-        meterPhotoIdentity: sql<
-          string | null
-        >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE 'meter' END)`,
-      })
-      .from(applications)
-      .innerJoin(users, eq(applications.userId, users.id))
-      .innerJoin(
-        logisticsCompanies,
-        eq(applications.logisticsCompanyId, logisticsCompanies.id),
-      )
-      .where(
-        and(
-          id ? eq(applications.id, id) : undefined,
-          query.logisticsCompanyId
-            ? eq(applications.logisticsCompanyId, query.logisticsCompanyId)
-            : undefined,
-        ),
-      )
-      .orderBy(
-        desc(sql`julianday(${applications.submittedAt})`),
-        desc(applications.id),
-      )
-      .all()
-      .map(
-        ({
-          receiptPhotoIdentity,
-          meterPhotoIdentity,
-          requestHash,
-          idempotencyKey,
-          ocrEvidence,
-          ...row
-        }) => {
-          for (const amount of [
-            row.receiptAmount,
-            row.meterAmount,
-            row.finalAmount,
-            row.mileageAmount,
-          ]) {
-            if (
-              amount !== null &&
-              (!Number.isSafeInteger(amount) || amount < 0)
-            )
-              throw new InternalServerErrorException();
-          }
-          // Uploads use immutable, unique storage keys. Re-registration must replace the
-          // changed photo and submission identity atomically before returning to pending.
-          const reviewVersion = createHash('sha256')
-            .update(
-              JSON.stringify([
-                row.id,
-                row.userId,
-                row.logisticsCompanyId,
-                idempotencyKey,
-                requestHash,
-                row.submittedAt,
-                row.receiptAmount,
-                row.meterAmount,
-                row.receiptAt,
-                row.matchStatus,
-                receiptPhotoIdentity,
-                meterPhotoIdentity,
-                ocrEvidence,
-              ]),
-            )
-            .digest('hex');
-          const base = `/api/v1/admin/mileage/applications/${row.id}/photos`;
-          return {
-            ...row,
-            reviewVersion,
-            submittedAt: iso(row.submittedAt),
-            decidedAt: row.decidedAt ? iso(row.decidedAt) : null,
-            receiptAt: row.receiptAt ? iso(row.receiptAt) : null,
-            finalAmount: row.status === 'approved' ? row.finalAmount : null,
-            mileageAmount: row.status === 'approved' ? row.mileageAmount : null,
-            rejectionReason:
-              row.status === 'rejected' ? row.rejectionReason : null,
-            photos: {
-              receipt: receiptPhotoIdentity ? `${base}/receipt` : null,
-              meter: meterPhotoIdentity ? `${base}/meter` : null,
-            },
-          };
-        },
-      );
+          receiptPhotoIdentity: sql<unknown>`(SELECT jsonb_build_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = 'receipt')`,
+          meterPhotoIdentity: sql<unknown>`(SELECT jsonb_build_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE 'meter' END)`,
+        })
+        .from(applications)
+        .innerJoin(users, eq(applications.userId, users.id))
+        .innerJoin(
+          logisticsCompanies,
+          eq(applications.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            id ? eq(applications.id, id) : undefined,
+            query.logisticsCompanyId
+              ? eq(applications.logisticsCompanyId, query.logisticsCompanyId)
+              : undefined,
+          ),
+        )
+        .orderBy(
+          desc(sql`(${applications.submittedAt})::timestamptz`),
+          desc(applications.id),
+        )
+    ).map(
+      ({
+        receiptPhotoIdentity,
+        meterPhotoIdentity,
+        requestHash,
+        idempotencyKey,
+        ocrEvidence,
+        ...row
+      }) => {
+        for (const amount of [
+          row.receiptAmount,
+          row.meterAmount,
+          row.finalAmount,
+          row.mileageAmount,
+        ]) {
+          if (amount !== null && (!Number.isSafeInteger(amount) || amount < 0))
+            throw new InternalServerErrorException();
+        }
+        // Uploads use immutable, unique storage keys. Re-registration must replace the
+        // changed photo and submission identity atomically before returning to pending.
+        const reviewVersion = createHash('sha256')
+          .update(
+            JSON.stringify([
+              row.id,
+              row.userId,
+              row.logisticsCompanyId,
+              idempotencyKey,
+              requestHash,
+              row.submittedAt,
+              row.receiptAmount,
+              row.meterAmount,
+              row.receiptAt,
+              row.matchStatus,
+              receiptPhotoIdentity,
+              meterPhotoIdentity,
+              ocrEvidence,
+            ]),
+          )
+          .digest('hex');
+        const base = `/api/v1/admin/mileage/applications/${row.id}/photos`;
+        return {
+          ...row,
+          reviewVersion,
+          submittedAt: iso(row.submittedAt),
+          decidedAt: row.decidedAt ? iso(row.decidedAt) : null,
+          receiptAt: row.receiptAt ? iso(row.receiptAt) : null,
+          finalAmount: row.status === 'approved' ? row.finalAmount : null,
+          mileageAmount: row.status === 'approved' ? row.mileageAmount : null,
+          rejectionReason:
+            row.status === 'rejected' ? row.rejectionReason : null,
+          photos: {
+            receipt: receiptPhotoIdentity ? `${base}/receipt` : null,
+            meter: meterPhotoIdentity ? `${base}/meter` : null,
+          },
+        };
+      },
+    );
   }
 
   private notFound() {

@@ -193,11 +193,11 @@ export class AuthController {
     description: 'INTERNAL_SERVER_ERROR',
     type: ApiErrorResponseDto,
   })
-  logout(
+  async logout(
     @Req() request: AuthenticatedRequest,
     @Res({ passthrough: true }) response: Response,
-  ): void {
-    this.authService.logout(request.authSession.tokenHash);
+  ): Promise<void> {
+    await this.authService.logout(request.authSession.tokenHash);
     if (request.authMethod === 'cookie') clearWebSession(response);
   }
 
@@ -282,8 +282,10 @@ export class AuthController {
     description: 'INTERNAL_SERVER_ERROR',
     type: ApiErrorResponseDto,
   })
-  validatePasswordReset(@Body() input: ValidatePasswordResetRequestDto): void {
-    this.authService.validatePasswordReset(input.token);
+  validatePasswordReset(
+    @Body() input: ValidatePasswordResetRequestDto,
+  ): Promise<void> {
+    return this.authService.validatePasswordReset(input.token);
   }
 
   @Post('reset-password')
@@ -418,7 +420,7 @@ export class AuthController {
     description: 'INTERNAL_SERVER_ERROR',
     type: ApiErrorResponseDto,
   })
-  findEmail(@Body() input: FindEmailRequestDto): FindEmailResponseDto {
+  findEmail(@Body() input: FindEmailRequestDto): Promise<FindEmailResponseDto> {
     return this.authService.findEmail(input);
   }
 
@@ -443,7 +445,7 @@ export class AuthController {
   confirmPhoneVerification(
     @Param() params: PhoneVerificationParamsDto,
     @Body() input: ConfirmPhoneVerificationRequestDto,
-  ): ConfirmPhoneVerificationResponseDto {
+  ): Promise<ConfirmPhoneVerificationResponseDto> {
     return this.authService.confirmPhoneVerification(
       params.verificationId,
       input.code,
@@ -550,7 +552,7 @@ export class AuthController {
     @Req() request: AuthenticatedRequest,
     @Param() params: PhoneVerificationParamsDto,
     @Body() input: ConfirmPhoneChangeVerificationDto,
-  ): ConfirmPhoneVerificationResponseDto {
+  ): Promise<ConfirmPhoneVerificationResponseDto> {
     return this.authService.confirmPhoneVerification(
       params.verificationId,
       input.code,
@@ -593,7 +595,7 @@ export class AuthController {
   changePhone(
     @Req() request: AuthenticatedRequest,
     @Body() input: ChangePhoneRequestDto,
-  ): void {
-    this.authService.changePhone(request.authSession, input);
+  ): Promise<void> {
+    return this.authService.changePhone(request.authSession, input);
   }
 }

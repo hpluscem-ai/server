@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { INestApplication, Logger } from '@nestjs/common';
 import type { OpenAPIObject } from '@nestjs/swagger';
+import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { DatabaseService } from '../src/database/database.service';
@@ -23,46 +24,40 @@ describe('Admin driver list (e2e)', () => {
     app = await createTestApp();
     database = app.get(DatabaseService);
   });
-  beforeEach(() => {
-    database.db.delete(users).run();
-    database.db.delete(logisticsCompanies).run();
-    authorization = seedAdminSession(database);
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
+    authorization = await seedAdminSession(database);
     companyId = randomUUID();
     userId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1234-5678',
-        bankCode: '19',
-        accountNumber: '12345',
-        accountHolder: '물류사',
-        active: false,
-      })
-      .run();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: 'driver@example.com',
-        name: 'ÉLODIE 기사',
-        passwordHash: 'private-hash',
-        phone: '010-8888-9999',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-        createdAt: '2026-09-07 15:00:00',
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '12345',
+      accountHolder: '물류사',
+      active: false,
+    });
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: 'driver@example.com',
+      name: 'ÉLODIE 기사',
+      passwordHash: 'private-hash',
+      phone: '010-8888-9999',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+      createdAt: '2026-09-07 15:00:00',
+    });
   });
   afterEach(() => jest.restoreAllMocks());
-  afterAll(async () => app.close());
+  afterAll(async () => app?.close());
   function list(query: object = {}, auth = authorization) {
     return request(app.getHttpServer())
       .get(PATH)
@@ -82,7 +77,7 @@ describe('Admin driver list (e2e)', () => {
           name: 'ÉLODIE 기사',
           phone: '010-8888-9999',
           email: 'driver@example.com',
-          joinedAt: '2026-09-07T15:00:00Z',
+          joinedAt: '2026-09-07T15:00:00.000Z',
         },
       ]);
   });
@@ -149,34 +144,32 @@ describe('Admin driver list (e2e)', () => {
     await list({}, '').expect(401);
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      userId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 600000),
+    });
     await list({}, `Bearer ${token}`).expect(401);
   });
   it('does not expose deactivated users or privileged account fields', async () => {
-    database.connection.exec(
-      "UPDATE users SET deactivated_at = CURRENT_TIMESTAMP WHERE role = 'driver'",
-    );
+    await database.db
+      .update(users)
+      .set({ deactivatedAt: '2026-09-01 00:00:00' })
+      .where(eq(users.role, 'driver'));
     await list().expect(200).expect([]);
   });
   it('propagates DB failure instead of returning an empty list', async () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      'ALTER TABLE logistics_companies RENAME TO unavailable_companies',
+    await database.connection.unsafe(
+      'ALTER TABLE app.logistics_companies RENAME TO unavailable_companies',
     );
     try {
       await list().expect(500);
     } finally {
-      database.connection.exec(
-        'ALTER TABLE unavailable_companies RENAME TO logistics_companies',
+      await database.connection.unsafe(
+        'ALTER TABLE app.unavailable_companies RENAME TO logistics_companies',
       );
     }
   });

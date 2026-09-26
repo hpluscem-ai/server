@@ -106,12 +106,12 @@ export class SettlementsController {
   })
   @ApiProduces('application/vnd.ms-excel')
   @ApiOkResponse({ schema: { type: 'string', format: 'binary' } })
-  export(
+  async export(
     @Query() query: MonthQuery,
     @Req() request: AdminAuthenticatedRequest,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const bytes = this.service.export(
+    const bytes = await this.service.export(
       query.month,
       request.adminSession.user.id,
     );

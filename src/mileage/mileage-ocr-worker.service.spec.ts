@@ -1,6 +1,6 @@
 import sharp from 'sharp';
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { eq, or } from 'drizzle-orm';
 import { DatabaseService } from '../database/database.service';
 import {
   logisticsCompanies,
@@ -22,6 +22,7 @@ import {
 } from './mileage-ocr.service';
 import { MileageOcrWorkerService } from './mileage-ocr-worker.service';
 import { PhotoStorageService } from './photo-storage.service';
+import { createTestDatabase } from '../../test/helpers/create-test-database';
 
 describe('MileageOcrWorkerService', () => {
   let database: DatabaseService;
@@ -34,42 +35,35 @@ describe('MileageOcrWorkerService', () => {
   const userId = randomUUID();
   const companyId = randomUUID();
 
-  beforeEach(() => {
+  beforeEach(async () => {
     delete process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
-    process.env.DATABASE_PATH = ':memory:';
     process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT = '10';
     process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = '10';
-    database = new DatabaseService();
+    database = await createTestDatabase();
     repository = new MileageRepository(database);
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '테스트',
-        businessNumber: randomUUID(),
-        corporateRegistrationNumber: randomUUID(),
-        businessAddress: '주소',
-        managerName: '담당자',
-        managerPhone: '010',
-        bankCode: '19',
-        accountNumber: '123',
-        accountHolder: '테스트',
-      })
-      .run();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: 'ocr@example.com',
-        name: '기사',
-        phone: '010-1111-2222',
-        logisticsCompanyId: companyId,
-        passwordHash: 'test-hash',
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '테스트',
+      businessNumber: randomUUID(),
+      corporateRegistrationNumber: randomUUID(),
+      businessAddress: '주소',
+      managerName: '담당자',
+      managerPhone: '010',
+      bankCode: '19',
+      accountNumber: '123',
+      accountHolder: '테스트',
+    });
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: 'ocr@example.com',
+      name: '기사',
+      phone: '010-1111-2222',
+      logisticsCompanyId: companyId,
+      passwordHash: 'test-hash',
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     ocr = new MileageOcrService();
     jest.spyOn(ocr, 'isConfigured').mockReturnValue(true);
     receiptCall = jest
@@ -115,22 +109,24 @@ describe('MileageOcrWorkerService', () => {
       get: jest.fn().mockResolvedValue(Buffer.from('private photo')),
     } as unknown as PhotoStorageService;
     worker = new MileageOcrWorkerService(repository, ocr, storage);
-    applicationId = createApplication();
+    applicationId = await createApplication();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     delete process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
-    database.onModuleDestroy();
-    delete process.env.DATABASE_PATH;
+    jest.useRealTimers();
+    if (database) await database.onModuleDestroy();
     delete process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT;
     delete process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT;
-    jest.useRealTimers();
     jest.restoreAllMocks();
   });
 
-  function createApplication(requestHash = 'a'.repeat(64), ownerId = userId) {
+  async function createApplication(
+    requestHash = 'a'.repeat(64),
+    ownerId = userId,
+  ) {
     const id = randomUUID();
-    repository.commit({
+    await repository.commit({
       id,
       userId: ownerId,
       logisticsCompanyId: companyId,
@@ -179,7 +175,7 @@ describe('MileageOcrWorkerService', () => {
         }));
       await worker.processOne();
       expect(call).toHaveBeenCalledTimes(limit);
-      const job = database.db.select().from(mileageOcrJobs).get()!;
+      const job = (await database.db.select().from(mileageOcrJobs).limit(1))[0];
       expect(job.lunaReservedAt).toBeTruthy();
       expect(Boolean(job.lunaRetryReservedAt)).toBe(limit === 2);
       expect(job.clovaReservedAt).toBeNull();
@@ -190,23 +186,21 @@ describe('MileageOcrWorkerService', () => {
         expect(call.mock.calls[1][0][0]).not.toBe(image);
         expect(call.mock.calls[1][0][1]).toBe(image);
       }
-      createApplication('c'.repeat(64));
+      await createApplication('c'.repeat(64));
       await worker.processOne();
       expect(call).toHaveBeenCalledTimes(limit);
     },
   );
 
   it('sends a single combined image once and retains unknown outcomes without paid retry', async () => {
-    database.db
+    await database.db
       .delete(mileagePhotos)
-      .where(eq(mileagePhotos.kind, 'meter'))
-      .run();
-    database.db.update(mileageApplications).set({ photoMode: 'single' }).run();
-    const row = repository.findOne(userId, applicationId)!;
-    database.db
+      .where(eq(mileagePhotos.kind, 'meter'));
+    await database.db.update(mileageApplications).set({ photoMode: 'single' });
+    const row = (await repository.findOne(userId, applicationId))!;
+    await database.db
       .update(mileageOcrJobs)
-      .set({ sourceVersion: repository.submissionVersion(row) })
-      .run();
+      .set({ sourceVersion: repository.submissionVersion(row) });
     const call = jest
       .spyOn(ocr, 'readApplication')
       .mockRejectedValue(new Error('timeout'));
@@ -214,30 +208,36 @@ describe('MileageOcrWorkerService', () => {
     expect(call).toHaveBeenCalledTimes(1);
     expect(call.mock.calls[0][0]).toHaveLength(1);
     expect(
-      database.db.select().from(mileageOcrJobs).get()?.lunaRetryReservedAt,
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0]
+        ?.lunaRetryReservedAt,
     ).toBeNull();
     expect(
-      database.db.select().from(mileageApplications).get()?.approvalStatus,
+      (await database.db.select().from(mileageApplications).limit(1))[0]
+        ?.approvalStatus,
     ).toBe('pending');
   });
 
   it('records both readings but keeps matched applications pending', async () => {
     expect(await worker.processOne()).toBe(true);
-    const application = database.db
-      .select()
-      .from(mileageApplications)
-      .where(eq(mileageApplications.id, applicationId))
-      .get()!;
+    const application = (
+      await database.db
+        .select()
+        .from(mileageApplications)
+        .where(eq(mileageApplications.id, applicationId))
+        .limit(1)
+    )[0];
     expect(application).toMatchObject({
       receiptAmount: 11700,
       meterAmount: 11700,
-      receiptAt: null,
+      receiptAt: '2026-09-23T03:34:56.000Z',
       matchStatus: 'matched',
       approvalStatus: 'pending',
       finalAmount: null,
       mileageAmount: null,
     });
-    expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0],
+    ).toMatchObject({
       status: 'completed',
       lunaInputTokens: 1000,
       lunaOutputTokens: 50,
@@ -250,13 +250,17 @@ describe('MileageOcrWorkerService', () => {
   it('does not use a failed receipt reading as proof of a match', async () => {
     receiptCall.mockRejectedValue(new Error('offline'));
     await worker.processOne();
-    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toMatchObject({
       receiptAmount: null,
       meterAmount: null,
       matchStatus: 'ocr_failed',
       approvalStatus: 'pending',
     });
-    expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0],
+    ).toMatchObject({
       status: 'failed',
       errorCode: 'LUNA_FAILED',
     });
@@ -286,7 +290,9 @@ describe('MileageOcrWorkerService', () => {
       durationMs: 1,
     });
     await worker.processOne();
-    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toMatchObject({
       receiptAmount: 12650,
       meterAmount: 7356,
       matchStatus: 'mismatched',
@@ -298,20 +304,20 @@ describe('MileageOcrWorkerService', () => {
     'discards an obsolete %s before paying providers',
     async (change) => {
       if (change === 'extractor')
-        database.db
+        await database.db
           .update(mileageOcrJobs)
-          .set({ extractorVersion: 'old-reader' })
-          .run();
+          .set({ extractorVersion: 'old-reader' });
       else
-        database.db
+        await database.db
           .update(mileagePhotos)
           .set({
             storageKey: 'mileage/replaced/receipt.jpg',
           })
-          .where(eq(mileagePhotos.kind, 'receipt'))
-          .run();
+          .where(eq(mileagePhotos.kind, 'receipt'));
       await worker.processOne();
-      expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
+      expect(
+        (await database.db.select().from(mileageOcrJobs).limit(1))[0],
+      ).toMatchObject({
         status: 'failed',
         errorCode: 'STALE_SOURCE',
       });
@@ -323,27 +329,26 @@ describe('MileageOcrWorkerService', () => {
   it('reserves each provider once and stops at the daily call limit', async () => {
     process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT = '1';
     process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = '1';
-    createApplication('b'.repeat(64));
+    await createApplication('b'.repeat(64));
     await worker.processOne();
     await worker.processOne();
     expect(receiptCall).toHaveBeenCalledTimes(1);
     expect(meterCall).toHaveBeenCalledTimes(1);
     expect(
-      database.db
-        .select()
-        .from(mileageOcrJobs)
-        .all()
+      (await database.db.select().from(mileageOcrJobs))
         .map((job) => job.status)
         .sort(),
     ).toEqual(['completed', 'failed']);
   });
 
   it('keeps an interrupted running call unknown instead of recharging it', async () => {
-    const job = repository.claimOcrJob()!;
-    expect(repository.reserveOcrCall(job.id, 10)).toBe(true);
-    repository.interruptRunningOcrJobs();
+    const job = (await repository.claimOcrJob())!;
+    expect(await repository.reserveOcrCall(job.id, 10)).toBe(true);
+    await repository.interruptRunningOcrJobs();
     expect(await worker.processOne()).toBe(false);
-    expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0],
+    ).toMatchObject({
       status: 'unknown',
       errorCode: 'INTERRUPTED',
     });
@@ -351,17 +356,16 @@ describe('MileageOcrWorkerService', () => {
   });
 
   it('does not overwrite an administrator decision completed during OCR', async () => {
-    meterCall.mockImplementation(() => {
-      database.db
+    meterCall.mockImplementation(async () => {
+      await database.db
         .update(mileageApplications)
         .set({
           approvalStatus: 'rejected',
           rejectionReason: '사진 재확인',
           decidedAt: new Date().toISOString(),
         })
-        .where(eq(mileageApplications.id, applicationId))
-        .run();
-      return Promise.resolve({
+        .where(eq(mileageApplications.id, applicationId));
+      return {
         reading: {
           amountText: '11700',
           litersText: '11.000 L',
@@ -369,10 +373,12 @@ describe('MileageOcrWorkerService', () => {
           issues: [],
         },
         durationMs: 1,
-      });
+      };
     });
     await worker.processOne();
-    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+    expect(
+      (await database.db.select().from(mileageApplications).limit(1))[0],
+    ).toMatchObject({
       approvalStatus: 'rejected',
       rejectionReason: '사진 재확인',
       receiptAmount: null,
@@ -383,16 +389,15 @@ describe('MileageOcrWorkerService', () => {
 
   it('compares current submissions instead of retained creation hashes or old OCR readings', async () => {
     await worker.processOne();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({ approvalStatus: 'rejected', decidedAt: new Date().toISOString() })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
-    const current = repository.findOne(userId, applicationId)!;
+      .where(eq(mileageApplications.id, applicationId));
+    const current = (await repository.findOne(userId, applicationId))!;
     const oldReceipt = current.photos.find(
       (photo) => photo.kind === 'receipt',
     )!;
-    repository.commitResubmission({
+    await repository.commitResubmission({
       id: applicationId,
       userId,
       attemptId: randomUUID(),
@@ -421,15 +426,33 @@ describe('MileageOcrWorkerService', () => {
       },
       durationMs: 1,
     });
-    receiptCall.mockResolvedValue(reading('2026-09-24', '11700'));
+    receiptCall.mockResolvedValue(reading('2026-09-24', '12000'));
+    meterCall.mockResolvedValue({
+      reading: {
+        amountText: '12000',
+        litersText: '11 L',
+        unitPriceText: null,
+        issues: [],
+      },
+      durationMs: 1,
+    });
     await worker.processOne();
-    const differentHash = createApplication('b'.repeat(64));
+    const differentHash = await createApplication('b'.repeat(64));
     receiptCall.mockResolvedValue(reading('2026-09-23', '11700'));
+    meterCall.mockResolvedValue({
+      reading: {
+        amountText: '11700',
+        litersText: '11 L',
+        unitPriceText: null,
+        issues: [],
+      },
+      durationMs: 1,
+    });
     await worker.processOne();
-    expect(repository.findOne(userId, differentHash)?.matchStatus).toBe(
+    expect((await repository.findOne(userId, differentHash))?.matchStatus).toBe(
       'matched',
     );
-    const retainedHash = createApplication('a'.repeat(64));
+    const retainedHash = await createApplication('a'.repeat(64));
     receiptCall.mockResolvedValue(reading('2026-09-25', '25000'));
     meterCall.mockResolvedValue({
       reading: {
@@ -441,34 +464,38 @@ describe('MileageOcrWorkerService', () => {
       durationMs: 1,
     });
     await worker.processOne();
-    expect(repository.findOne(userId, retainedHash)?.matchStatus).toBe(
+    expect((await repository.findOne(userId, retainedHash))?.matchStatus).toBe(
       'matched',
     );
   });
 
   it('flags the same photo pair submitted again as a duplicate', async () => {
-    const second = createApplication();
+    const second = await createApplication();
     await worker.processOne();
     await worker.processOne();
     expect(
-      database.db
-        .select()
-        .from(mileageApplications)
-        .where(eq(mileageApplications.id, second))
-        .get()?.matchStatus,
+      (
+        await database.db
+          .select()
+          .from(mileageApplications)
+          .where(eq(mileageApplications.id, second))
+          .limit(1)
+      )[0]?.matchStatus,
     ).toBe('duplicate_suspected');
   });
 
   it('flags different photos with matching totals and printed transaction time', async () => {
     await worker.processOne();
-    const second = createApplication('b'.repeat(64));
+    const second = await createApplication('b'.repeat(64));
     await worker.processOne();
     expect(
-      database.db
-        .select()
-        .from(mileageApplications)
-        .where(eq(mileageApplications.id, second))
-        .get()?.matchStatus,
+      (
+        await database.db
+          .select()
+          .from(mileageApplications)
+          .where(eq(mileageApplications.id, second))
+          .limit(1)
+      )[0]?.matchStatus,
     ).toBe('duplicate_suspected');
   });
 
@@ -496,18 +523,22 @@ describe('MileageOcrWorkerService', () => {
     lunaInputTokens: 10,
     lunaOutputTokens: 10,
   });
-  function application() {
-    return database.db
-      .select()
-      .from(mileageApplications)
-      .where(eq(mileageApplications.id, applicationId))
-      .get()!;
+  async function application() {
+    return (
+      await database.db
+        .select()
+        .from(mileageApplications)
+        .where(eq(mileageApplications.id, applicationId))
+        .limit(1)
+    )[0];
   }
-  function balance() {
-    return new SettlementsService(
-      database,
-      new AdminAuthRepository(database),
-    ).balance(userId).accumulatedMileage;
+  async function balance() {
+    return (
+      await new SettlementsService(
+        database,
+        new AdminAuthRepository(database),
+      ).balance(userId)
+    ).accumulatedMileage;
   }
   function review() {
     return new AdminMileageService(
@@ -519,12 +550,12 @@ describe('MileageOcrWorkerService', () => {
 
   it('approves atomically, exposes the balance once and rejects the old review version', async () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const before = review().detail(applicationId);
+    const before = await review().detail(applicationId);
     const result = validResult();
     receiptCall.mockResolvedValue({ reading: result.receipt!, durationMs: 1 });
     meterCall.mockResolvedValue({ reading: result.meter!, durationMs: 1 });
     await worker.processOne();
-    const decided = application();
+    const decided = await application();
     expect(decided).toMatchObject({
       approvalStatus: 'approved',
       finalAmount: 11700,
@@ -532,22 +563,38 @@ describe('MileageOcrWorkerService', () => {
       receiptAt: '2026-09-23T03:34:56.000Z',
     });
     expect(decided.decidedAt).not.toBeNull();
-    expect(balance()).toBe(220);
-    const job = database.db.select().from(mileageOcrJobs).get()!;
+    expect(await balance()).toBe(220);
+    const job = (await database.db.select().from(mileageOcrJobs).limit(1))[0];
     expect(job.status).toBe('completed');
-    jest.useFakeTimers({ now: new Date('2030-01-01T00:00:00.000Z') });
+    jest.useFakeTimers({
+      now: new Date('2030-01-01T00:00:00.000Z'),
+      doNotFake: [
+        'hrtime',
+        'nextTick',
+        'performance',
+        'queueMicrotask',
+        'setImmediate',
+        'clearImmediate',
+        'setInterval',
+        'clearInterval',
+        'setTimeout',
+        'clearTimeout',
+      ],
+    });
     const replay = validResult();
     replay.meter!.litersText = '99 L';
-    repository.finishOcrJob(job, replay);
-    expect(application()).toEqual(decided);
-    expect(database.db.select().from(mileageOcrJobs).get()).toEqual(job);
-    expect(balance()).toBe(220);
-    expect(() =>
+    await repository.finishOcrJob(job, replay);
+    expect(await application()).toEqual(decided);
+    expect(
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0],
+    ).toEqual(job);
+    expect(await balance()).toBe(220);
+    await expect(
       review().reject(applicationId, {
         rejectionReason: '금액 불일치',
         reviewVersion: before.reviewVersion,
       }),
-    ).toThrow();
+    ).rejects.toThrow();
     expect(await worker.processOne()).toBe(false);
     expect(receiptCall).toHaveBeenCalledTimes(1);
     expect(meterCall).toHaveBeenCalledTimes(1);
@@ -555,12 +602,12 @@ describe('MileageOcrWorkerService', () => {
 
   it.each(['false', 'TRUE', '', undefined])(
     'leaves approvals disabled for %s without retroactively approving completed jobs',
-    (flag) => {
+    async (flag) => {
       if (flag !== undefined)
         process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = flag;
-      const job = repository.claimOcrJob()!;
-      repository.finishOcrJob(job, validResult());
-      const before = application();
+      const job = (await repository.claimOcrJob())!;
+      await repository.finishOcrJob(job, validResult());
+      const before = await application();
       expect(before).toMatchObject({
         approvalStatus: 'pending',
         finalAmount: null,
@@ -568,21 +615,16 @@ describe('MileageOcrWorkerService', () => {
         decidedAt: null,
       });
       process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-      repository.finishOcrJob(job, validResult());
-      expect(application()).toEqual(before);
-      expect(balance()).toBe(0);
+      await repository.finishOcrJob(job, validResult());
+      expect(await application()).toEqual(before);
+      expect(await balance()).toBe(0);
     },
   );
 
   it.each([
-    'time',
-    'seconds',
-    'timezone',
-    'calendar',
     'mismatch',
-    'receiptIssue',
-    'meterIssue',
-    'cancel',
+    'receiptAmount',
+    'meterAmount',
     'liters',
     'receiptMissing',
     'meterMissing',
@@ -590,18 +632,12 @@ describe('MileageOcrWorkerService', () => {
     'lunaError',
     'emptyError',
     'jobError',
-  ])('keeps %s evidence pending', (kind) => {
+  ])('keeps %s evidence pending', async (kind) => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
     const result = validResult();
-    if (kind === 'time') result.receipt!.transactionTimeText = null;
-    if (kind === 'seconds') result.receipt!.transactionTimeText = '12:34+09:00';
-    if (kind === 'timezone') result.receipt!.transactionTimeText = '12:34:56';
-    if (kind === 'calendar') result.receipt!.transactionDateText = '2026-02-30';
     if (kind === 'mismatch') result.meter!.amountText = '12000';
-    if (kind === 'receiptIssue')
-      result.receipt!.issues = ['REPRINTED_DOCUMENT'];
-    if (kind === 'meterIssue') result.meter!.issues = ['unclear'];
-    if (kind === 'cancel') result.receipt!.documentKind = 'cancel';
+    if (kind === 'receiptAmount') result.receipt!.amountText = null;
+    if (kind === 'meterAmount') result.meter!.amountText = null;
     if (kind === 'liters') result.meter!.litersText = '11';
     if (kind === 'receiptMissing') result.receipt = null;
     if (kind === 'meterMissing') result.meter = null;
@@ -611,35 +647,158 @@ describe('MileageOcrWorkerService', () => {
       result.clovaError = '';
       result.lunaError = 'LUNA_FAILED';
     }
-    repository.finishOcrJob(
-      repository.claimOcrJob()!,
+    await repository.finishOcrJob(
+      (await repository.claimOcrJob())!,
       result,
       kind === 'jobError' ? 'PHOTO_READ_FAILED' : undefined,
     );
-    expect(application()).toMatchObject({
+    expect(await application()).toMatchObject({
       approvalStatus: 'pending',
       finalAmount: null,
       mileageAmount: null,
       decidedAt: null,
     });
-    expect(balance()).toBe(0);
+    expect(await balance()).toBe(0);
+  });
+
+  it.each(['sale', 'cancel', 'mixed', 'unknown'] as const)(
+    'approves matching readable amounts despite %s metadata, reprints or absent transaction time',
+    async (documentKind) => {
+      process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+      const result = validResult();
+      Object.assign(result.receipt!, {
+        documentKind,
+        reprinted: null,
+        transactionTimeText: null,
+        issues: [
+          'REPRINT_UNCLEAR',
+          '영수증 하단이 잘려 재발행 표시를 확인할 수 없음',
+        ],
+      });
+      result.meter!.issues = ['단가 표시 없음'];
+      await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+      expect(await application()).toMatchObject({
+        approvalStatus: 'approved',
+        matchStatus: 'matched',
+        finalAmount: 11700,
+        mileageAmount: 220,
+        receiptAt: null,
+      });
+      expect(await balance()).toBe(220);
+    },
+  );
+
+  it('uses only the same driver’s immediately previous current OCR result for the amount-only duplicate rule', async () => {
+    process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+    jest.useFakeTimers({
+      now: new Date('2026-09-26T00:00:00Z'),
+      doNotFake: [
+        'hrtime',
+        'nextTick',
+        'performance',
+        'queueMicrotask',
+        'setImmediate',
+        'clearImmediate',
+        'setInterval',
+        'clearInterval',
+        'setTimeout',
+        'clearTimeout',
+      ],
+    });
+    const finish = async (
+      hash: string,
+      amount: string,
+      time: string,
+      owner = userId,
+    ) => {
+      jest.advanceTimersByTime(1000);
+      const id = await createApplication(hash.repeat(64), owner);
+      const result = validResult();
+      result.receipt!.amountText = result.meter!.amountText = amount;
+      result.receipt!.transactionTimeText = time;
+      await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+      return (await repository.findOne(owner, id))!;
+    };
+    await repository.finishOcrJob(
+      (await repository.claimOcrJob())!,
+      validResult(),
+    );
+    expect((await finish('b', '11700', '13:00:00')).matchStatus).toBe(
+      'duplicate_suspected',
+    );
+    expect((await finish('c', '11701', '14:00:00')).approvalStatus).toBe(
+      'approved',
+    );
+    expect((await finish('d', '11700', '15:00:00')).approvalStatus).toBe(
+      'approved',
+    );
+
+    const otherUser = randomUUID();
+    await database.db.insert(users).values({
+      ...(await database.db.select().from(users).limit(1))[0],
+      id: otherUser,
+      email: 'other@example.com',
+      phone: '010-9999-9999',
+    });
+    expect(
+      (await finish('e', '11700', '16:00:00', otherUser)).approvalStatus,
+    ).toBe('approved');
+    // Another driver's intervening result must not hide this driver's previous total.
+    expect((await finish('f', '11700', '17:00:00')).matchStatus).toBe(
+      'duplicate_suspected',
+    );
+
+    jest.advanceTimersByTime(1000);
+    await createApplication('1'.repeat(64));
+    const failed = validResult();
+    failed.receipt = failed.meter = null;
+    await repository.finishOcrJob(
+      (await repository.claimOcrJob())!,
+      failed,
+      'LUNA_FAILED',
+    );
+    expect((await finish('2', '11700', '18:00:00')).approvalStatus).toBe(
+      'approved',
+    );
+  });
+
+  it('uses completed-result order when the same driver has two OCR jobs in flight', async () => {
+    process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+    const first = (await repository.claimOcrJob())!;
+    const secondId = await createApplication('b'.repeat(64));
+    const second = (await repository.claimOcrJob())!;
+    const result = validResult();
+    result.receipt!.transactionTimeText = '13:00:00';
+    await repository.finishOcrJob(second, result);
+    await repository.finishOcrJob(first, validResult());
+    expect((await repository.findOne(userId, secondId))?.approvalStatus).toBe(
+      'approved',
+    );
+    expect(await application()).toMatchObject({
+      approvalStatus: 'pending',
+      matchStatus: 'duplicate_suspected',
+    });
+    expect(await balance()).toBe(220);
   });
 
   it.each([
     ['0.025 L', 1],
     ['0.024 L', 0],
-  ] as const)('stores exact rounded mileage for %s', (liters, expected) => {
-    process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const result = validResult();
-    result.meter!.litersText = liters;
-    repository.finishOcrJob(repository.claimOcrJob()!, result);
-    expect(application()).toMatchObject({
-      approvalStatus: 'approved',
-      finalAmount: 11700,
-      mileageAmount: expected,
-    });
-    expect(balance()).toBe(expected);
-  });
+  ] as const)(
+    'stores exact rounded mileage for %s',
+    async (liters, expected) => {
+      process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+      const result = validResult();
+      result.meter!.litersText = liters;
+      await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+      expect(await application()).toMatchObject({
+        approvalStatus: 'approved',
+        finalAmount: 11700,
+        mileageAmount: expected,
+      });
+      expect(await balance()).toBe(expected);
+    },
+  );
 
   it.each([
     'rejected',
@@ -650,16 +809,16 @@ describe('MileageOcrWorkerService', () => {
     'extractor',
     'jobVersion',
     'jobIdentity',
-  ])('does not alter a decision or obsolete %s result', (kind) => {
+  ])('does not alter a decision or obsolete %s result', async (kind) => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const job = repository.claimOcrJob()!;
+    const job = (await repository.claimOcrJob())!;
     if (kind === 'rejected')
-      review().reject(applicationId, {
+      await review().reject(applicationId, {
         rejectionReason: '금액 불일치',
-        reviewVersion: review().detail(applicationId).reviewVersion,
+        reviewVersion: (await review().detail(applicationId)).reviewVersion,
       });
     if (kind === 'approved')
-      database.db
+      await database.db
         .update(mileageApplications)
         .set({
           approvalStatus: 'approved',
@@ -667,19 +826,15 @@ describe('MileageOcrWorkerService', () => {
           mileageAmount: 123,
           decidedAt: '2026-01-01T00:00:00.000Z',
         })
-        .where(eq(mileageApplications.id, applicationId))
-        .run();
+        .where(eq(mileageApplications.id, applicationId));
     if (kind === 'settled') {
-      database.db
-        .insert(settlements)
-        .values({
-          id: 'snapshot',
-          logisticsCompanyId: companyId,
-          settlementMonth: '2026-09',
-          transferStatus: 'pending',
-        })
-        .run();
-      database.db
+      await database.db.insert(settlements).values({
+        id: 'snapshot',
+        logisticsCompanyId: companyId,
+        settlementMonth: '2026-09',
+        transferStatus: 'pending',
+      });
+      await database.db
         .update(mileageApplications)
         .set({
           settlementId: 'snapshot',
@@ -688,46 +843,41 @@ describe('MileageOcrWorkerService', () => {
           mileageAmount: 123,
           decidedAt: '2026-01-01T00:00:00.000Z',
         })
-        .where(eq(mileageApplications.id, applicationId))
-        .run();
+        .where(eq(mileageApplications.id, applicationId));
     }
     if (kind === 'photo')
-      database.db
+      await database.db
         .update(mileagePhotos)
         .set({ storageKey: 'replaced' })
-        .where(eq(mileagePhotos.kind, 'meter'))
-        .run();
+        .where(eq(mileagePhotos.kind, 'meter'));
     if (kind === 'deletedPhoto')
-      database.db
+      await database.db
         .delete(mileagePhotos)
-        .where(eq(mileagePhotos.kind, 'meter'))
-        .run();
+        .where(eq(mileagePhotos.kind, 'meter'));
     if (kind === 'extractor')
-      database.db
+      await database.db
         .update(mileageOcrJobs)
         .set({ extractorVersion: 'old-reader' })
-        .where(eq(mileageOcrJobs.id, job.id))
-        .run();
+        .where(eq(mileageOcrJobs.id, job.id));
     if (kind === 'jobVersion')
-      database.db
+      await database.db
         .update(mileageOcrJobs)
         .set({ sourceVersion: 'f'.repeat(64) })
-        .where(eq(mileageOcrJobs.id, job.id))
-        .run();
+        .where(eq(mileageOcrJobs.id, job.id));
     if (kind === 'jobIdentity') job.applicationId = randomUUID();
-    const before = application();
-    repository.finishOcrJob(job, validResult());
-    expect(application()).toEqual(before);
+    const before = await application();
+    await repository.finishOcrJob(job, validResult());
+    expect(await application()).toEqual(before);
   });
 
-  it('ignores a late result after resubmission and only applies the current job once', () => {
+  it('ignores a late result after resubmission and only applies the current job once', async () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const oldJob = repository.claimOcrJob()!;
-    review().reject(applicationId, {
+    const oldJob = (await repository.claimOcrJob())!;
+    await review().reject(applicationId, {
       rejectionReason: '금액 불일치',
-      reviewVersion: review().detail(applicationId).reviewVersion,
+      reviewVersion: (await review().detail(applicationId)).reviewVersion,
     });
-    const current = repository.findOne(userId, applicationId)!;
+    const current = (await repository.findOne(userId, applicationId))!;
     const input = {
       id: applicationId,
       userId,
@@ -744,105 +894,158 @@ describe('MileageOcrWorkerService', () => {
         },
       ],
     };
-    repository.commitResubmission(input);
-    const before = application();
-    repository.finishOcrJob(oldJob, validResult());
-    expect(application()).toEqual(before);
-    const job = repository.claimOcrJob()!;
-    repository.finishOcrJob(job, validResult());
-    expect(balance()).toBe(220);
-    const approved = application();
-    expect(repository.commitResubmission(input).committed).toBe(false);
-    repository.finishOcrJob(oldJob, validResult());
-    repository.finishOcrJob(job, validResult());
-    expect(application()).toEqual(approved);
-    expect(balance()).toBe(220);
+    await repository.commitResubmission(input);
+    const before = await application();
+    await repository.finishOcrJob(oldJob, validResult());
+    expect(await application()).toEqual(before);
+    const job = (await repository.claimOcrJob())!;
+    await repository.finishOcrJob(job, validResult());
+    expect(await balance()).toBe(220);
+    const approved = await application();
+    expect((await repository.commitResubmission(input)).committed).toBe(false);
+    await repository.finishOcrJob(oldJob, validResult());
+    await repository.finishOcrJob(job, validResult());
+    expect(await application()).toEqual(approved);
+    expect(await balance()).toBe(220);
   });
 
-  it('serializes two in-flight duplicate submissions across users and retains withdrawn history', () => {
+  it('serializes concurrent cross-driver duplicate completions', async () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const first = repository.claimOcrJob()!;
     const secondUser = randomUUID();
-    database.db
-      .insert(users)
-      .values({
-        ...database.db.select().from(users).get()!,
-        id: secondUser,
-        email: 'second@example.com',
-        phone: '010-9999-9999',
+    await database.db.insert(users).values({
+      ...(await database.db.select().from(users).limit(1))[0],
+      id: secondUser,
+      email: 'concurrent@example.com',
+      phone: '010-7777-8888',
+    });
+    const first = (await repository.claimOcrJob())!;
+    const secondId = await createApplication('b'.repeat(64), secondUser);
+    const second = (await repository.claimOcrJob())!;
+
+    await Promise.all([
+      repository.finishOcrJob(first, validResult()),
+      repository.finishOcrJob(second, validResult()),
+    ]);
+
+    const rows = await database.db
+      .select({
+        id: mileageApplications.id,
+        approvalStatus: mileageApplications.approvalStatus,
+        matchStatus: mileageApplications.matchStatus,
       })
-      .run();
-    const secondId = createApplication('b'.repeat(64), secondUser);
-    const second = repository.claimOcrJob()!;
-    repository.finishOcrJob(first, validResult());
-    database.db
+      .from(mileageApplications)
+      .where(
+        or(
+          eq(mileageApplications.id, applicationId),
+          eq(mileageApplications.id, secondId),
+        ),
+      );
+    expect(
+      rows.filter((row) => row.approvalStatus === 'approved'),
+    ).toHaveLength(1);
+    expect(
+      rows.filter((row) => row.matchStatus === 'duplicate_suspected'),
+    ).toHaveLength(1);
+  });
+
+  it('serializes two in-flight duplicate submissions across users and retains withdrawn history', async () => {
+    process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+    const first = (await repository.claimOcrJob())!;
+    const secondUser = randomUUID();
+    await database.db.insert(users).values({
+      ...(await database.db.select().from(users).limit(1))[0],
+      id: secondUser,
+      email: 'second@example.com',
+      phone: '010-9999-9999',
+    });
+    const secondId = await createApplication('b'.repeat(64), secondUser);
+    const second = (await repository.claimOcrJob())!;
+    await repository.finishOcrJob(first, validResult());
+    await database.db
       .update(users)
       .set({ deactivatedAt: new Date().toISOString(), passwordHash: null })
-      .where(eq(users.id, userId))
-      .run();
+      .where(eq(users.id, userId));
     const result = validResult();
     result.receipt!.transactionDateText = '2026/9/23';
     result.receipt!.transactionTimeText = '03:34:56Z';
-    repository.finishOcrJob(second, result);
-    expect(application().approvalStatus).toBe('approved');
+    await repository.finishOcrJob(second, result);
+    expect((await application()).approvalStatus).toBe('approved');
     expect(
-      database.db
-        .select()
-        .from(mileageApplications)
-        .where(eq(mileageApplications.id, secondId))
-        .get(),
+      (
+        await database.db
+          .select()
+          .from(mileageApplications)
+          .where(eq(mileageApplications.id, secondId))
+          .limit(1)
+      )[0],
     ).toMatchObject({
       approvalStatus: 'pending',
       matchStatus: 'duplicate_suspected',
       mileageAmount: null,
     });
-    expect(balance()).toBe(220);
+    expect(await balance()).toBe(220);
   });
 
-  it('normalizes old current evidence without re-reading or approving that completed job', () => {
-    const first = repository.claimOcrJob()!;
+  it('normalizes old current evidence without re-reading or approving that completed job', async () => {
+    const first = (await repository.claimOcrJob())!;
     const oldResult = validResult();
     oldResult.receipt!.transactionDateText = '2026/9/23';
-    repository.finishOcrJob(first, oldResult);
-    database.db
+    await repository.finishOcrJob(first, oldResult);
+    await database.db
       .update(mileageOcrJobs)
       .set({ extractorVersion: 'clova-general-v2+luna-meter-v1' })
-      .where(eq(mileageOcrJobs.id, first.id))
-      .run();
-    database.db
+      .where(eq(mileageOcrJobs.id, first.id));
+    await database.db
       .update(mileageApplications)
       .set({ receiptAt: null })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
-    const secondId = createApplication('b'.repeat(64));
+      .where(eq(mileageApplications.id, applicationId));
+    const secondId = await createApplication('b'.repeat(64));
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    repository.finishOcrJob(repository.claimOcrJob()!, validResult());
+    await repository.finishOcrJob(
+      (await repository.claimOcrJob())!,
+      validResult(),
+    );
     expect(
-      database.db
-        .select()
-        .from(mileageApplications)
-        .where(eq(mileageApplications.id, secondId))
-        .get(),
+      (
+        await database.db
+          .select()
+          .from(mileageApplications)
+          .where(eq(mileageApplications.id, secondId))
+          .limit(1)
+      )[0],
     ).toMatchObject({
       approvalStatus: 'pending',
       matchStatus: 'duplicate_suspected',
     });
-    expect(application().approvalStatus).toBe('pending');
-    expect(balance()).toBe(0);
+    expect((await application()).approvalStatus).toBe('pending');
+    expect(await balance()).toBe(0);
   });
 
-  it('rolls back approval, evidence and job completion together on a write failure', () => {
+  it('rolls back approval, evidence and job completion together on a write failure', async () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
-    const job = repository.claimOcrJob()!;
-    database.connection.exec(
-      "CREATE TRIGGER fail_ocr BEFORE UPDATE ON mileage_ocr_jobs BEGIN SELECT RAISE(ABORT, 'failure'); END",
+    const job = (await repository.claimOcrJob())!;
+    await database.connection.unsafe(
+      `CREATE FUNCTION app.fail_ocr() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'failure'; END;
+       $$;
+       CREATE TRIGGER fail_ocr BEFORE UPDATE ON app.mileage_ocr_jobs
+       FOR EACH ROW EXECUTE FUNCTION app.fail_ocr();`,
     );
-    const before = application();
-    expect(() => repository.finishOcrJob(job, validResult())).toThrow();
-    expect(application()).toEqual(before);
-    expect(database.db.select().from(mileageOcrJobs).get()!.status).toBe(
-      'running',
+    const before = await application();
+    let error: unknown;
+    try {
+      await repository.finishOcrJob(job, validResult());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as { cause?: { message?: string } }).cause?.message).toBe(
+      'failure',
     );
-    expect(balance()).toBe(0);
+    expect(await application()).toEqual(before);
+    expect(
+      (await database.db.select().from(mileageOcrJobs).limit(1))[0].status,
+    ).toBe('running');
+    expect(await balance()).toBe(0);
   });
 });

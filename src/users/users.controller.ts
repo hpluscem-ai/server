@@ -59,7 +59,9 @@ export class UsersController {
       '기사 세션의 본인 이메일·성함·연락처·마케팅 동의만 반환합니다. 요청에서 사용자 식별자를 받지 않습니다.',
   })
   @ApiOkResponse({ type: DriverProfileResponseDto })
-  findProfile(@Req() request: AuthenticatedRequest): DriverProfileResponseDto {
+  findProfile(
+    @Req() request: AuthenticatedRequest,
+  ): Promise<DriverProfileResponseDto> {
     return this.users.findProfile(request.authSession.user.id);
   }
 
@@ -84,10 +86,11 @@ export class UsersController {
   withdraw(
     @Req() request: AuthenticatedRequest,
     @Res({ passthrough: true }) response: Response,
-  ): void {
-    this.users.withdrawDriver(request.authSession.user.id);
-    // 저장 실패 시 재시도할 수 있도록 트랜잭션 성공 뒤에만 쿠키를 지운다.
-    if (request.authMethod === 'cookie') clearWebSession(response);
+  ): Promise<void> {
+    return this.users.withdrawDriver(request.authSession.user.id).then(() => {
+      // 저장 실패 시 재시도할 수 있도록 트랜잭션 성공 뒤에만 쿠키를 지운다.
+      if (request.authMethod === 'cookie') clearWebSession(response);
+    });
   }
 
   @Patch('me')
@@ -108,7 +111,7 @@ export class UsersController {
   updateProfile(
     @Req() request: AuthenticatedRequest,
     @Body() input: UpdateDriverProfileDto,
-  ): DriverProfileResponseDto {
+  ): Promise<DriverProfileResponseDto> {
     return this.users.updateProfile(request.authSession.user.id, input);
   }
 }

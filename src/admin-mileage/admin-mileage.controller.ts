@@ -69,7 +69,9 @@ export class AdminMileageController {
       '신청 시각·ID 최신순. 이름과 신청 소속으로 검색합니다. 탈퇴 기사·비활성 물류사·정산 완료 이력을 포함합니다. 미확정 금액은 null이며 OCR·심사 결과를 생성하지 않습니다. 현재 관리자 목록과 같이 페이지 처리 없이 반환합니다.',
   })
   @ApiOkResponse({ type: AdminMileageResponseDto, isArray: true })
-  list(@Query() query: AdminMileageQueryDto): AdminMileageResponseDto[] {
+  async list(
+    @Query() query: AdminMileageQueryDto,
+  ): Promise<AdminMileageResponseDto[]> {
     return this.mileage.list(query);
   }
 
@@ -85,9 +87,9 @@ export class AdminMileageController {
     type: ApiErrorResponseDto,
     description: 'MILEAGE_APPLICATION_NOT_FOUND',
   })
-  detail(
+  async detail(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): AdminMileageResponseDto {
+  ): Promise<AdminMileageResponseDto> {
     return this.mileage.detail(id);
   }
 
@@ -112,10 +114,10 @@ export class AdminMileageController {
     type: ApiErrorResponseDto,
     description: 'MILEAGE_APPLICATION_NOT_FOUND',
   })
-  approve(
+  async approve(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
     @Body() body: ApproveAdminMileageDto,
-  ): AdminMileageResponseDto {
+  ): Promise<AdminMileageResponseDto> {
     return this.mileage.approve(id, body);
   }
 
@@ -140,10 +142,10 @@ export class AdminMileageController {
     type: ApiErrorResponseDto,
     description: 'MILEAGE_APPLICATION_NOT_FOUND',
   })
-  reject(
+  async reject(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
     @Body() body: RejectAdminMileageDto,
-  ): AdminMileageResponseDto {
+  ): Promise<AdminMileageResponseDto> {
     return this.mileage.reject(id, body);
   }
 

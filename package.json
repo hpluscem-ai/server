@@ -11,6 +11,8 @@
   "scripts": {
     "build": "nest build",
     "db": "drizzle-kit studio",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node --env-file-if-exists=.env -r ts-node/register src/database/migrate.ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
@@ -35,6 +37,7 @@
     "class-validator": "^0.14.4",
     "drizzle-orm": "1.0.0-rc.4",
     "multer": "^2.4.0",
+    "postgres": "3.4.7",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "sharp": "^0.35.4",

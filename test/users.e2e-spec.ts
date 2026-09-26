@@ -31,75 +31,74 @@ describe('Current driver profile (e2e)', () => {
     passwordHash = await argon2.hash('Password!1', { type: argon2.argon2id });
   });
 
-  beforeEach(() => {
-    database.db.delete(users).run();
-    database.db.delete(logisticsCompanies).run();
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
     companyId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1234-5678',
-        bankCode: '19',
-        accountNumber: '123456',
-        accountHolder: '물류사',
-      })
-      .run();
-    userId = seedDriver('010-1234-5678');
-    token = seedSession(userId);
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '123456',
+      accountHolder: '물류사',
+    });
+    userId = await seedDriver('010-1234-5678');
+    token = await seedSession(userId);
   });
 
-  afterEach(() => {
-    database.connection.exec('DROP TRIGGER IF EXISTS fail_profile_update');
+  afterEach(async () => {
+    if (database)
+      await database.connection.unsafe(
+        'DROP TRIGGER IF EXISTS fail_profile_update ON app.users; DROP FUNCTION IF EXISTS app.fail_profile_update();',
+      );
     jest.restoreAllMocks();
   });
 
   afterAll(async () => {
-    await app.close();
+    await app?.close();
   });
 
-  function seedDriver(phone: string) {
+  async function seedDriver(phone: string) {
     const id = randomUUID();
-    database.db
-      .insert(users)
-      .values({
-        id,
-        role: 'driver',
-        email: `${id}@example.com`,
-        passwordHash,
-        name: '김기사',
-        phone,
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(users).values({
+      id,
+      role: 'driver',
+      email: `${id}@example.com`,
+      passwordHash,
+      name: '김기사',
+      phone,
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     return id;
   }
 
-  function seedSession(forUserId: string) {
+  async function seedSession(forUserId: string) {
     const value = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(value).digest('hex'),
-        userId: forUserId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 30 * 86400000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(value).digest('hex'),
+      userId: forUserId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 30 * 86400000),
+    });
     return value;
   }
 
-  function storedUser(id = userId) {
-    return database.db.select().from(users).where(eq(users.id, id)).get();
+  async function storedUser(id = userId) {
+    const [user] = await database.db
+      .select()
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
+    return user;
   }
 
   function read(authToken = token) {
@@ -132,13 +131,12 @@ describe('Current driver profile (e2e)', () => {
   });
 
   it('saves both editable fields, trims the name, and preserves other data and sessions', async () => {
-    const before = storedUser();
-    database.db
+    const before = await storedUser();
+    await database.db
       .update(users)
       .set({ updatedAt: '2000-01-01 00:00:00' })
-      .where(eq(users.id, userId))
-      .run();
-    seedSession(userId);
+      .where(eq(users.id, userId));
+    await seedSession(userId);
     await update({ name: '  이 기사  ', marketingConsent: true })
       .expect(200)
       .expect('Cache-Control', 'no-store')
@@ -148,14 +146,14 @@ describe('Current driver profile (e2e)', () => {
         phone: '010-1234-5678',
         marketingConsent: true,
       });
-    expect(storedUser()).toEqual({
+    expect(await storedUser()).toEqual({
       ...before,
       name: '이 기사',
       marketingConsent: true,
       updatedAt: expect.any(String) as unknown,
     });
-    expect(storedUser()?.updatedAt).not.toBe('2000-01-01 00:00:00');
-    expect(database.db.select().from(authSessions).all()).toHaveLength(2);
+    expect((await storedUser())?.updatedAt).not.toBe('2000-01-01 00:00:00');
+    expect(await database.db.select().from(authSessions)).toHaveLength(2);
     await request(app.getHttpServer())
       .get('/api/v1/auth/me')
       .set('Authorization', `Bearer ${token}`)
@@ -171,12 +169,12 @@ describe('Current driver profile (e2e)', () => {
   it('changes only supplied fields and accepts false without erasing the name', async () => {
     await update({ marketingConsent: true }).expect(200);
     await update({ name: '새기사' }).expect(200);
-    expect(storedUser()).toMatchObject({
+    expect(await storedUser()).toMatchObject({
       name: '새기사',
       marketingConsent: true,
     });
     await update({ marketingConsent: false }).expect(200);
-    expect(storedUser()).toMatchObject({
+    expect(await storedUser()).toMatchObject({
       name: '새기사',
       marketingConsent: false,
     });
@@ -188,15 +186,15 @@ describe('Current driver profile (e2e)', () => {
       update({ marketingConsent: true }).expect(200),
     ]);
     await update({ name: '새기사' }).expect(200);
-    expect(storedUser()).toMatchObject({
+    expect(await storedUser()).toMatchObject({
       name: '새기사',
       marketingConsent: true,
     });
   });
 
   it('cannot read or modify another driver through query parameters', async () => {
-    const otherId = seedDriver('010-9999-8888');
-    const other = storedUser(otherId);
+    const otherId = await seedDriver('010-9999-8888');
+    const other = await storedUser(otherId);
     await read()
       .query({ userId: otherId })
       .expect(200)
@@ -204,7 +202,7 @@ describe('Current driver profile (e2e)', () => {
         expect(body).toMatchObject({ email: `${userId}@example.com` }),
       );
     await update({ name: '변경기사' }).query({ userId: otherId }).expect(200);
-    expect(storedUser(otherId)).toEqual(other);
+    expect(await storedUser(otherId)).toEqual(other);
   });
 
   it.each([
@@ -226,13 +224,13 @@ describe('Current driver profile (e2e)', () => {
   ])(
     'rejects invalid or protected fields without any update: %p',
     async (input) => {
-      const before = storedUser();
+      const before = await storedUser();
       await update(input)
         .expect(400)
         .expect(({ body }: { body: unknown }) =>
           expect(body).toMatchObject({ code: 'VALIDATION_ERROR' }),
         );
-      expect(storedUser()).toEqual(before);
+      expect(await storedUser()).toEqual(before);
     },
   );
 
@@ -272,52 +270,48 @@ describe('Current driver profile (e2e)', () => {
     'rejects %s sessions on both operations without changing profile data',
     async (state) => {
       if (state === 'expired')
-        database.db
-          .update(authSessions)
-          .set({
-            createdAt: new Date(Date.now() - 86400000),
-            lastUsedAt: new Date(Date.now() - 86400000),
-            expiresAt: new Date(Date.now() - 1),
-          })
-          .run();
+        await database.db.update(authSessions).set({
+          createdAt: new Date(Date.now() - 86400000),
+          lastUsedAt: new Date(Date.now() - 86400000),
+          expiresAt: new Date(Date.now() - 1),
+        });
       if (state === 'idle')
-        database.db
-          .update(authSessions)
-          .set({
-            createdAt: new Date(Date.now() - 8 * 86400000),
-            lastUsedAt: new Date(Date.now() - 8 * 86400000),
-          })
-          .run();
-      if (state === 'revoked') database.db.delete(authSessions).run();
+        await database.db.update(authSessions).set({
+          createdAt: new Date(Date.now() - 8 * 86400000),
+          lastUsedAt: new Date(Date.now() - 8 * 86400000),
+        });
+      if (state === 'revoked') await database.db.delete(authSessions);
       if (state === 'driver-inactive')
-        database.db
+        await database.db
           .update(users)
           .set({ deactivatedAt: '2026-09-01 00:00:00' })
-          .where(eq(users.id, userId))
-          .run();
+          .where(eq(users.id, userId));
       if (state === 'company-inactive')
-        database.db.update(logisticsCompanies).set({ active: false }).run();
+        await database.db.update(logisticsCompanies).set({ active: false });
       if (state === 'admin')
-        database.db
+        await database.db
           .update(users)
           .set({ role: 'admin' })
-          .where(eq(users.id, userId))
-          .run();
-      const before = storedUser();
+          .where(eq(users.id, userId));
+      const before = await storedUser();
       await update({ name: '기사' }).expect(401);
       await read().expect(401);
-      expect(storedUser()).toEqual(before);
+      expect(await storedUser()).toEqual(before);
     },
   );
 
-  it('rolls back both changes on an actual SQLite write failure and does not expose data', async () => {
+  it('rolls back both changes on a database write failure and does not expose data', async () => {
     const log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
-    const before = storedUser();
-    database.connection
-      .exec(`CREATE TRIGGER fail_profile_update AFTER UPDATE OF name, marketing_consent ON users
-      BEGIN SELECT RAISE(ABORT, 'private-database-error'); END;`);
+    const before = await storedUser();
+    await database.connection.unsafe(`
+      CREATE FUNCTION app.fail_profile_update() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'private-database-error'; END;
+      $$;
+      CREATE TRIGGER fail_profile_update AFTER UPDATE OF name, marketing_consent ON app.users
+      FOR EACH ROW EXECUTE FUNCTION app.fail_profile_update();
+    `);
     await update({ name: '변경기사', marketingConsent: true })
       .expect(500)
       .expect(({ body }: { body: unknown }) => {
@@ -326,7 +320,7 @@ describe('Current driver profile (e2e)', () => {
           /private-database-error|변경기사|password_hash/,
         );
       });
-    expect(storedUser()).toEqual(before);
+    expect(await storedUser()).toEqual(before);
     expect(log).toHaveBeenCalled();
     expect(JSON.stringify(log.mock.calls)).not.toMatch(
       /private-database-error|변경기사|password_hash/,

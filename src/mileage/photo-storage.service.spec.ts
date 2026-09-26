@@ -17,18 +17,21 @@ jest.mock('@aws-sdk/client-s3', () => ({
 describe('PhotoStorageService', () => {
   let storage: PhotoStorageService;
   const names = [
-    'R2_ACCOUNT_ID',
-    'R2_BUCKET_NAME',
-    'R2_ACCESS_KEY_ID',
-    'R2_SECRET_ACCESS_KEY',
+    'SUPABASE_S3_ENDPOINT',
+    'SUPABASE_S3_REGION',
+    'SUPABASE_STORAGE_BUCKET',
+    'SUPABASE_S3_ACCESS_KEY_ID',
+    'SUPABASE_S3_SECRET_ACCESS_KEY',
   ];
   let previous: (string | undefined)[];
   beforeEach(() => {
     previous = names.map((name) => process.env[name]);
-    process.env.R2_ACCOUNT_ID = 'a'.repeat(32);
-    process.env.R2_BUCKET_NAME = 'isolated-test-bucket';
-    process.env.R2_ACCESS_KEY_ID = 'isolated-test-key';
-    process.env.R2_SECRET_ACCESS_KEY = 'isolated-test-secret';
+    process.env.SUPABASE_S3_ENDPOINT =
+      'https://isolated-test.storage.supabase.co/storage/v1/s3';
+    process.env.SUPABASE_S3_REGION = 'ap-northeast-2';
+    process.env.SUPABASE_STORAGE_BUCKET = 'isolated-test-bucket';
+    process.env.SUPABASE_S3_ACCESS_KEY_ID = 'isolated-test-key';
+    process.env.SUPABASE_S3_SECRET_ACCESS_KEY = 'isolated-test-secret';
     mockSend.mockReset();
     mockDestroy.mockReset();
     jest.mocked(S3Client).mockClear();
@@ -42,11 +45,59 @@ describe('PhotoStorageService', () => {
     });
   });
   it('fails closed when storage configuration is absent', async () => {
-    delete process.env.R2_ACCOUNT_ID;
+    delete process.env.SUPABASE_S3_ENDPOINT;
     await expect(storage.get('private-photo')).rejects.toMatchObject({
       response: { code: 'PHOTO_STORAGE_UNAVAILABLE' },
     });
     expect(S3Client).not.toHaveBeenCalled();
+  });
+  it('uses the Supabase S3 endpoint, region and path-style private bucket access', () => {
+    storage.ensureConfigured();
+    expect(S3Client).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'https://isolated-test.storage.supabase.co/storage/v1/s3',
+        region: 'ap-northeast-2',
+        forcePathStyle: true,
+        credentials: {
+          accessKeyId: 'isolated-test-key',
+          secretAccessKey: 'isolated-test-secret',
+        },
+        maxAttempts: 1,
+      }),
+    );
+  });
+  it.each([
+    'not-a-url',
+    'http://remote.example.com/storage/v1/s3',
+    'https://user:secret@example.com/storage/v1/s3',
+    'https://example.com/storage/v1/s3?token=secret',
+  ])('rejects an invalid or insecure S3 endpoint: %s', (endpoint) => {
+    process.env.SUPABASE_S3_ENDPOINT = endpoint;
+    expect(() => storage.ensureConfigured()).toThrow();
+    expect(S3Client).not.toHaveBeenCalled();
+  });
+  it('supports the documented local Supabase endpoint', () => {
+    process.env.SUPABASE_S3_ENDPOINT = 'http://127.0.0.1:54321/storage/v1/s3';
+    process.env.SUPABASE_S3_REGION = 'local';
+    storage.ensureConfigured();
+    expect(S3Client).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'http://127.0.0.1:54321/storage/v1/s3',
+        region: 'local',
+        forcePathStyle: true,
+      }),
+    );
+  });
+  it('rejects unencrypted storage even on loopback in production', () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    process.env.SUPABASE_S3_ENDPOINT = 'http://127.0.0.1:54321/storage/v1/s3';
+    try {
+      expect(() => storage.ensureConfigured()).toThrow();
+      expect(S3Client).not.toHaveBeenCalled();
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
   });
   it('returns the actual bytes and destroys the response stream', async () => {
     const body = Readable.from([Buffer.from('one'), Buffer.from('two')]);

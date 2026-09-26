@@ -151,11 +151,11 @@ export class AdminAuthController {
     type: ApiErrorResponseDto,
     description: 'INVALID_ADMIN_SESSION',
   })
-  logout(
+  async logout(
     @Req() request: AdminAuthenticatedRequest,
     @Res({ passthrough: true }) response: Response,
-  ): void {
-    this.auth.logout(request.adminSession.tokenHash);
+  ): Promise<void> {
+    await this.auth.logout(request.adminSession.tokenHash);
     if (request.authMethod === 'cookie')
       clearWebSession(response, ADMIN_WEB_SESSION_COOKIE, '/api/v1/admin');
   }

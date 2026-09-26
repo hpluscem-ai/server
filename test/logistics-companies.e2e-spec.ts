@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { INestApplication } from '@nestjs/common';
+import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 
 import { DatabaseService } from '../src/database/database.service';
+import { logisticsCompanies, users } from '../src/database/schema';
 import { createTestApp } from './helpers/create-test-app';
 import { seedAdminSession } from './helpers/seed-admin-session';
 
@@ -59,8 +61,12 @@ function expectCompanyResponse(
   expect(company.id).toMatch(
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
   );
-  expect(company.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
-  expect(company.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  expect(company.createdAt).toMatch(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+  );
+  expect(company.updatedAt).toMatch(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+  );
 }
 
 describe('Logistics companies (e2e)', () => {
@@ -73,13 +79,13 @@ describe('Logistics companies (e2e)', () => {
     database = app.get(DatabaseService);
   });
 
-  beforeEach(() => {
-    database.connection.exec('DELETE FROM users');
-    database.connection.exec('DELETE FROM logistics_companies');
-    adminAuthorization = seedAdminSession(database);
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
+    adminAuthorization = await seedAdminSession(database);
   });
 
-  function seedCompany(
+  async function seedCompany(
     overrides: Partial<typeof companyInput> & {
       active?: boolean;
       id?: string;
@@ -92,35 +98,7 @@ describe('Logistics companies (e2e)', () => {
       id: overrides.id ?? randomUUID(),
     };
 
-    database.connection
-      .prepare(
-        `INSERT INTO logistics_companies (
-          id,
-          business_name,
-          business_number,
-          corporate_registration_number,
-          business_address,
-          manager_name,
-          manager_phone,
-          bank_code,
-          account_number,
-          account_holder,
-          active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        company.id,
-        company.businessName,
-        company.businessNumber,
-        company.corporateRegistrationNumber,
-        company.businessAddress,
-        company.managerName,
-        company.managerPhone,
-        company.bankCode,
-        company.accountNumber,
-        company.accountHolder,
-        Number(company.active),
-      );
+    await database.db.insert(logisticsCompanies).values(company);
 
     return company;
   }
@@ -151,11 +129,10 @@ describe('Logistics companies (e2e)', () => {
       accountHolder: '(주)경인물류',
       managerName: '이영희',
     };
-    database.connection
-      .prepare(
-        "UPDATE logistics_companies SET updated_at = '2000-01-01 00:00:00' WHERE id = ?",
-      )
-      .run(id);
+    await database.db
+      .update(logisticsCompanies)
+      .set({ updatedAt: '2000-01-01 00:00:00' })
+      .where(eq(logisticsCompanies.id, id));
     const updateResponse = await request(app.getHttpServer())
       .put(`/api/v1/admin/logistics-companies/${id}`)
       .set('Authorization', adminAuthorization)
@@ -173,11 +150,12 @@ describe('Logistics companies (e2e)', () => {
       .expect(204)
       .expect('');
 
-    const storedCompany = database.connection
-      .prepare('SELECT active FROM logistics_companies WHERE id = ?')
-      .get(id) as { active: number };
+    const [storedCompany] = await database.db
+      .select({ active: logisticsCompanies.active })
+      .from(logisticsCompanies)
+      .where(eq(logisticsCompanies.id, id));
 
-    expect(storedCompany.active).toBe(0);
+    expect(storedCompany.active).toBe(false);
     await request(app.getHttpServer())
       .get(`/api/v1/admin/logistics-companies/${id}`)
       .set('Authorization', adminAuthorization)
@@ -201,25 +179,26 @@ describe('Logistics companies (e2e)', () => {
       .delete(`/api/v1/admin/logistics-companies/${id}`)
       .set('Authorization', adminAuthorization)
       .expect(404);
-    expect(
-      database.connection
-        .prepare('SELECT active FROM logistics_companies WHERE id = ?')
-        .get(id),
-    ).toEqual({ active: 0 });
+    await expect(
+      database.db
+        .select({ active: logisticsCompanies.active })
+        .from(logisticsCompanies)
+        .where(eq(logisticsCompanies.id, id)),
+    ).resolves.toEqual([{ active: false }]);
   });
 
   it('lists only active companies in business-name order', async () => {
-    const second = seedCompany({
+    const second = await seedCompany({
       businessName: '나래물류',
       businessNumber: '234-56-78901',
       corporateRegistrationNumber: '110111-0023456',
     });
-    const first = seedCompany({
+    const first = await seedCompany({
       businessName: '가람물류',
       businessNumber: '345-67-89012',
       corporateRegistrationNumber: '110111-0034567',
     });
-    seedCompany({
+    await seedCompany({
       active: false,
       businessName: '비활성물류',
       businessNumber: '456-78-90123',
@@ -305,7 +284,7 @@ describe('Logistics companies (e2e)', () => {
   });
 
   it('returns conflict for duplicate business identifiers', async () => {
-    seedCompany({ active: false });
+    await seedCompany({ active: false });
 
     const duplicateBusinessNumber = await request(app.getHttpServer())
       .post('/api/v1/admin/logistics-companies')
@@ -335,8 +314,8 @@ describe('Logistics companies (e2e)', () => {
   });
 
   it('does not overwrite a company with duplicate identifiers', async () => {
-    const first = seedCompany();
-    const second = seedCompany({
+    const first = await seedCompany();
+    const second = await seedCompany({
       businessName: '대한물류',
       businessNumber: '234-56-78901',
       corporateRegistrationNumber: '110111-0023456',
@@ -584,6 +563,6 @@ describe('Logistics companies (e2e)', () => {
   });
 
   afterAll(async () => {
-    await app.close();
+    await app?.close();
   });
 });

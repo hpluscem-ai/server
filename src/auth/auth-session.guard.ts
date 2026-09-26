@@ -18,7 +18,7 @@ export type AuthenticatedRequest = Request & {
 export class AuthSessionGuard implements CanActivate {
   constructor(private readonly authService: AuthService) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const http = context.switchToHttp();
     const request = http.getRequest<AuthenticatedRequest>();
     const response = http.getResponse<Response>();
@@ -39,7 +39,7 @@ export class AuthSessionGuard implements CanActivate {
     ) {
       assertWebOrigin(request);
     }
-    const session = this.authService.authenticateSession(token);
+    const session = await this.authService.authenticateSession(token);
 
     if (!session) {
       // A late 401 must not delete the cookie issued by a newer login.

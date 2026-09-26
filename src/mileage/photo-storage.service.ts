@@ -21,23 +21,39 @@ export class PhotoStorageService implements OnModuleDestroy {
 
   ensureConfigured(): void {
     if (this.client) return;
-    const account = process.env.R2_ACCOUNT_ID?.trim();
-    const bucket = process.env.R2_BUCKET_NAME?.trim();
-    const accessKeyId = process.env.R2_ACCESS_KEY_ID?.trim();
-    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim();
+    const endpoint = process.env.SUPABASE_S3_ENDPOINT?.trim();
+    const region = process.env.SUPABASE_S3_REGION?.trim();
+    const bucket = process.env.SUPABASE_STORAGE_BUCKET?.trim();
+    const accessKeyId = process.env.SUPABASE_S3_ACCESS_KEY_ID?.trim();
+    const secretAccessKey = process.env.SUPABASE_S3_SECRET_ACCESS_KEY?.trim();
+    if (!endpoint || !region || !bucket || !accessKeyId || !secretAccessKey) {
+      throw this.unavailable();
+    }
+    let url: URL;
+    try {
+      url = new URL(endpoint);
+    } catch {
+      throw this.unavailable();
+    }
+    const localHttp =
+      url.protocol === 'http:' &&
+      ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) &&
+      process.env.NODE_ENV !== 'production' &&
+      process.env.VERCEL_ENV !== 'production';
     if (
-      !account ||
-      !/^[a-f0-9]{32}$/i.test(account) ||
-      !bucket ||
-      !accessKeyId ||
-      !secretAccessKey
+      (url.protocol !== 'https:' && !localHttp) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
     ) {
       throw this.unavailable();
     }
     this.bucket = bucket;
     this.client = new S3Client({
-      region: 'auto',
-      endpoint: `https://${account}.r2.cloudflarestorage.com`,
+      region,
+      endpoint,
+      forcePathStyle: true,
       credentials: { accessKeyId, secretAccessKey },
       maxAttempts: 1,
       requestChecksumCalculation: 'WHEN_REQUIRED',

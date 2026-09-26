@@ -140,32 +140,37 @@ describe('AppController (e2e)', () => {
     }
   });
 
-  it('uses an in-memory SQLite database', () => {
+  it('uses an isolated PostgreSQL database', async () => {
     const database = app.get(DatabaseService).connection;
-    const databases = database.prepare('PRAGMA database_list').all() as {
-      file: string;
-      name: string;
-      seq: number;
-    }[];
-
-    expect(databases).toContainEqual({ file: '', name: 'main', seq: 0 });
+    const [result] = await database<{ name: string; version: string }[]>`
+      SELECT current_database() AS name, version() AS version
+    `;
+    expect(result.name).toMatch(/^hpluseco_test_/);
+    expect(result.version).toContain('PostgreSQL');
   });
 
-  it('restores DATABASE_PATH after creating a test application', async () => {
-    const previousDatabasePath = process.env.DATABASE_PATH;
-    process.env.DATABASE_PATH = 'preserved.sqlite';
+  it('never uses or changes the runtime DATABASE_URL for test applications', async () => {
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = 'postgresql://unused.invalid/preserved';
     let isolatedApp: INestApplication<App> | undefined;
 
     try {
       isolatedApp = await createTestApp();
-      expect(process.env.DATABASE_PATH).toBe('preserved.sqlite');
+      expect(process.env.DATABASE_URL).toBe(
+        'postgresql://unused.invalid/preserved',
+      );
+      const [first] = await app.get(DatabaseService)
+        .connection`SELECT current_database() AS name`;
+      const [second] = await isolatedApp.get(DatabaseService)
+        .connection`SELECT current_database() AS name`;
+      expect(first.name).not.toBe(second.name);
     } finally {
       await isolatedApp?.close();
 
-      if (previousDatabasePath === undefined) {
-        delete process.env.DATABASE_PATH;
+      if (previousDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
       } else {
-        process.env.DATABASE_PATH = previousDatabasePath;
+        process.env.DATABASE_URL = previousDatabaseUrl;
       }
     }
   });

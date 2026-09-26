@@ -118,7 +118,7 @@ export class LogisticsCompaniesController {
   @ApiParam({ description: '물류사 식별자', format: 'uuid', name: 'id' })
   deactivate(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
-  ): void {
+  ): Promise<void> {
     return this.logisticsCompanies.deactivate(id);
   }
 }

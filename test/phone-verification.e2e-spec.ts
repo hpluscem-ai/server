@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { INestApplication, Logger } from '@nestjs/common';
 import type { OpenAPIObject } from '@nestjs/swagger';
+import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 
@@ -45,7 +46,7 @@ describe('SOLAPI phone verification (e2e)', () => {
     database = app.get(DatabaseService);
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.replaceProperty(process, 'env', {
       ...process.env,
       SOLAPI_API_KEY: 'test-api-key',
@@ -57,11 +58,9 @@ describe('SOLAPI phone verification (e2e)', () => {
     fetchMock = jest
       .spyOn(globalThis, 'fetch')
       .mockImplementation(() => Promise.resolve(Response.json(accepted)));
-    database.connection.exec(`
-      DELETE FROM users;
-      DELETE FROM phone_verifications;
-      DELETE FROM logistics_companies;
-    `);
+    await database.db.delete(users);
+    await database.connection.unsafe('DELETE FROM app.phone_verifications');
+    await database.db.delete(logisticsCompanies);
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -81,10 +80,13 @@ describe('SOLAPI phone verification (e2e)', () => {
     return match![1];
   }
 
-  function row(id: string): VerificationRow {
-    return database.connection
-      .prepare('SELECT * FROM phone_verifications WHERE id = ?')
-      .get(id) as VerificationRow;
+  async function row(id: string): Promise<VerificationRow> {
+    return (
+      await database.connection.unsafe(
+        'SELECT * FROM app.phone_verifications WHERE id = $1',
+        [id],
+      )
+    )[0] as unknown as VerificationRow;
   }
 
   async function send(to = phone): Promise<SentVerification> {
@@ -119,57 +121,57 @@ describe('SOLAPI phone verification (e2e)', () => {
   describe('authenticated phone change', () => {
     const path = '/api/v1/auth/phone-change/verifications';
     let userId: string;
+    let companyId: string;
     let authorization: string;
-    beforeEach(() => {
-      const companyId = randomUUID();
-      database.db
-        .insert(logisticsCompanies)
-        .values({
-          id: companyId,
-          businessName: '물류사',
-          businessNumber: '123-45-67890',
-          corporateRegistrationNumber: '123456-1234567',
-          businessAddress: '서울시',
-          managerName: '담당자',
-          managerPhone: '010-1234-5678',
-          bankCode: '19',
-          accountNumber: '12345',
-          accountHolder: '물류사',
-        })
-        .run();
+    beforeEach(async () => {
+      companyId = randomUUID();
+      await database.db.insert(logisticsCompanies).values({
+        id: companyId,
+        businessName: '물류사',
+        businessNumber: '123-45-67890',
+        corporateRegistrationNumber: '123456-1234567',
+        businessAddress: '서울시',
+        managerName: '담당자',
+        managerPhone: '010-1234-5678',
+        bankCode: '19',
+        accountNumber: '12345',
+        accountHolder: '물류사',
+      });
       userId = randomUUID();
-      database.db
-        .insert(users)
-        .values({
-          id: userId,
-          role: 'driver',
-          email: 'driver@example.com',
-          passwordHash: 'test-only-unused-hash',
-          name: '기사',
-          phone: '010-8888-9999',
-          logisticsCompanyId: companyId,
-          serviceTermsConsent: true,
-          privacyTermsConsent: true,
-        })
-        .run();
-      authorization = session(userId);
+      await database.db.insert(users).values({
+        id: userId,
+        role: 'driver',
+        email: 'driver@example.com',
+        passwordHash: 'test-only-unused-hash',
+        name: '기사',
+        phone: '010-8888-9999',
+        logisticsCompanyId: companyId,
+        serviceTermsConsent: true,
+        privacyTermsConsent: true,
+      });
+      authorization = await session(userId);
     });
-    afterEach(() =>
-      database.connection.exec('DROP TRIGGER IF EXISTS fail_phone_change'),
-    );
-    function session(id: string) {
+    afterEach(async () => {
+      await database.connection.unsafe(
+        'DROP TRIGGER IF EXISTS fail_phone_change ON app.phone_verifications',
+      );
+      await database.connection.unsafe(
+        'DROP TRIGGER IF EXISTS fail_phone_change ON app.users',
+      );
+      await database.connection.unsafe(
+        'DROP FUNCTION IF EXISTS app.fail_phone_change()',
+      );
+    });
+    async function session(id: string) {
       const token = randomBytes(32).toString('base64url');
       const now = new Date();
-      database.db
-        .insert(authSessions)
-        .values({
-          tokenHash: createHash('sha256').update(token).digest('hex'),
-          userId: id,
-          createdAt: now,
-          lastUsedAt: now,
-          expiresAt: new Date(now.getTime() + 600000),
-        })
-        .run();
+      await database.db.insert(authSessions).values({
+        tokenHash: createHash('sha256').update(token).digest('hex'),
+        userId: id,
+        createdAt: now,
+        lastUsedAt: now,
+        expiresAt: new Date(now.getTime() + 600000),
+      });
       return `Bearer ${token}`;
     }
     function sendChange(to = phone, auth = authorization) {
@@ -199,15 +201,18 @@ describe('SOLAPI phone verification (e2e)', () => {
         .set('Authorization', auth)
         .send({ phone: to, verificationProof: value });
     }
-    function savedPhone() {
-      return database.connection
-        .prepare('SELECT phone FROM users WHERE id = ?')
-        .get(userId);
+    async function savedPhone() {
+      const [saved] = await database.db
+        .select({ phone: users.phone })
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
+      return saved;
     }
 
     it('changes only the authenticated driver phone and consumes the owner-bound proof once', async () => {
       const verified = await proof();
-      expect(row(verified.id)).toMatchObject({
+      expect(await row(verified.id)).toMatchObject({
         purpose: 'change_phone',
         scope_user_id: userId,
         phone,
@@ -216,8 +221,8 @@ describe('SOLAPI phone verification (e2e)', () => {
         .expect(204)
         .expect('')
         .expect('Cache-Control', 'no-store');
-      expect(savedPhone()).toEqual({ phone });
-      expect(row(verified.id).consumed_at).not.toBeNull();
+      expect(await savedPhone()).toEqual({ phone });
+      expect((await row(verified.id)).consumed_at).not.toBeNull();
       await change(verified.value).expect(400);
       await request(app.getHttpServer())
         .get('/api/v1/users/me')
@@ -243,24 +248,29 @@ describe('SOLAPI phone verification (e2e)', () => {
     it('rejects another owner or changed phone without consuming the proof', async () => {
       const verified = await proof();
       const otherId = randomUUID();
-      database.connection
-        .prepare(
-          `INSERT INTO users (id, role, email, password_hash, name, phone, logistics_company_id, service_terms_consent, privacy_terms_consent)
-        SELECT ?, role, 'other@example.com', password_hash, name, '010-3333-4444', logistics_company_id, 1, 1 FROM users WHERE id = ?`,
-        )
-        .run(otherId, userId);
-      await change(verified.value, phone, session(otherId))
+      await database.db.insert(users).values({
+        id: otherId,
+        role: 'driver',
+        email: 'other@example.com',
+        passwordHash: 'test-only-unused-hash',
+        name: '기사',
+        phone: '010-3333-4444',
+        logisticsCompanyId: companyId,
+        serviceTermsConsent: true,
+        privacyTermsConsent: true,
+      });
+      await change(verified.value, phone, await session(otherId))
         .expect(400)
         .expect(({ body }: { body: { code: string } }) =>
           expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
         );
       await change(verified.value, '010-5555-6666').expect(400);
-      expect(row(verified.id).consumed_at).toBeNull();
-      await sendChange(phone, session(otherId)).expect(201);
-      expect(row(verified.id).invalidated_at).toBeNull();
+      expect((await row(verified.id)).consumed_at).toBeNull();
+      await sendChange(phone, await session(otherId)).expect(201);
+      expect((await row(verified.id)).invalidated_at).toBeNull();
       const next = await sendChange().expect(201);
       const id = (next.body as SentVerification).verificationId;
-      await confirmChange(id, sentCode(), session(otherId)).expect(400);
+      await confirmChange(id, sentCode(), await session(otherId)).expect(400);
       await confirmChange(id, sentCode()).expect(200);
     });
 
@@ -277,30 +287,27 @@ describe('SOLAPI phone verification (e2e)', () => {
           expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
         );
       await sendChange('010-5555-6666').expect(201);
-      expect(row(first.id).invalidated_at).not.toBeNull();
+      expect((await row(first.id)).invalidated_at).not.toBeNull();
       await change(first.value).expect(400);
     });
 
     it('rejects duplicate phones without consuming the proof', async () => {
-      database.db
-        .insert(users)
-        .values({
-          id: randomUUID(),
-          role: 'admin',
-          email: 'taken@example.com',
-          name: '다른 계정',
-          passwordHash: 'test-only',
-          phone,
-        })
-        .run();
+      await database.db.insert(users).values({
+        id: randomUUID(),
+        role: 'admin',
+        email: 'taken@example.com',
+        name: '다른 계정',
+        passwordHash: 'test-only',
+        phone,
+      });
       const verified = await proof();
       await change(verified.value)
         .expect(409)
         .expect(({ body }: { body: { code: string } }) =>
           expect(body.code).toBe('PHONE_ALREADY_EXISTS'),
         );
-      expect(row(verified.id).consumed_at).toBeNull();
-      expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+      expect((await row(verified.id)).consumed_at).toBeNull();
+      expect(await savedPhone()).toEqual({ phone: '010-8888-9999' });
     });
 
     it.each(['expired-proof', 'revoked-session', 'inactive-company'])(
@@ -308,19 +315,18 @@ describe('SOLAPI phone verification (e2e)', () => {
       async (state) => {
         const verified = await proof();
         if (state === 'expired-proof')
-          database.connection
-            .prepare(
-              'UPDATE phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = ?',
-            )
-            .run(verified.id);
-        if (state === 'revoked-session') database.db.delete(authSessions).run();
+          await database.connection.unsafe(
+            'UPDATE app.phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = $1',
+            [verified.id],
+          );
+        if (state === 'revoked-session') await database.db.delete(authSessions);
         if (state === 'inactive-company')
-          database.db.update(logisticsCompanies).set({ active: false }).run();
+          await database.db.update(logisticsCompanies).set({ active: false });
         await change(verified.value).expect(
           state === 'expired-proof' ? 400 : 401,
         );
-        expect(row(verified.id).consumed_at).toBeNull();
-        expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+        expect((await row(verified.id)).consumed_at).toBeNull();
+        expect(await savedPhone()).toEqual({ phone: '010-8888-9999' });
       },
     );
 
@@ -340,16 +346,19 @@ describe('SOLAPI phone verification (e2e)', () => {
         jest
           .spyOn(Logger.prototype, 'error')
           .mockImplementation(() => undefined);
-        const operation =
+        const [operation, table] =
           point === 'proof-consume'
-            ? 'AFTER UPDATE OF consumed_at ON phone_verifications'
-            : 'AFTER UPDATE OF phone ON users';
-        database.connection.exec(
-          `CREATE TRIGGER fail_phone_change ${operation} BEGIN SELECT RAISE(FAIL, 'private-failure'); END;`,
+            ? ['AFTER UPDATE OF consumed_at', 'phone_verifications']
+            : ['AFTER UPDATE OF phone', 'users'];
+        await database.connection.unsafe(
+          "CREATE OR REPLACE FUNCTION app.fail_phone_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'private-failure'; END; $$",
+        );
+        await database.connection.unsafe(
+          `CREATE TRIGGER fail_phone_change ${operation} ON app.${table} FOR EACH ROW EXECUTE FUNCTION app.fail_phone_change()`,
         );
         await change(verified.value).expect(500);
-        expect(row(verified.id).consumed_at).toBeNull();
-        expect(savedPhone()).toEqual({ phone: '010-8888-9999' });
+        expect((await row(verified.id)).consumed_at).toBeNull();
+        expect(await savedPhone()).toEqual({ phone: '010-8888-9999' });
       },
     );
 
@@ -391,7 +400,7 @@ describe('SOLAPI phone verification (e2e)', () => {
         .expect(400);
       await change('', phone).expect(400);
       await change(verified.value, 'invalid').expect(400);
-      expect(row(verified.id).consumed_at).toBeNull();
+      expect((await row(verified.id)).consumed_at).toBeNull();
     });
   });
 
@@ -416,7 +425,7 @@ describe('SOLAPI phone verification (e2e)', () => {
         .post(`${basePath}/${id}/confirm`)
         .send({ code, purpose })
         .expect(200);
-      expect(row(id)).toMatchObject({
+      expect(await row(id)).toMatchObject({
         purpose,
         phone,
         scope_email: purpose === 'reset_password' ? 'driver@example.com' : null,
@@ -426,7 +435,7 @@ describe('SOLAPI phone verification (e2e)', () => {
         .expect(({ body }: { body: { code: string } }) =>
           expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
         );
-      expect(row(id).consumed_at).toBeNull();
+      expect((await row(id)).consumed_at).toBeNull();
       const reconfirmed = await request(app.getHttpServer())
         .post(`${basePath}/${id}/confirm`)
         .send({ code, purpose })
@@ -459,7 +468,7 @@ describe('SOLAPI phone verification (e2e)', () => {
       .post(basePath)
       .send({ phone, purpose: 'reset_password', email: 'second@example.com' })
       .expect(201);
-    expect(row(firstId).invalidated_at).not.toBeNull();
+    expect((await row(firstId)).invalidated_at).not.toBeNull();
     await confirm(signup.verificationId, signupCode).expect(200);
   });
 
@@ -480,7 +489,7 @@ describe('SOLAPI phone verification (e2e)', () => {
   it('signs one SMS request, stores only its HMAC and starts a 3-minute expiry after acceptance', async () => {
     const sent = await send(` ${phone} `);
     const code = sentCode();
-    const verification = row(sent.verificationId);
+    const verification = await row(sent.verificationId);
     expect(Object.keys(sent).sort()).toEqual(['expiresAt', 'verificationId']);
     expect(Date.parse(sent.expiresAt) - Date.now()).toBeGreaterThan(178_000);
     expect(Date.parse(sent.expiresAt) - Date.now()).toBeLessThanOrEqual(
@@ -542,7 +551,7 @@ describe('SOLAPI phone verification (e2e)', () => {
     ]);
     expect(confirmed.expiresAt).toBe(sent.expiresAt);
     expect(confirmed.verificationProof).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(row(sent.verificationId).proof_hash).toBe(
+    expect((await row(sent.verificationId)).proof_hash).toBe(
       createHash('sha256').update(confirmed.verificationProof).digest('hex'),
     );
     const wrongCode = code === '000000' ? '111111' : '000000';
@@ -555,23 +564,23 @@ describe('SOLAPI phone verification (e2e)', () => {
       .body as ConfirmedVerification;
     expect(reconfirmed.verificationProof).not.toBe(confirmed.verificationProof);
     expect(reconfirmed.expiresAt).toBe(sent.expiresAt);
-    expect(row(sent.verificationId).proof_hash).toBe(
+    expect((await row(sent.verificationId)).proof_hash).toBe(
       createHash('sha256').update(reconfirmed.verificationProof).digest('hex'),
     );
 
     const companyId = randomUUID();
-    database.connection
-      .prepare(
-        `
-      INSERT INTO logistics_companies (
-        id, business_name, business_number, corporate_registration_number,
-        business_address, manager_name, manager_phone, bank_code,
-        account_number, account_holder
-      ) VALUES (?, '테스트물류', '123-45-67890', '123456-1234567',
-        '서울시 강남구', '김관리', '010-9876-5432', '19', '12345678', '테스트물류')
-    `,
-      )
-      .run(companyId);
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '테스트물류',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시 강남구',
+      managerName: '김관리',
+      managerPhone: '010-9876-5432',
+      bankCode: '19',
+      accountNumber: '12345678',
+      accountHolder: '테스트물류',
+    });
     await signUp(confirmed.verificationProof, companyId)
       .expect(400)
       .expect(({ body }: { body: { code: string } }) =>
@@ -582,13 +591,13 @@ describe('SOLAPI phone verification (e2e)', () => {
       .expect(({ body }: { body: { code: string } }) =>
         expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
       );
-    expect(row(sent.verificationId).consumed_at).toBeNull();
+    expect((await row(sent.verificationId)).consumed_at).toBeNull();
     await signUp(reconfirmed.verificationProof, companyId).expect(201);
-    expect(row(sent.verificationId).consumed_at).not.toBeNull();
+    expect((await row(sent.verificationId)).consumed_at).not.toBeNull();
     await signUp(reconfirmed.verificationProof, companyId).expect(400);
     await confirm(sent.verificationId, code).expect(400);
     await send();
-    expect(row(sent.verificationId).invalidated_at).toBeNull();
+    expect((await row(sent.verificationId)).invalidated_at).toBeNull();
   });
 
   it('allows correcting a wrong code without minting a proof or adding an attempt limit', async () => {
@@ -602,7 +611,7 @@ describe('SOLAPI phone verification (e2e)', () => {
           expect(body.code).toBe('PHONE_VERIFICATION_CODE_MISMATCH'),
         );
     }
-    expect(row(sent.verificationId).proof_hash).toBeNull();
+    expect((await row(sent.verificationId)).proof_hash).toBeNull();
     await confirm(sent.verificationId, code).expect(200);
   });
 
@@ -617,12 +626,12 @@ describe('SOLAPI phone verification (e2e)', () => {
     const proofs = results.map(
       (result) => (result.body as ConfirmedVerification).verificationProof,
     );
+    const storedProofHash = (await row(sent.verificationId)).proof_hash;
     expect(new Set(proofs).size).toBe(2);
     expect(
       proofs.filter(
         (proof) =>
-          createHash('sha256').update(proof).digest('hex') ===
-          row(sent.verificationId).proof_hash,
+          createHash('sha256').update(proof).digest('hex') === storedProofHash,
       ),
     ).toHaveLength(1);
     expect(
@@ -636,9 +645,10 @@ describe('SOLAPI phone verification (e2e)', () => {
     const hash = createHmac('sha256', secret)
       .update(`sign_up:${sent.verificationId}:${code}`)
       .digest('hex');
-    database.connection
-      .prepare('UPDATE phone_verifications SET code_hash = ? WHERE id = ?')
-      .run(hash, sent.verificationId);
+    await database.connection.unsafe(
+      'UPDATE app.phone_verifications SET code_hash = $1 WHERE id = $2',
+      [hash, sent.verificationId],
+    );
     await confirm(sent.verificationId, code).expect(200);
   });
 
@@ -650,15 +660,16 @@ describe('SOLAPI phone verification (e2e)', () => {
   ])('rejects an unavailable verification (%s)', async (assignment) => {
     const sent = await send();
     // assignment is a fixed test case above, never user input.
-    database.connection
-      .prepare(`UPDATE phone_verifications SET ${assignment} WHERE id = ?`)
-      .run(sent.verificationId);
+    await database.connection.unsafe(
+      `UPDATE app.phone_verifications SET ${assignment} WHERE id = $1`,
+      [sent.verificationId],
+    );
     await confirm(sent.verificationId, sentCode())
       .expect(400)
       .expect(({ body }: { body: { code: string } }) =>
         expect(body.code).toBe('PHONE_VERIFICATION_INVALID'),
       );
-    expect(row(sent.verificationId).proof_hash).toBeNull();
+    expect((await row(sent.verificationId)).proof_hash).toBeNull();
   });
 
   it('does not extend a confirmed proof past the original expiry', async () => {
@@ -666,11 +677,10 @@ describe('SOLAPI phone verification (e2e)', () => {
     const confirmed = (
       await confirm(sent.verificationId, sentCode()).expect(200)
     ).body as ConfirmedVerification;
-    database.connection
-      .prepare(
-        'UPDATE phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = ?',
-      )
-      .run(sent.verificationId);
+    await database.connection.unsafe(
+      'UPDATE app.phone_verifications SET expires_at = CURRENT_TIMESTAMP WHERE id = $1',
+      [sent.verificationId],
+    );
     await confirm(sent.verificationId, sentCode()).expect(400);
     await signUp(confirmed.verificationProof)
       .expect(400)
@@ -690,6 +700,48 @@ describe('SOLAPI phone verification (e2e)', () => {
     await confirm(other.verificationId, otherCode).expect(200);
   });
 
+  it('keeps only the newest concurrent send active for one verification scope', async () => {
+    const responses = await Promise.all([
+      request(app.getHttpServer()).post(basePath).send({ phone }),
+      request(app.getHttpServer()).post(basePath).send({ phone }),
+    ]);
+    expect(
+      responses.every(({ status }) => status === 201 || status === 409),
+    ).toBe(true);
+    expect(responses.some(({ status }) => status === 201)).toBe(true);
+    const verifications = (await database.connection.unsafe(
+      `SELECT * FROM app.phone_verifications
+       WHERE purpose = 'sign_up' AND phone = $1
+       ORDER BY created_at`,
+      [phone],
+    )) as unknown as VerificationRow[];
+    expect(verifications).toHaveLength(2);
+    const active = verifications.filter(
+      (verification) => verification.invalidated_at === null,
+    );
+    expect(active).toHaveLength(1);
+    expect(
+      responses
+        .filter(({ status }) => status === 201)
+        .map(({ body }) => (body as SentVerification).verificationId),
+    ).toContain(active[0].id);
+    const codeFor = (verification: VerificationRow) =>
+      Array.from({ length: fetchMock.mock.calls.length }, (_, index) =>
+        sentCode(index),
+      ).find(
+        (code) =>
+          createHmac('sha256', secret)
+            .update(`sign_up:${verification.id}:${code}`)
+            .digest('hex') === verification.code_hash,
+      );
+    const inactive = verifications.find(
+      (verification) => verification.id !== active[0].id,
+    );
+    expect(inactive).toBeDefined();
+    await confirm(inactive!.id, codeFor(inactive!)!).expect(400);
+    await confirm(active[0].id, codeFor(active[0])!).expect(200);
+  });
+
   it('keeps previous proofs invalidated even when the resend fails', async () => {
     const sent = await send();
     const code = sentCode();
@@ -700,7 +752,7 @@ describe('SOLAPI phone verification (e2e)', () => {
       .post(basePath)
       .send({ phone })
       .expect(502);
-    expect(row(sent.verificationId).invalidated_at).not.toBeNull();
+    expect((await row(sent.verificationId)).invalidated_at).not.toBeNull();
     await confirm(sent.verificationId, code).expect(400);
     await signUp(confirmed.verificationProof)
       .expect(400)
@@ -728,9 +780,9 @@ describe('SOLAPI phone verification (e2e)', () => {
       .then((response) => response);
     await providerEntered;
     try {
-      const pending = database.connection
-        .prepare('SELECT * FROM phone_verifications')
-        .get() as VerificationRow;
+      const [pending] = (await database.connection.unsafe(
+        'SELECT * FROM app.phone_verifications',
+      )) as unknown as [VerificationRow];
       const firstCode = sentCode();
       expect(pending.expires_at).toBe('1970-01-01 00:00:00');
       await confirm(pending.id, firstCode).expect(400);
@@ -799,9 +851,9 @@ describe('SOLAPI phone verification (e2e)', () => {
           code: 'SMS_SEND_FAILED',
           message: '인증번호 발송을 확인하지 못했습니다. 다시 요청해 주세요.',
         });
-      const failed = database.connection
-        .prepare('SELECT * FROM phone_verifications')
-        .get() as VerificationRow;
+      const [failed] = (await database.connection.unsafe(
+        'SELECT * FROM app.phone_verifications',
+      )) as unknown as [VerificationRow];
       expect(failed.proof_hash).toBeNull();
       await confirm(failed.id, sentCode()).expect(400);
       expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -824,9 +876,9 @@ describe('SOLAPI phone verification (e2e)', () => {
         .send({ phone })
         .expect(502);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const failed = database.connection
-        .prepare('SELECT * FROM phone_verifications')
-        .get() as VerificationRow;
+      const [failed] = (await database.connection.unsafe(
+        'SELECT * FROM app.phone_verifications',
+      )) as unknown as [VerificationRow];
       await confirm(failed.id, sentCode()).expect(400);
     },
   );

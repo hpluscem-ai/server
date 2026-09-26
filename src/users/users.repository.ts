@@ -6,6 +6,7 @@ import {
   eq,
   gte,
   inArray,
+  ilike,
   isNull,
   lt,
   or,
@@ -36,8 +37,8 @@ type ProfileChanges = { name?: string; marketingConsent?: boolean };
 export class UsersRepository {
   constructor(private readonly database: DatabaseService) {}
 
-  findDrivers(query: AdminDriverListQueryDto) {
-    const rows = this.database.db
+  async findDrivers(query: AdminDriverListQueryDto) {
+    return this.database.db
       .select({
         id: users.id,
         logisticsCompanyId: logisticsCompanies.id,
@@ -61,96 +62,89 @@ export class UsersRepository {
             : undefined,
           query.createdFrom
             ? gte(
-                sql`julianday(${users.createdAt})`,
-                sql`julianday(${query.createdFrom})`,
+                sql`${users.createdAt}::timestamptz`,
+                sql`${query.createdFrom}::timestamptz`,
               )
             : undefined,
           query.createdBefore
             ? lt(
-                sql`julianday(${users.createdAt})`,
-                sql`julianday(${query.createdBefore})`,
+                sql`${users.createdAt}::timestamptz`,
+                sql`${query.createdBefore}::timestamptz`,
               )
+            : undefined,
+          query.nameQuery
+            ? ilike(users.name, `%${escapeLike(query.nameQuery)}%`)
             : undefined,
         ),
       )
-      .orderBy(desc(users.createdAt), asc(users.id))
-      .all();
-    // ponytail: Unicode contains search scans the selected rows; add indexed search when volume warrants it.
-    const name = query.nameQuery?.toLocaleLowerCase('ko-KR');
-    return name
-      ? rows.filter((row) => row.name.toLocaleLowerCase('ko-KR').includes(name))
-      : rows;
+      .orderBy(desc(users.createdAt), asc(users.id));
   }
 
-  findProfile(userId: string) {
-    return this.database.db
+  async findProfile(userId: string) {
+    const [profile] = await this.database.db
       .select(profileFields)
       .from(users)
       .where(this.activeDriver(userId))
-      .get();
+      .limit(1);
+    return profile;
   }
 
-  withdrawDriver(userId: string) {
-    return this.database.db.transaction(
-      (tx) => {
-        const driver = tx
-          .select({ email: users.email, phone: users.phone })
-          .from(users)
-          .where(
-            and(
-              eq(users.id, userId),
-              eq(users.role, 'driver'),
-              isNull(users.deactivatedAt),
-            ),
-          )
-          .get();
-        if (!driver) return false;
-        if (driver.phone === null)
-          throw new Error('Driver phone invariant violated');
+  async withdrawDriver(userId: string) {
+    return this.database.db.transaction(async (tx) => {
+      const [driver] = await tx
+        .select({ email: users.email, phone: users.phone })
+        .from(users)
+        .where(
+          and(
+            eq(users.id, userId),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      if (!driver) return false;
+      if (driver.phone === null)
+        throw new Error('Driver phone invariant violated');
 
-        tx.update(users)
-          .set({
-            passwordHash: null,
-            deactivatedAt: sql`CURRENT_TIMESTAMP`,
-            updatedAt: sql`CURRENT_TIMESTAMP`,
-          })
-          .where(eq(users.id, userId))
-          .run();
-        tx.delete(authSessions).where(eq(authSessions.userId, userId)).run();
-        tx.delete(adminSessions).where(eq(adminSessions.userId, userId)).run();
-        tx.delete(passwordResetTokens)
-          .where(eq(passwordResetTokens.userId, userId))
-          .run();
-        // Pending SMS sends are removed too, so a late provider response cannot revive them.
-        tx.delete(phoneVerifications)
-          .where(
-            or(
-              eq(phoneVerifications.scopeUserId, userId),
-              and(
-                isNull(phoneVerifications.scopeUserId),
-                or(
-                  eq(phoneVerifications.phone, driver.phone),
-                  and(
-                    eq(phoneVerifications.purpose, 'reset_password'),
-                    eq(
-                      phoneVerifications.scopeEmail,
-                      driver.email.toLowerCase(),
-                    ),
-                  ),
+      await tx
+        .update(users)
+        .set({
+          passwordHash: null,
+          deactivatedAt: sql`CURRENT_TIMESTAMP`,
+          updatedAt: sql`CURRENT_TIMESTAMP`,
+        })
+        .where(eq(users.id, userId));
+      await tx.delete(authSessions).where(eq(authSessions.userId, userId));
+      await tx.delete(adminSessions).where(eq(adminSessions.userId, userId));
+      await tx
+        .delete(passwordResetTokens)
+        .where(eq(passwordResetTokens.userId, userId));
+      // Pending SMS sends are removed too, so a late provider response cannot revive them.
+      await tx
+        .delete(phoneVerifications)
+        .where(
+          or(
+            eq(phoneVerifications.scopeUserId, userId),
+            and(
+              isNull(phoneVerifications.scopeUserId),
+              or(
+                eq(phoneVerifications.phone, driver.phone),
+                and(
+                  eq(phoneVerifications.purpose, 'reset_password'),
+                  eq(phoneVerifications.scopeEmail, driver.email.toLowerCase()),
                 ),
               ),
             ),
-          )
-          .run();
-        return true;
-      },
-      { behavior: 'immediate' },
-    );
+          ),
+        );
+      return true;
+    });
   }
 
-  updateProfile(userId: string, changes: ProfileChanges) {
+  async updateProfile(userId: string, changes: ProfileChanges) {
     // 한 UPDATE로 두 값을 함께 저장한다. 생략한 필드는 변경하지 않는다.
-    return this.database.db
+    const [profile] = await this.database.db
       .update(users)
       .set({
         name: changes.name,
@@ -158,8 +152,8 @@ export class UsersRepository {
         updatedAt: sql`CURRENT_TIMESTAMP`,
       })
       .where(this.activeDriver(userId))
-      .returning(profileFields)
-      .get();
+      .returning(profileFields);
+    return profile;
   }
 
   private activeDriver(userId: string) {
@@ -176,4 +170,8 @@ export class UsersRepository {
       ),
     );
   }
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
 }

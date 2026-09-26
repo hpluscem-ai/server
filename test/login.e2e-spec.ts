@@ -49,41 +49,35 @@ describe('Login (e2e)', () => {
     });
   });
 
-  beforeEach(() => {
-    database.db.delete(users).run();
-    database.db.delete(phoneVerifications).run();
-    database.db.delete(logisticsCompanies).run();
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(phoneVerifications);
+    await database.db.delete(logisticsCompanies);
     companyId = randomUUID();
     userId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '(주)경인물류',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시 강남구',
-        managerName: '김담당',
-        managerPhone: '010-1111-2222',
-        bankCode: '19',
-        accountNumber: '110-123-456789',
-        accountHolder: '김담당',
-      })
-      .run();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: credentials.email,
-        passwordHash,
-        name: '김기사',
-        phone: '010-1234-5678',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '(주)경인물류',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시 강남구',
+      managerName: '김담당',
+      managerPhone: '010-1111-2222',
+      bankCode: '19',
+      accountNumber: '110-123-456789',
+      accountHolder: '김담당',
+    });
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: credentials.email,
+      passwordHash,
+      name: '김기사',
+      phone: '010-1234-5678',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
   });
 
   afterEach(() => {
@@ -107,7 +101,7 @@ describe('Login (e2e)', () => {
 
     expect(Object.keys(body).sort()).toEqual(['expiresAt', 'token']);
     expect(body.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    const sessions = database.db.select().from(authSessions).all();
+    const sessions = await database.db.select().from(authSessions);
     expect(sessions).toHaveLength(1);
     const session = sessions[0];
     expect(session.userId).toBe(userId);
@@ -129,7 +123,10 @@ describe('Login (e2e)', () => {
       .post('/api/v1/auth/login')
       .send(credentials)
       .expect(200);
-    const firstSession = database.db.select().from(authSessions).get();
+    const [firstSession] = await database.db
+      .select()
+      .from(authSessions)
+      .limit(1);
     const second = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
       .send(credentials)
@@ -138,7 +135,7 @@ describe('Login (e2e)', () => {
     const secondBody = second.body as LoginResponse;
 
     expect(firstBody.token).not.toBe(secondBody.token);
-    const sessions = database.db.select().from(authSessions).all();
+    const sessions = await database.db.select().from(authSessions);
     expect(sessions).toHaveLength(2);
     expect(sessions).toContainEqual(firstSession);
   });
@@ -165,24 +162,22 @@ describe('Login (e2e)', () => {
       code: 'INVALID_CREDENTIALS',
       message: '이메일 또는 비밀번호가 일치하지 않습니다.',
     });
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
   });
 
   it.each(['user', 'company'])(
     'blocks a deactivated %s without issuing a session',
     async (target) => {
       if (target === 'user') {
-        database.db
+        await database.db
           .update(users)
           .set({ deactivatedAt: new Date().toISOString() })
-          .where(eq(users.id, userId))
-          .run();
+          .where(eq(users.id, userId));
       } else {
-        database.db
+        await database.db
           .update(logisticsCompanies)
           .set({ active: false })
-          .where(eq(logisticsCompanies.id, companyId))
-          .run();
+          .where(eq(logisticsCompanies.id, companyId));
       }
 
       const rejected = await request(app.getHttpServer())
@@ -198,18 +193,18 @@ describe('Login (e2e)', () => {
       expect(response.body).toMatchObject({
         code: target === 'user' ? 'INVALID_CREDENTIALS' : 'ACCOUNT_UNAVAILABLE',
       });
-      expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+      expect(await database.db.select().from(authSessions)).toHaveLength(0);
     },
   );
 
   it('does not issue a driver session to an admin', async () => {
-    database.db.update(users).set({ role: 'admin' }).run();
+    await database.db.update(users).set({ role: 'admin' });
     const response = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
       .send(credentials)
       .expect(401);
     expect(response.body).toMatchObject({ code: 'INVALID_CREDENTIALS' });
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
   });
 
   it.each<[string, unknown]>([
@@ -241,25 +236,22 @@ describe('Login (e2e)', () => {
 
     expect(body.code).toBe('VALIDATION_ERROR');
     expect(body.fieldErrors?.[field]?.length).toBeGreaterThan(0);
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
     expect(JSON.stringify(body)).not.toContain(credentials.password);
   });
 
   it('allows a newly signed-up driver to log in with the saved Argon2id password', async () => {
     const phone = '010-9999-8888';
     const verificationProof = randomUUID();
-    database.db
-      .insert(phoneVerifications)
-      .values({
-        id: randomUUID(),
-        purpose: 'sign_up',
-        phone,
-        codeHash: 'test-only-already-verified-code',
-        proofHash: createHash('sha256').update(verificationProof).digest('hex'),
-        verifiedAt: '2026-01-01 00:00:00',
-        expiresAt: '2099-01-01 00:00:00',
-      })
-      .run();
+    await database.db.insert(phoneVerifications).values({
+      id: randomUUID(),
+      purpose: 'sign_up',
+      phone,
+      codeHash: 'test-only-already-verified-code',
+      proofHash: createHash('sha256').update(verificationProof).digest('hex'),
+      verifiedAt: '2026-01-01 00:00:00',
+      expiresAt: '2099-01-01 00:00:00',
+    });
     const signup = await request(app.getHttpServer())
       .post('/api/v1/auth/signup')
       .send({
@@ -280,7 +272,7 @@ describe('Login (e2e)', () => {
       .post('/api/v1/auth/login')
       .send({ ...credentials, email: 'new-driver@example.com' })
       .expect(200);
-    expect(database.db.select().from(authSessions).all()).toEqual([
+    expect(await database.db.select().from(authSessions)).toEqual([
       expect.objectContaining({ userId: signedUp.id }),
     ]);
   });
@@ -289,13 +281,13 @@ describe('Login (e2e)', () => {
     'accepts valid password boundaries and preserves spaces: %p',
     async (password) => {
       const storedHash = await argon2.hash(password, { type: argon2.argon2id });
-      database.db.update(users).set({ passwordHash: storedHash }).run();
+      await database.db.update(users).set({ passwordHash: storedHash });
 
       await request(app.getHttpServer())
         .post('/api/v1/auth/login')
         .send({ ...credentials, password })
         .expect(200);
-      expect(database.db.select().from(authSessions).all()).toHaveLength(1);
+      expect(await database.db.select().from(authSessions)).toHaveLength(1);
     },
   );
 
@@ -306,25 +298,23 @@ describe('Login (e2e)', () => {
       const findCredentials = repository.findDriverCredentials.bind(repository);
       jest
         .spyOn(repository, 'findDriverCredentials')
-        .mockImplementationOnce((email) => {
-          const snapshot = findCredentials(email);
+        .mockImplementationOnce(async (email) => {
+          const snapshot = await findCredentials(email);
           // 비동기 비밀번호 검증 중에 상태가 바뀌는 상황을 지연 타이머 없이 재현한다.
           if (target === 'company') {
-            database.db.update(logisticsCompanies).set({ active: false }).run();
+            await database.db.update(logisticsCompanies).set({ active: false });
           } else if (target === 'user') {
-            database.db
+            await database.db
               .update(users)
-              .set({ deactivatedAt: new Date().toISOString() })
-              .run();
+              .set({ deactivatedAt: new Date().toISOString() });
           } else if (target === 'password') {
-            database.db
+            await database.db
               .update(users)
-              .set({ passwordHash: replacementPasswordHash })
-              .run();
+              .set({ passwordHash: replacementPasswordHash });
           } else if (target === 'role') {
-            database.db.update(users).set({ role: 'admin' }).run();
+            await database.db.update(users).set({ role: 'admin' });
           } else {
-            database.db.delete(users).run();
+            await database.db.delete(users);
           }
           return snapshot;
         });
@@ -334,7 +324,7 @@ describe('Login (e2e)', () => {
         .send(credentials)
         .expect(403);
       expect(response.body).toMatchObject({ code: 'ACCOUNT_UNAVAILABLE' });
-      expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+      expect(await database.db.select().from(authSessions)).toHaveLength(0);
     },
   );
 
@@ -342,12 +332,12 @@ describe('Login (e2e)', () => {
     const log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
-    database.connection.exec(`
-      CREATE TRIGGER fail_login_session AFTER INSERT ON auth_sessions
-      BEGIN
-        SELECT RAISE(FAIL, 'forced login storage failure');
-      END;
-    `);
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_login_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced login storage failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_login_session AFTER INSERT ON app.auth_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_login_session()',
+    );
 
     try {
       const response = await request(app.getHttpServer())
@@ -359,20 +349,25 @@ describe('Login (e2e)', () => {
         code: 'INTERNAL_SERVER_ERROR',
         message: '서버 오류가 발생했습니다.',
       });
-      expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+      expect(await database.db.select().from(authSessions)).toHaveLength(0);
       expect(log).toHaveBeenCalled();
       expect(JSON.stringify(log.mock.calls)).not.toContain(
         credentials.password,
       );
       expect(JSON.stringify(log.mock.calls)).not.toContain(passwordHash);
     } finally {
-      database.connection.exec('DROP TRIGGER fail_login_session');
+      await database.connection.unsafe(
+        'DROP TRIGGER fail_login_session ON app.auth_sessions',
+      );
+      await database.connection.unsafe(
+        'DROP FUNCTION app.fail_login_session()',
+      );
     }
   });
 
   it('fails closed when a stored password hash cannot be verified', async () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.db.update(users).set({ passwordHash: 'broken hash' }).run();
+    await database.db.update(users).set({ passwordHash: 'broken hash' });
 
     const response = await request(app.getHttpServer())
       .post('/api/v1/auth/login')
@@ -383,7 +378,7 @@ describe('Login (e2e)', () => {
       code: 'INTERNAL_SERVER_ERROR',
       message: '서버 오류가 발생했습니다.',
     });
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
   });
 
   it('documents login request, response, and failures in Swagger', async () => {
@@ -485,7 +480,7 @@ describe('Login (e2e)', () => {
     const response = await pending.expect(403);
     expect(response.body).toMatchObject({ code: 'WEB_ORIGIN_NOT_ALLOWED' });
     expect(response.headers['set-cookie']).toBeUndefined();
-    expect(database.db.select().from(authSessions).all()).toHaveLength(0);
+    expect(await database.db.select().from(authSessions)).toHaveLength(0);
   });
 
   it('allows credentials only for configured CORS origins', async () => {

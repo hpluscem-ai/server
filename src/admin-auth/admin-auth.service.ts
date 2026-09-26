@@ -32,7 +32,7 @@ export class AdminAuthService {
         message: '관리자 세션 유지기간 설정이 준비되지 않았습니다.',
       });
     }
-    const user = this.repository.findCredentials(input.email);
+    const user = await this.repository.findCredentials(input.email);
     const matches = await argon2.verify(
       user?.passwordHash ?? MISSING_USER_PASSWORD_HASH,
       input.password,
@@ -42,28 +42,28 @@ export class AdminAuthService {
     const createdAt = new Date(Date.now());
     const expiresAt = new Date(createdAt.getTime() + lifetime);
     if (
-      !this.repository.createSession({
+      !(await this.repository.createSession({
         userId: user.id,
         passwordHash: user.passwordHash,
         tokenHash: createHash('sha256').update(token).digest('hex'),
         createdAt,
         expiresAt,
-      })
+      }))
     ) {
       this.throwCredentialsInvalid();
     }
     return { token, expiresAt: expiresAt.toISOString() };
   }
 
-  authenticate(token: string | undefined) {
+  async authenticate(token: string | undefined) {
     if (!token) return undefined;
     const tokenHash = createHash('sha256').update(token).digest('hex');
-    const user = this.repository.findSession(tokenHash);
+    const user = await this.repository.findSession(tokenHash);
     return user ? { tokenHash, user } : undefined;
   }
 
-  logout(tokenHash: string): void {
-    this.repository.deleteSession(tokenHash);
+  async logout(tokenHash: string): Promise<void> {
+    await this.repository.deleteSession(tokenHash);
   }
 
   private throwCredentialsInvalid(): never {

@@ -4,19 +4,25 @@ import { App } from 'supertest/types';
 
 import { configureApp } from '../../src/app.setup';
 import { AppModule } from '../../src/app.module';
+import { DatabaseService } from '../../src/database/database.service';
+
+import { createTestDatabase } from './create-test-database';
 
 export async function createTestApp(
   controllers: Type<unknown>[] = [],
+  database?: DatabaseService,
 ): Promise<INestApplication<App>> {
-  const previousDatabasePath = process.env.DATABASE_PATH;
-  process.env.DATABASE_PATH = ':memory:';
+  const testDatabase = database ?? (await createTestDatabase());
   let app: INestApplication<App> | undefined;
 
   try {
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
       controllers,
-    }).compile();
+    })
+      .overrideProvider(DatabaseService)
+      .useValue(testDatabase)
+      .compile();
     app = moduleRef.createNestApplication<INestApplication<App>>();
 
     configureApp(app);
@@ -25,12 +31,7 @@ export async function createTestApp(
     return app;
   } catch (error) {
     await app?.close();
+    if (!app) await testDatabase.onModuleDestroy();
     throw error;
-  } finally {
-    if (previousDatabasePath === undefined) {
-      delete process.env.DATABASE_PATH;
-    } else {
-      process.env.DATABASE_PATH = previousDatabasePath;
-    }
   }
 }

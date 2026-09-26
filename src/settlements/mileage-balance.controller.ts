@@ -29,7 +29,7 @@ export class MileageBalanceController {
       properties: { accumulatedMileage: { type: 'integer', minimum: 0 } },
     },
   })
-  balance(@Req() request: AuthenticatedRequest) {
+  async balance(@Req() request: AuthenticatedRequest) {
     return this.settlements.balance(request.authSession.user.id);
   }
 }

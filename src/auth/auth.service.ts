@@ -66,7 +66,7 @@ export class AuthService {
   ) {}
 
   async login(input: LoginRequestDto): Promise<LoginResponseDto> {
-    const user = this.authRepository.findDriverCredentials(input.email);
+    const user = await this.authRepository.findDriverCredentials(input.email);
     const passwordMatches = await argon2.verify(
       user?.passwordHash ?? MISSING_USER_PASSWORD_HASH,
       input.password,
@@ -84,7 +84,7 @@ export class AuthService {
     const expiresAt = new Date(createdAt.getTime() + SESSION_LIFETIME_MS);
 
     try {
-      this.authRepository.createLoginSession({
+      await this.authRepository.createLoginSession({
         userId: user.id,
         passwordHash: user.passwordHash,
         tokenHash: createHash('sha256').update(token).digest('hex'),
@@ -104,9 +104,9 @@ export class AuthService {
     return { token, expiresAt: expiresAt.toISOString() };
   }
 
-  authenticateSession(
+  async authenticateSession(
     token: string | undefined,
-  ): AuthenticatedSession | undefined {
+  ): Promise<AuthenticatedSession | undefined> {
     if (!token) return undefined;
 
     return this.authenticateSessionHash(
@@ -115,9 +115,11 @@ export class AuthService {
   }
 
   // Recheck long-running uploads/reads after external I/O without retaining the raw token.
-  authenticateSessionHash(tokenHash: string): AuthenticatedSession | undefined {
+  async authenticateSessionHash(
+    tokenHash: string,
+  ): Promise<AuthenticatedSession | undefined> {
     const now = new Date(Date.now());
-    const user = this.authRepository.useSession(
+    const user = await this.authRepository.useSession(
       tokenHash,
       now,
       new Date(now.getTime() - SESSION_IDLE_TIMEOUT_MS),
@@ -126,14 +128,14 @@ export class AuthService {
     return user ? { tokenHash, user } : undefined;
   }
 
-  logout(tokenHash: string): void {
-    this.authRepository.deleteSession(tokenHash);
+  async logout(tokenHash: string): Promise<void> {
+    await this.authRepository.deleteSession(tokenHash);
   }
 
-  findEmail(input: FindEmailRequestDto): FindEmailResponseDto {
+  async findEmail(input: FindEmailRequestDto): Promise<FindEmailResponseDto> {
     let email: string | undefined;
     try {
-      email = this.authRepository.findEmailWithProof(
+      email = await this.authRepository.findEmailWithProof(
         input.phone,
         createHash('sha256').update(input.verificationProof).digest('hex'),
       );
@@ -160,7 +162,7 @@ export class AuthService {
     session: AuthenticatedSession,
     input: ChangePasswordRequestDto,
   ): Promise<void> {
-    const user = this.authRepository.findDriverPassword(session.user.id);
+    const user = await this.authRepository.findDriverPassword(session.user.id);
     if (!user?.passwordHash) this.throwSessionInvalid();
     if (!(await argon2.verify(user.passwordHash, input.currentPassword))) {
       throw new BadRequestException({
@@ -173,7 +175,7 @@ export class AuthService {
       type: argon2.argon2id,
     });
     const now = new Date(Date.now());
-    const changed = this.authRepository.changeDriverPassword({
+    const changed = await this.authRepository.changeDriverPassword({
       userId: session.user.id,
       tokenHash: session.tokenHash,
       previousPasswordHash: user.passwordHash,
@@ -191,26 +193,28 @@ export class AuthService {
     });
   }
 
-  validatePasswordReset(token: string): void {
+  async validatePasswordReset(token: string): Promise<void> {
     const tokenHash = createHash('sha256').update(token).digest('hex');
-    if (!this.authRepository.findPasswordReset(tokenHash)?.passwordHash) {
+    if (
+      !(await this.authRepository.findPasswordReset(tokenHash))?.passwordHash
+    ) {
       this.throwPasswordResetInvalid();
     }
   }
 
   async resetPassword(input: ResetPasswordRequestDto): Promise<void> {
     const tokenHash = createHash('sha256').update(input.token).digest('hex');
-    const user = this.authRepository.findPasswordReset(tokenHash);
+    const user = await this.authRepository.findPasswordReset(tokenHash);
     if (!user?.passwordHash) this.throwPasswordResetInvalid();
     const passwordHash = await argon2.hash(input.newPassword, {
       type: argon2.argon2id,
     });
     if (
-      !this.authRepository.resetDriverPassword(
+      !(await this.authRepository.resetDriverPassword(
         tokenHash,
         user.passwordHash,
         passwordHash,
-      )
+      ))
     ) {
       this.throwPasswordResetInvalid();
     }
@@ -221,9 +225,11 @@ export class AuthService {
     session?: AuthenticatedSession,
   ): Promise<void> {
     const configuration = this.emailService.getResetConfiguration();
-    let recipient: ReturnType<AuthRepository['claimPasswordResetEmail']>;
+    let recipient: Awaited<
+      ReturnType<AuthRepository['claimPasswordResetEmail']>
+    >;
     try {
-      recipient = this.authRepository.claimPasswordResetEmail(
+      recipient = await this.authRepository.claimPasswordResetEmail(
         session?.user.email ?? input.email,
         input.phone,
         createHash('sha256').update(input.verificationProof).digest('hex'),
@@ -247,12 +253,12 @@ export class AuthService {
       token,
     );
     if (
-      !this.authRepository.activatePasswordResetEmail(
+      !(await this.authRepository.activatePasswordResetEmail(
         recipient,
         createHash('sha256').update(token).digest('hex'),
         randomUUID(),
         this.resetEmailSession(session),
-      )
+      ))
     ) {
       throw new BadRequestException({
         code: 'PASSWORD_RESET_REQUEST_INVALID',
@@ -318,7 +324,7 @@ export class AuthService {
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
 
     try {
-      this.authRepository.beginPhoneVerification(
+      await this.authRepository.beginPhoneVerification(
         verificationId,
         phone,
         codeHash,
@@ -331,7 +337,7 @@ export class AuthService {
       throw error;
     }
     await this.smsService.sendVerificationCode(phone, code);
-    const expiresAt = this.authRepository.activatePhoneVerification(
+    const expiresAt = await this.authRepository.activatePhoneVerification(
       verificationId,
       purpose,
       userId,
@@ -348,14 +354,14 @@ export class AuthService {
     return { verificationId, expiresAt };
   }
 
-  confirmPhoneVerification(
+  async confirmPhoneVerification(
     verificationId: string,
     code: string,
     purpose: VerificationPurpose,
     userId?: string,
-  ): ConfirmPhoneVerificationResponseDto {
+  ): Promise<ConfirmPhoneVerificationResponseDto> {
     const codeHash = this.hashVerificationCode(verificationId, code, purpose);
-    const verification = this.authRepository.findActivePhoneVerification(
+    const verification = await this.authRepository.findActivePhoneVerification(
       verificationId,
       purpose,
       userId,
@@ -381,7 +387,7 @@ export class AuthService {
     const proofHash = createHash('sha256')
       .update(verificationProof)
       .digest('hex');
-    const expiresAt = this.authRepository.confirmPhoneVerification(
+    const expiresAt = await this.authRepository.confirmPhoneVerification(
       verificationId,
       proofHash,
       purpose,
@@ -395,13 +401,13 @@ export class AuthService {
     return { verificationProof, expiresAt };
   }
 
-  changePhone(
+  async changePhone(
     session: AuthenticatedSession,
     input: ChangePhoneRequestDto,
-  ): void {
+  ): Promise<void> {
     const now = new Date(Date.now());
     try {
-      const changed = this.authRepository.changeDriverPhone({
+      const changed = await this.authRepository.changeDriverPhone({
         userId: session.user.id,
         tokenHash: session.tokenHash,
         phone: input.phone,
@@ -440,7 +446,7 @@ export class AuthService {
       const passwordHash = await argon2.hash(input.password, {
         type: argon2.argon2id,
       });
-      const id = this.authRepository.createDriver({
+      const id = await this.authRepository.createDriver({
         email: input.email,
         id: randomUUID(),
         logisticsCompanyId: input.logisticsCompanyId,

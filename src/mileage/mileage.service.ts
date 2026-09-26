@@ -73,8 +73,8 @@ export class MileageService {
       )
       .digest('hex');
     const key = input.idempotencyKey.toLowerCase();
-    this.revalidate(session);
-    const existing = this.repository.findByKey(session.user.id, key);
+    await this.revalidate(session);
+    const existing = await this.repository.findByKey(session.user.id, key);
     if (existing) {
       this.assertSameRequest(existing, requestHash);
       return this.findOne(session.user.id, existing.id);
@@ -95,7 +95,7 @@ export class MileageService {
       photo.originalStorageKey,
       photo.storageKey,
     ]);
-    this.repository.trackAttempt(id, session.user.id, keys);
+    await this.repository.trackAttempt(id, session.user.id, keys);
     try {
       for (let i = 0; i < photos.length; i++) {
         await this.storage.put(
@@ -111,9 +111,8 @@ export class MileageService {
           pair[i].size,
         );
       }
-      // No await between final session validation and the synchronous DB transaction.
-      const current = this.revalidate(session);
-      const saved = this.repository.commit({
+      const current = await this.revalidate(session);
+      const saved = await this.repository.commit({
         id,
         userId: current.user.id,
         logisticsCompanyId: current.user.logisticsCompanyId,
@@ -125,7 +124,7 @@ export class MileageService {
       });
       if (saved.id !== id) await this.cleanup(id, keys, false);
       this.assertSameRequest(saved, requestHash);
-      this.revalidate(session);
+      await this.revalidate(session);
       return this.findOne(session.user.id, saved.id);
     } catch (error) {
       // Keep failed attempt records: a timed-out remote PUT may have completed ambiguously.
@@ -148,14 +147,14 @@ export class MileageService {
         code: 'VALIDATION_ERROR',
         message: '교체할 사진을 한 장 이상 선택해 주세요.',
       });
-    const row = this.repository.findOne(session.user.id, id);
+    const row = await this.repository.findOne(session.user.id, id);
     if (!row) throw this.notFound();
     const photoMode = input.photoMode ?? 'separate';
     const key = input.idempotencyKey.toLowerCase();
     if (
       (photoMode === 'single' &&
         (kinds.length !== 1 || kinds[0] !== 'receipt')) ||
-      (!this.repository.findResubmission(id, key) &&
+      (!(await this.repository.findResubmission(id, key)) &&
         photoMode === 'separate' &&
         row.photoMode === 'single' &&
         kinds.length !== 2)
@@ -165,7 +164,7 @@ export class MileageService {
         message: '선택한 장수에 맞는 사진을 새로 등록해 주세요.',
       });
     }
-    if (!this.repository.findResubmission(id, key))
+    if (!(await this.repository.findResubmission(id, key)))
       this.repository.assertResubmittable(row, input.submissionVersion);
     const processed = await this.processor.processPhotos(
       kinds.map((kind) => files[kind]![0]),
@@ -179,8 +178,8 @@ export class MileageService {
         ]),
       )
       .digest('hex');
-    this.revalidate(session);
-    const replay = this.repository.findResubmission(id, key);
+    await this.revalidate(session);
+    const replay = await this.repository.findResubmission(id, key);
     if (replay) {
       this.assertSameRequest(replay, requestHash);
       return this.findOne(session.user.id, id);
@@ -200,7 +199,7 @@ export class MileageService {
       photo.originalStorageKey,
       photo.storageKey,
     ]);
-    this.repository.trackAttempt(attemptId, session.user.id, keys);
+    await this.repository.trackAttempt(attemptId, session.user.id, keys);
     try {
       for (let i = 0; i < photos.length; i++) {
         await this.storage.put(
@@ -216,8 +215,8 @@ export class MileageService {
           processed[i].size,
         );
       }
-      const current = this.revalidate(session);
-      const saved = this.repository.commitResubmission({
+      const current = await this.revalidate(session);
+      const saved = await this.repository.commitResubmission({
         id,
         userId: current.user.id,
         attemptId,
@@ -230,7 +229,7 @@ export class MileageService {
       });
       if (!saved.committed) await this.cleanup(attemptId, keys, false);
       this.assertSameRequest(saved, requestHash);
-      this.revalidate(session);
+      await this.revalidate(session);
       return this.findOne(session.user.id, id);
     } catch (error) {
       await this.cleanup(attemptId, keys, true);
@@ -238,10 +237,13 @@ export class MileageService {
     }
   }
 
-  findList(userId: string, input: MileageListQueryDto): MileageListDto {
+  async findList(
+    userId: string,
+    input: MileageListQueryDto,
+  ): Promise<MileageListDto> {
     const query = { ...input, ...normalizeDateRange(input) };
     const cursor = query.cursor ? this.decodeCursor(query) : undefined;
-    const rows = this.repository.findList(userId, query, cursor);
+    const rows = await this.repository.findList(userId, query, cursor);
     const limit = query.limit ?? 20;
     const more = rows.length > limit;
     const items = rows.slice(0, limit).map((row) => this.present(row));
@@ -263,8 +265,8 @@ export class MileageService {
     };
   }
 
-  findOne(userId: string, id: string): MileageDetailDto {
-    const row = this.repository.findOne(userId, id);
+  async findOne(userId: string, id: string): Promise<MileageDetailDto> {
+    const row = await this.repository.findOne(userId, id);
     if (!row) throw this.notFound();
     const path = (kind: 'receipt' | 'meter') =>
       row.photos.some(
@@ -291,14 +293,14 @@ export class MileageService {
         code: 'VALIDATION_ERROR',
         message: '사진 종류를 확인해 주세요.',
       });
-    const row = this.repository.findOne(session.user.id, id);
+    const row = await this.repository.findOne(session.user.id, id);
     const photo = row?.photos.find(
       (item) => item.kind === (row.photoMode === 'single' ? 'receipt' : kind),
     );
     if (!photo) throw this.notFound();
     const content = await this.storage.get(photo.storageKey);
-    this.revalidate(session);
-    const latest = this.repository.findOne(session.user.id, id);
+    await this.revalidate(session);
+    const latest = await this.repository.findOne(session.user.id, id);
     const current = latest?.photos.find(
       (item) =>
         item.kind === (latest.photoMode === 'single' ? 'receipt' : kind),
@@ -308,8 +310,10 @@ export class MileageService {
     return content;
   }
 
-  private revalidate(session: AuthenticatedSession): AuthenticatedSession {
-    const current = this.auth.authenticateSessionHash(session.tokenHash);
+  private async revalidate(
+    session: AuthenticatedSession,
+  ): Promise<AuthenticatedSession> {
+    const current = await this.auth.authenticateSessionHash(session.tokenHash);
     if (!current || current.user.id !== session.user.id)
       throw new UnauthorizedException({
         code: 'INVALID_SESSION',
@@ -326,7 +330,7 @@ export class MileageService {
   ): Promise<void> {
     try {
       // The successful DB transaction removes this row. Never delete committed files.
-      if (!this.repository.hasAttempt(id)) return;
+      if (!(await this.repository.hasAttempt(id))) return;
       const results = await Promise.allSettled(
         keys.map((key) => this.storage.remove(key)),
       );
@@ -334,7 +338,7 @@ export class MileageService {
         !keepRecord &&
         results.every((result) => result.status === 'fulfilled')
       )
-        this.repository.forgetAttempt(id);
+        await this.repository.forgetAttempt(id);
       else
         this.logger.warn(
           `Mileage upload attempt requires reconciliation: ${id}`,

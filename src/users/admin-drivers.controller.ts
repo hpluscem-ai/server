@@ -57,7 +57,9 @@ export class AdminDriversController {
     type: ApiErrorResponseDto,
     description: 'INTERNAL_SERVER_ERROR',
   })
-  findAll(@Query() query: AdminDriverListQueryDto): AdminDriverResponseDto[] {
+  findAll(
+    @Query() query: AdminDriverListQueryDto,
+  ): Promise<AdminDriverResponseDto[]> {
     return this.users.findDrivers(query);
   }
 
@@ -89,7 +91,9 @@ export class AdminDriversController {
     type: ApiErrorResponseDto,
     description: 'INTERNAL_SERVER_ERROR',
   })
-  withdraw(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string): void {
-    this.users.withdrawDriver(id);
+  withdraw(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+  ): Promise<void> {
+    return this.users.withdrawDriver(id);
   }
 }

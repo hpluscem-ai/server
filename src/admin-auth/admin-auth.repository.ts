@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { and, eq, gt, isNull } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { DatabaseService } from '../database/database.service';
 import { adminSessions, users } from '../database/schema';
@@ -8,18 +8,18 @@ import { adminSessions, users } from '../database/schema';
 export class AdminAuthRepository {
   constructor(private readonly database: DatabaseService) {}
 
-  findCredentials(email: string) {
-    return this.database.db
+  async findCredentials(email: string) {
+    const [user] = await this.database.db
       .select({ id: users.id, passwordHash: users.passwordHash })
       .from(users)
       .where(
         and(
-          eq(users.email, email),
+          sql`lower(${users.email}) = lower(${email})`,
           eq(users.role, 'admin'),
           isNull(users.deactivatedAt),
         ),
-      )
-      .get();
+      );
+    return user;
   }
 
   createSession(input: {
@@ -28,9 +28,9 @@ export class AdminAuthRepository {
     tokenHash: string;
     createdAt: Date;
     expiresAt: Date;
-  }): boolean {
-    return this.database.db.transaction((transaction) => {
-      const eligible = transaction
+  }): Promise<boolean> {
+    return this.database.db.transaction(async (transaction) => {
+      const [eligible] = await transaction
         .select({ id: users.id })
         .from(users)
         .where(
@@ -41,23 +41,20 @@ export class AdminAuthRepository {
             eq(users.passwordHash, input.passwordHash),
           ),
         )
-        .get();
+        .for('update', { of: [users] });
       if (!eligible) return false;
-      transaction
-        .insert(adminSessions)
-        .values({
-          tokenHash: input.tokenHash,
-          userId: input.userId,
-          createdAt: input.createdAt,
-          expiresAt: input.expiresAt,
-        })
-        .run();
+      await transaction.insert(adminSessions).values({
+        tokenHash: input.tokenHash,
+        userId: input.userId,
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+      });
       return true;
     });
   }
 
-  findSession(tokenHash: string) {
-    return this.database.db
+  async findSession(tokenHash: string) {
+    const [session] = await this.database.db
       .select({ id: users.id, email: users.email, name: users.name })
       .from(adminSessions)
       .innerJoin(users, eq(adminSessions.userId, users.id))
@@ -68,16 +65,15 @@ export class AdminAuthRepository {
           eq(users.role, 'admin'),
           isNull(users.deactivatedAt),
         ),
-      )
-      .get();
+      );
+    return session;
   }
 
-  deleteSession(tokenHash: string): void {
-    this.database.db.transaction((transaction) => {
-      transaction
+  async deleteSession(tokenHash: string): Promise<void> {
+    await this.database.db.transaction(async (transaction) => {
+      await transaction
         .delete(adminSessions)
-        .where(eq(adminSessions.tokenHash, tokenHash))
-        .run();
+        .where(eq(adminSessions.tokenHash, tokenHash));
     });
   }
 }

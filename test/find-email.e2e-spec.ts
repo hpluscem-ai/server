@@ -25,66 +25,62 @@ describe('Find email (e2e)', () => {
     app = await createTestApp();
     database = app.get(DatabaseService);
   });
-  beforeEach(() => {
-    database.connection.exec(
-      'DELETE FROM users; DELETE FROM phone_verifications; DELETE FROM logistics_companies;',
-    );
+  beforeEach(async () => {
+    await database.db.delete(users);
+    await database.db.delete(phoneVerifications);
+    await database.db.delete(logisticsCompanies);
     companyId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: phone,
-        bankCode: '19',
-        accountNumber: '123456',
-        accountHolder: '물류사',
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: phone,
+      bankCode: '19',
+      accountNumber: '123456',
+      accountHolder: '물류사',
+    });
     userId = randomUUID();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: 'driver@example.com',
-        passwordHash: 'test-only-unused-hash',
-        name: '기사',
-        phone,
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: 'driver@example.com',
+      passwordHash: 'test-only-unused-hash',
+      name: '기사',
+      phone,
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
   });
-  afterEach(() => {
-    database.connection.exec('DROP TRIGGER IF EXISTS fail_find_email;');
+  afterEach(async () => {
+    await database.connection.unsafe(
+      'DROP TRIGGER IF EXISTS fail_find_email ON app.phone_verifications',
+    );
+    await database.connection.unsafe(
+      'DROP FUNCTION IF EXISTS app.fail_find_email()',
+    );
     jest.restoreAllMocks();
   });
   afterAll(async () => app.close());
 
-  function proof(
+  async function proof(
     overrides: Partial<typeof phoneVerifications.$inferInsert> = {},
   ) {
     const value = randomBytes(32).toString('base64url');
     const id = randomUUID();
-    database.db
-      .insert(phoneVerifications)
-      .values({
-        id,
-        purpose: 'find_email',
-        phone,
-        codeHash: '0'.repeat(64),
-        proofHash: createHash('sha256').update(value).digest('hex'),
-        verifiedAt: new Date().toISOString(),
-        expiresAt: '2099-01-01 00:00:00',
-        ...overrides,
-      })
-      .run();
+    await database.db.insert(phoneVerifications).values({
+      id,
+      purpose: 'find_email',
+      phone,
+      codeHash: '0'.repeat(64),
+      proofHash: createHash('sha256').update(value).digest('hex'),
+      verifiedAt: new Date().toISOString(),
+      expiresAt: '2099-01-01 00:00:00',
+      ...overrides,
+    });
     return { id, value };
   }
   function find(value: string, extra: object = {}) {
@@ -92,12 +88,13 @@ describe('Find email (e2e)', () => {
       .post(path)
       .send({ phone, verificationProof: value, ...extra });
   }
-  function saved(id: string) {
-    return database.db
+  async function saved(id: string) {
+    const [row] = await database.db
       .select()
       .from(phoneVerifications)
       .where(eq(phoneVerifications.id, id))
-      .get()!;
+      .limit(1);
+    return row;
   }
 
   it('uses a real purpose-scoped SMS proof and returns only the masked result once', async () => {
@@ -137,7 +134,7 @@ describe('Find email (e2e)', () => {
       maskedEmail: 'dr****@example.com',
       phoneLastFour: '5678',
     });
-    expect(saved(id).consumedAt).not.toBeNull();
+    expect((await saved(id)).consumedAt).not.toBeNull();
     expect((await find(value).expect(400)).body).toMatchObject({
       code: 'PHONE_VERIFICATION_INVALID',
     });
@@ -149,8 +146,8 @@ describe('Find email (e2e)', () => {
     ['abc@example.com', 'ab*@example.com'],
     ['abcd@example.com', 'ab**@example.com'],
   ])('masks %s', async (email, maskedEmail) => {
-    database.db.update(users).set({ email }).where(eq(users.id, userId)).run();
-    expect((await find(proof().value).expect(200)).body).toEqual({
+    await database.db.update(users).set({ email }).where(eq(users.id, userId));
+    expect((await find((await proof()).value).expect(200)).body).toEqual({
       maskedEmail,
       phoneLastFour: '5678',
     });
@@ -159,8 +156,8 @@ describe('Find email (e2e)', () => {
   it.each(['sign_up', 'reset_password', 'change_phone'])(
     'rejects a %s proof without consumption',
     async (purpose) => {
-      const item = proof({
-        purpose,
+      const item = await proof({
+        purpose: purpose as typeof phoneVerifications.$inferInsert.purpose,
         ...(purpose === 'reset_password'
           ? { scopeEmail: 'driver@example.com' }
           : {}),
@@ -168,7 +165,7 @@ describe('Find email (e2e)', () => {
       expect((await find(item.value).expect(400)).body).toMatchObject({
         code: 'PHONE_VERIFICATION_INVALID',
       });
-      expect(saved(item.id).consumedAt).toBeNull();
+      expect((await saved(item.id)).consumedAt).toBeNull();
     },
   );
 
@@ -179,9 +176,9 @@ describe('Find email (e2e)', () => {
     { consumedAt: '2026-01-01 00:00:00' },
     { invalidatedAt: '2026-01-01 00:00:00' },
   ])('rejects an invalid proof scope/state: %j', async (overrides) => {
-    expect((await find(proof(overrides).value).expect(400)).body).toMatchObject(
-      { code: 'PHONE_VERIFICATION_INVALID' },
-    );
+    expect(
+      (await find((await proof(overrides)).value).expect(400)).body,
+    ).toMatchObject({ code: 'PHONE_VERIFICATION_INVALID' });
   });
 
   it.each([
@@ -201,52 +198,57 @@ describe('Find email (e2e)', () => {
   it.each(['absent', 'admin', 'deactivated'])(
     'does not expose %s accounts and consumes the proof',
     async (state) => {
-      if (state === 'absent') database.db.delete(users).run();
+      if (state === 'absent') await database.db.delete(users);
       else
-        database.db
+        await database.db
           .update(users)
           .set(
             state === 'admin'
               ? { role: 'admin' }
               : { deactivatedAt: '2026-01-01 00:00:00' },
-          )
-          .run();
-      const item = proof();
+          );
+      const item = await proof();
       expect((await find(item.value).expect(404)).body).toEqual({
         statusCode: 404,
         code: 'ACCOUNT_NOT_FOUND',
         message: '일치하는 회원정보를 찾을 수 없습니다.',
       });
-      expect(saved(item.id).consumedAt).not.toBeNull();
+      expect((await saved(item.id)).consumedAt).not.toBeNull();
       await find(item.value).expect(400);
     },
   );
 
   it('keeps identity lookup available when the company cannot log in', async () => {
-    database.db.update(logisticsCompanies).set({ active: false }).run();
-    await find(proof().value).expect(200);
+    await database.db.update(logisticsCompanies).set({ active: false });
+    await find((await proof()).value).expect(200);
   });
   it('allows only one simultaneous consumption', async () => {
-    const item = proof();
+    const item = await proof();
     const results = await Promise.all([find(item.value), find(item.value)]);
     expect(results.map((r) => r.status).sort()).toEqual([200, 400]);
   });
   it('does not hide a database failure or leak sensitive error text', async () => {
-    const item = proof();
+    const item = await proof();
     const log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
-    database.connection.exec(
-      "CREATE TRIGGER fail_find_email BEFORE UPDATE ON phone_verifications BEGIN SELECT RAISE(ABORT, 'driver@example.com private-proof'); END;",
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_find_email() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'driver@example.com private-proof'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_find_email BEFORE UPDATE ON app.phone_verifications FOR EACH ROW EXECUTE FUNCTION app.fail_find_email()',
     );
     expect((await find(item.value).expect(500)).body).toMatchObject({
       code: 'INTERNAL_SERVER_ERROR',
     });
-    expect(saved(item.id).consumedAt).toBeNull();
+    expect((await saved(item.id)).consumedAt).toBeNull();
     expect(JSON.stringify(log.mock.calls)).not.toMatch(
       /driver@example.com|private-proof/,
     );
-    database.connection.exec('DROP TRIGGER fail_find_email;');
+    await database.connection.unsafe(
+      'DROP TRIGGER fail_find_email ON app.phone_verifications',
+    );
+    await database.connection.unsafe('DROP FUNCTION app.fail_find_email()');
     await find(item.value).expect(200);
   });
   it('documents request, result and failures in Swagger', async () => {

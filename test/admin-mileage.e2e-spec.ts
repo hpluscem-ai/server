@@ -28,6 +28,7 @@ import {
 } from '../src/mileage';
 import { seedAdminSession } from './helpers/seed-admin-session';
 import { SettlementsService } from '../src/settlements';
+import { createTestDatabase } from './helpers/create-test-database';
 
 const URL = '/api/v1/admin/mileage/applications';
 
@@ -39,7 +40,7 @@ describe('Admin mileage reads and review (e2e)', () => {
   let userId: string;
   let applicationId: string;
   let jpeg: Buffer;
-  let beforeGet: (() => void) | undefined;
+  let beforeGet: (() => Promise<void>) | undefined;
   let storageFailure: boolean;
   const storedKeys: string[] = [];
 
@@ -51,116 +52,95 @@ describe('Admin mileage reads and review (e2e)', () => {
       .toBuffer();
   });
   beforeEach(async () => {
-    const previousPath = process.env.DATABASE_PATH;
-    process.env.DATABASE_PATH = ':memory:';
     beforeGet = undefined;
     storageFailure = false;
     storedKeys.length = 0;
-    try {
-      const module = await Test.createTestingModule({ imports: [AppModule] })
-        .overrideProvider(PhotoStorageService)
-        .useValue({
-          get: (key: string) => {
-            storedKeys.push(key);
-            beforeGet?.();
-            if (storageFailure)
-              return Promise.reject(
-                new ServiceUnavailableException({
-                  code: 'PHOTO_STORAGE_UNAVAILABLE',
-                }),
-              );
-            return Promise.resolve(jpeg);
-          },
-        })
-        .compile();
-      app = module.createNestApplication<INestApplication<App>>();
-      configureApp(app);
-      await app.init();
-    } finally {
-      if (previousPath === undefined) delete process.env.DATABASE_PATH;
-      else process.env.DATABASE_PATH = previousPath;
-    }
-    database = app.get(DatabaseService);
-    authorization = seedAdminSession(database);
-    companyId = addCompany();
+    database = await createTestDatabase();
+    const module = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(DatabaseService)
+      .useValue(database)
+      .overrideProvider(PhotoStorageService)
+      .useValue({
+        get: async (key: string) => {
+          storedKeys.push(key);
+          await beforeGet?.();
+          if (storageFailure)
+            throw new ServiceUnavailableException({
+              code: 'PHOTO_STORAGE_UNAVAILABLE',
+            });
+          return jpeg;
+        },
+      })
+      .compile();
+    app = module.createNestApplication<INestApplication<App>>();
+    configureApp(app);
+    await app.init();
+    authorization = await seedAdminSession(database);
+    companyId = await addCompany();
     userId = randomUUID();
-    database.db
-      .insert(users)
-      .values({
-        id: userId,
-        role: 'driver',
-        email: 'driver@example.test',
-        name: '김 %_ 기사',
-        phone: '010-1234-5678',
-        passwordHash: 'unused-test-hash',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(users).values({
+      id: userId,
+      role: 'driver',
+      email: 'driver@example.test',
+      name: '김 %_ 기사',
+      phone: '010-1234-5678',
+      passwordHash: 'unused-test-hash',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     applicationId = randomUUID();
-    database.db
-      .insert(mileageApplications)
-      .values({
-        id: applicationId,
-        userId,
-        logisticsCompanyId: companyId,
-        idempotencyKey: randomUUID(),
-        submittedAt: '2026-09-22T00:00:00Z',
-      })
-      .run();
+    await database.db.insert(mileageApplications).values({
+      id: applicationId,
+      userId,
+      logisticsCompanyId: companyId,
+      idempotencyKey: randomUUID(),
+      submittedAt: '2026-09-22T00:00:00Z',
+    });
     for (const kind of ['receipt', 'meter'] as const) {
-      database.db
-        .insert(mileagePhotos)
-        .values({
-          id: randomUUID(),
-          mileageApplicationId: applicationId,
-          kind,
-          storageKey: `private/${kind}.jpg`,
-          originalStorageKey: `private/original-${kind}.png`,
-          contentType: 'image/jpeg',
-          byteSize: jpeg.length,
-        })
-        .run();
+      await database.db.insert(mileagePhotos).values({
+        id: randomUUID(),
+        mileageApplicationId: applicationId,
+        kind,
+        storageKey: `private/${kind}.jpg`,
+        originalStorageKey: `private/original-${kind}.png`,
+        contentType: 'image/jpeg',
+        byteSize: jpeg.length,
+      });
     }
   });
   afterEach(async () => {
     await app?.close();
+    await database?.onModuleDestroy();
   });
 
-  function addCompany() {
+  async function addCompany() {
     const id = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id,
-        businessName: '같은 회사명',
-        businessNumber: randomUUID(),
-        corporateRegistrationNumber: randomUUID(),
-        businessAddress: '서울',
-        managerName: '담당자',
-        managerPhone: '010-2222-3333',
-        bankCode: '19',
-        accountNumber: '001',
-        accountHolder: 'QA',
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id,
+      businessName: '같은 회사명',
+      businessNumber: randomUUID(),
+      corporateRegistrationNumber: randomUUID(),
+      businessAddress: '서울',
+      managerName: '담당자',
+      managerPhone: '010-2222-3333',
+      bankCode: '19',
+      accountNumber: '001',
+      accountHolder: 'QA',
+    });
     return id;
   }
 
   it('requires an administrator for every read and accepts the existing admin cookie', async () => {
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      userId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 600000),
+    });
     for (const path of [
       '',
       `/${applicationId}`,
@@ -219,7 +199,7 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('filters literal names and company IDs without conflating equal company names', async () => {
-    const secondCompany = addCompany();
+    const secondCompany = await addCompany();
     for (const nameQuery of ['%_', ' 김 ', '기사']) {
       const result = await request(app.getHttpServer())
         .get(URL)
@@ -258,7 +238,7 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('retains withdrawn, inactive and completed history using the original application owner', async () => {
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({
         approvalStatus: 'approved',
@@ -266,41 +246,33 @@ describe('Admin mileage reads and review (e2e)', () => {
         mileageAmount: 200,
         decidedAt: '2026-09-22T01:00:00Z',
       })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     const settlementId = randomUUID();
-    database.db
-      .insert(settlements)
-      .values({
-        id: settlementId,
-        logisticsCompanyId: companyId,
-        settlementMonth: '2026-09',
-        transferStatus: 'pending',
-      })
-      .run();
-    database.db
+    await database.db.insert(settlements).values({
+      id: settlementId,
+      logisticsCompanyId: companyId,
+      settlementMonth: '2026-09',
+      transferStatus: 'pending',
+    });
+    await database.db
       .update(mileageApplications)
       .set({ settlementId })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
-    database.db
+      .where(eq(mileageApplications.id, applicationId));
+    await database.db
       .update(settlements)
       .set({
         transferStatus: 'completed',
         transferredAt: '2026-09-22T02:00:00Z',
       })
-      .where(eq(settlements.id, settlementId))
-      .run();
-    database.db
+      .where(eq(settlements.id, settlementId));
+    await database.db
       .update(users)
       .set({ deactivatedAt: '2026-09-22T03:00:00Z', passwordHash: null })
-      .where(eq(users.id, userId))
-      .run();
-    database.db
+      .where(eq(users.id, userId));
+    await database.db
       .update(logisticsCompanies)
       .set({ active: false })
-      .where(eq(logisticsCompanies.id, companyId))
-      .run();
+      .where(eq(logisticsCompanies.id, companyId));
     const result = await request(app.getHttpServer())
       .get(URL)
       .set('Authorization', authorization)
@@ -330,10 +302,9 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(photo.headers['x-content-type-options']).toBe('nosniff');
     expect(photo.body).toEqual(jpeg);
     expect(storedKeys).toEqual(['private/receipt.jpg']);
-    database.db
+    await database.db
       .delete(mileagePhotos)
-      .where(eq(mileagePhotos.mileageApplicationId, applicationId))
-      .run();
+      .where(eq(mileagePhotos.mileageApplicationId, applicationId));
     const detail = await request(app.getHttpServer())
       .get(`${URL}/${applicationId}`)
       .set('Authorization', authorization)
@@ -359,8 +330,8 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('rejects a session revoked during storage access and does not return the photo', async () => {
-    beforeGet = () => {
-      database.db.delete(adminSessions).run();
+    beforeGet = async () => {
+      await database.db.delete(adminSessions);
     };
     const result = await request(app.getHttpServer())
       .get(`${URL}/${applicationId}/photos/receipt`)
@@ -373,12 +344,11 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('rejects changed photo identity during storage access and propagates storage failures', async () => {
-    beforeGet = () => {
-      database.db
+    beforeGet = async () => {
+      await database.db
         .update(mileagePhotos)
         .set({ storageKey: 'replaced.jpg' })
-        .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'))
-        .run();
+        .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'));
     };
     await request(app.getHttpServer())
       .get(`${URL}/${applicationId}/photos/receipt`)
@@ -415,6 +385,25 @@ describe('Admin mileage reads and review (e2e)', () => {
       .send(input);
   }
 
+  async function adminSessionDiagnostic() {
+    const token = authorization.slice('Bearer '.length);
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    return (
+      await database.db
+        .select({
+          userId: users.id,
+          role: users.role,
+          deactivatedAt: users.deactivatedAt,
+          createdAt: adminSessions.createdAt,
+          expiresAt: adminSessions.expiresAt,
+        })
+        .from(adminSessions)
+        .innerJoin(users, eq(adminSessions.userId, users.id))
+        .where(eq(adminSessions.tokenHash, tokenHash))
+        .limit(1)
+    )[0];
+  }
+
   it.each([
     ['5.124', 102],
     ['5.125', 103],
@@ -423,15 +412,14 @@ describe('Admin mileage reads and review (e2e)', () => {
   ])(
     'approves admin-confirmed values using exact rounding for %s L',
     async (liters, mileageAmount) => {
-      database.db
+      await database.db
         .update(mileageApplications)
         .set({
           receiptAmount: 10000,
           meterAmount: 8000,
           matchStatus: 'mismatched',
         })
-        .where(eq(mileageApplications.id, applicationId))
-        .run();
+        .where(eq(mileageApplications.id, applicationId));
       const before = await snapshot();
       const result = await approve({
         reviewVersion: before.reviewVersion,
@@ -450,7 +438,7 @@ describe('Admin mileage reads and review (e2e)', () => {
       });
       expect((result.body as AdminMileageResponseDto).decidedAt).not.toBeNull();
       expect(await snapshot()).toEqual(result.body);
-      expect(app.get(SettlementsService).balance(userId)).toEqual({
+      expect(await app.get(SettlementsService).balance(userId)).toEqual({
         accumulatedMileage: mileageAmount,
       });
     },
@@ -470,24 +458,32 @@ describe('Admin mileage reads and review (e2e)', () => {
       ),
       { ...valid, reviewVersion: 'wrong' },
       { ...valid, mileageAmount: 999 },
-    ])
-      await approve(input).expect(400);
+    ]) {
+      const response = await approve(input);
+      if (response.status !== 400) {
+        throw new Error(
+          `Expected 400 for manual approval validation, got ${response.status}; ` +
+            `session=${JSON.stringify(await adminSessionDiagnostic())}`,
+        );
+      }
+      expect(response.status).toBe(400);
+    }
     expect((await snapshot()).status).toBe('pending');
     await approve({ ...valid, finalAmount: 0, liters: '0' }).expect(200);
   });
 
   it('preserves repeated approval and rejects different decisions or late OCR overwrites', async () => {
-    const job = ocrJob();
+    const job = await ocrJob();
     const reviewVersion = (await snapshot()).reviewVersion;
     const body = { reviewVersion, finalAmount: 10000, liters: '5.125' };
     const responses = await Promise.all(
-      [authorization, seedAdminSession(database)].map((auth) =>
+      [authorization, await seedAdminSession(database)].map((auth) =>
         approve(body, auth),
       ),
     );
     expect(responses.map((response) => response.status)).toEqual([200, 200]);
     expect(responses[0].body).toEqual(responses[1].body);
-    app.get(MileageRepository).finishOcrJob(job, reading);
+    await app.get(MileageRepository).finishOcrJob(job, reading);
     await approve(body).expect(200).expect(responses[0].body);
     await approve({ ...body, finalAmount: 20000 }).expect(409);
     await approve({ ...body, liters: '10' }).expect(409);
@@ -495,13 +491,71 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(await snapshot()).toEqual(responses[0].body);
   });
 
+  it('approves more concurrent reviews than the database pool has connections', async () => {
+    const applicationIds = [applicationId];
+    for (let index = 0; index < 5; index++) {
+      const id = randomUUID();
+      applicationIds.push(id);
+      await database.db.insert(mileageApplications).values({
+        id,
+        userId,
+        logisticsCompanyId: companyId,
+        idempotencyKey: randomUUID(),
+        submittedAt: '2026-09-22T00:00:00Z',
+      });
+      await database.db.insert(mileagePhotos).values(
+        (['receipt', 'meter'] as const).map((kind) => ({
+          id: randomUUID(),
+          mileageApplicationId: id,
+          kind,
+          storageKey: `private/${id}/${kind}.jpg`,
+          contentType: 'image/jpeg',
+          byteSize: jpeg.length,
+        })),
+      );
+    }
+
+    const details = await Promise.all(
+      applicationIds.map(async (id) => {
+        const response = await request(app.getHttpServer())
+          .get(`${URL}/${id}`)
+          .set('Authorization', authorization)
+          .expect(200);
+        return response.body as AdminMileageResponseDto;
+      }),
+    );
+    const responses = await Promise.all(
+      details.map((detail) =>
+        request(app.getHttpServer())
+          .post(`${URL}/${detail.id}/approve`)
+          .set('Authorization', authorization)
+          .send({
+            reviewVersion: detail.reviewVersion,
+            finalAmount: 10000,
+            liters: '5',
+          }),
+      ),
+    );
+
+    expect(responses.map((response) => response.status)).toEqual(
+      Array(applicationIds.length).fill(200),
+    );
+    for (const [index, response] of responses.entries()) {
+      expect(response.body).toMatchObject({
+        id: applicationIds[index],
+        status: 'approved',
+        finalAmount: 10000,
+        mileageAmount: 100,
+      });
+    }
+  });
+
   it('blocks stale, rejected, missing-photo and settlement-attached approval', async () => {
     const old = await snapshot();
-    database.db
+    await database.db
       .update(mileagePhotos)
       .set({ storageKey: 'private/replaced.jpg' })
-      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'))
-      .run();
+      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'));
     await approve({
       reviewVersion: old.reviewVersion,
       finalAmount: 10000,
@@ -514,11 +568,10 @@ describe('Admin mileage reads and review (e2e)', () => {
       finalAmount: 10000,
       liters: '5',
     }).expect(409);
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({ approvalStatus: 'pending', decidedAt: null })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     current = await snapshot();
     await approve({
       reviewVersion: current.reviewVersion,
@@ -526,20 +579,16 @@ describe('Admin mileage reads and review (e2e)', () => {
       liters: '5',
     }).expect(200);
     const settlementId = randomUUID();
-    database.db
-      .insert(settlements)
-      .values({
-        id: settlementId,
-        logisticsCompanyId: companyId,
-        settlementMonth: '2026-09',
-        transferStatus: 'pending',
-      })
-      .run();
-    database.db
+    await database.db.insert(settlements).values({
+      id: settlementId,
+      logisticsCompanyId: companyId,
+      settlementMonth: '2026-09',
+      transferStatus: 'pending',
+    });
+    await database.db
       .update(mileageApplications)
       .set({ settlementId })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     current = await snapshot();
     await approve({
       reviewVersion: current.reviewVersion,
@@ -547,7 +596,7 @@ describe('Admin mileage reads and review (e2e)', () => {
       liters: '5',
     }).expect(409);
     expect(await snapshot()).toEqual(current);
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({
         settlementId: null,
@@ -556,12 +605,10 @@ describe('Admin mileage reads and review (e2e)', () => {
         mileageAmount: null,
         decidedAt: null,
       })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
-    database.db
+      .where(eq(mileageApplications.id, applicationId));
+    await database.db
       .delete(mileagePhotos)
-      .where(eq(mileagePhotos.kind, 'meter'))
-      .run();
+      .where(eq(mileagePhotos.kind, 'meter'));
     current = await snapshot();
     await approve({
       reviewVersion: current.reviewVersion,
@@ -571,20 +618,21 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(await snapshot()).toEqual(current);
   });
 
-  function ocrJob() {
+  async function ocrJob() {
     const repository = app.get(MileageRepository);
-    const record = repository.findOne(userId, applicationId)!;
-    return database.db
-      .insert(mileageOcrJobs)
-      .values({
-        id: randomUUID(),
-        applicationId,
-        sourceVersion: repository.submissionVersion(record),
-        extractorVersion: OCR_VERSION,
-        status: 'running',
-      })
-      .returning()
-      .get();
+    const record = (await repository.findOne(userId, applicationId))!;
+    return (
+      await database.db
+        .insert(mileageOcrJobs)
+        .values({
+          id: randomUUID(),
+          applicationId,
+          sourceVersion: repository.submissionVersion(record),
+          extractorVersion: OCR_VERSION,
+          status: 'running',
+        })
+        .returning()
+    )[0];
   }
 
   const reading = {
@@ -613,10 +661,10 @@ describe('Admin mileage reads and review (e2e)', () => {
   };
 
   it('includes stored OCR liters in the review version even when amount and timestamps are unchanged', async () => {
-    const job = ocrJob();
-    app.get(MileageRepository).finishOcrJob(job, reading);
+    const job = await ocrJob();
+    await app.get(MileageRepository).finishOcrJob(job, reading);
     const before = await snapshot();
-    database.db
+    await database.db
       .update(mileageOcrJobs)
       .set({
         result: {
@@ -624,8 +672,7 @@ describe('Admin mileage reads and review (e2e)', () => {
           meter: { ...reading.meter, litersText: '6.125 리터' },
         },
       })
-      .where(eq(mileageOcrJobs.id, job.id))
-      .run();
+      .where(eq(mileageOcrJobs.id, job.id));
     const after = await snapshot();
     expect(after.reviewVersion).not.toBe(before.reviewVersion);
     expect(after.meterAmount).toBe(before.meterAmount);
@@ -633,12 +680,12 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('preserves a rejection reason on replay after late OCR finishes without applying its readings', async () => {
-    const job = ocrJob();
+    const job = await ocrJob();
     const before = await snapshot();
     const rejected = await reject({
       reviewVersion: before.reviewVersion,
     }).expect(200);
-    app.get(MileageRepository).finishOcrJob(job, reading);
+    await app.get(MileageRepository).finishOcrJob(job, reading);
     await reject({ reviewVersion: before.reviewVersion })
       .expect(200)
       .expect(rejected.body);
@@ -678,16 +725,13 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(await snapshot()).toEqual(body);
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      userId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 600000),
+    });
     const detail = await request(app.getHttpServer())
       .get(`/api/v1/mileage/applications/${applicationId}`)
       .set('Authorization', `Bearer ${token}`)
@@ -696,15 +740,14 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
 
   it('preserves historical reasons and prevents rewriting an existing rejection', async () => {
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({
         approvalStatus: 'rejected',
         rejectionReason: '과거 사유',
         decidedAt: '2026-09-22T01:00:00Z',
       })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     const before = await snapshot();
     await reject({
       reviewVersion: before.reviewVersion,
@@ -727,16 +770,13 @@ describe('Admin mileage reads and review (e2e)', () => {
       const send = action === 'approve' ? approve : reject;
       const token = randomBytes(32).toString('base64url');
       const now = new Date();
-      database.db
-        .insert(authSessions)
-        .values({
-          tokenHash: createHash('sha256').update(token).digest('hex'),
-          userId,
-          createdAt: now,
-          lastUsedAt: now,
-          expiresAt: new Date(now.getTime() + 600000),
-        })
-        .run();
+      await database.db.insert(authSessions).values({
+        tokenHash: createHash('sha256').update(token).digest('hex'),
+        userId,
+        createdAt: now,
+        lastUsedAt: now,
+        expiresAt: new Date(now.getTime() + 600000),
+      });
       await request(app.getHttpServer())
         .post(`${URL}/${applicationId}/${action}`)
         .send(body)
@@ -779,7 +819,7 @@ describe('Admin mileage reads and review (e2e)', () => {
 
   it('serializes identical rejections and preserves the first decision', async () => {
     const { reviewVersion } = await snapshot();
-    const secondAdmin = seedAdminSession(database);
+    const secondAdmin = await seedAdminSession(database);
     const responses = await Promise.all(
       [authorization, secondAdmin].map((auth) =>
         reject({ reviewVersion }, auth),
@@ -793,20 +833,18 @@ describe('Admin mileage reads and review (e2e)', () => {
 
   it('blocks stale reviews after photo replacement or changed OCR input, even with unchanged timestamps', async () => {
     const old = await snapshot();
-    database.db
+    await database.db
       .update(mileagePhotos)
       .set({ storageKey: 'private/new-receipt.jpg' })
-      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'))
-      .run();
+      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'));
     await reject({
       reviewVersion: old.reviewVersion,
     }).expect(409);
     const changed = await snapshot();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({ meterAmount: 12345 })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     await reject({
       reviewVersion: changed.reviewVersion,
     }).expect(409);
@@ -819,23 +857,20 @@ describe('Admin mileage reads and review (e2e)', () => {
       reviewVersion: old.reviewVersion,
     }).expect(200);
     // Models the atomic DB result of re-registration; no driver endpoint is claimed here.
-    database.db.transaction(
-      (tx) => {
-        tx.update(mileagePhotos)
-          .set({ storageKey: 'private/resubmitted.jpg' })
-          .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'))
-          .run();
-        tx.update(mileageApplications)
-          .set({
-            approvalStatus: 'pending',
-            rejectionReason: null,
-            decidedAt: null,
-          })
-          .where(eq(mileageApplications.id, applicationId))
-          .run();
-      },
-      { behavior: 'immediate' },
-    );
+    await database.db.transaction(async (tx) => {
+      await tx
+        .update(mileagePhotos)
+        .set({ storageKey: 'private/resubmitted.jpg' })
+        .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'));
+      await tx
+        .update(mileageApplications)
+        .set({
+          approvalStatus: 'pending',
+          rejectionReason: null,
+          decidedAt: null,
+        })
+        .where(eq(mileageApplications.id, applicationId));
+    });
     await reject({
       reviewVersion: old.reviewVersion,
     }).expect(409);
@@ -849,7 +884,7 @@ describe('Admin mileage reads and review (e2e)', () => {
 
   it('never changes approved or settlement-attached applications', async () => {
     const old = await snapshot();
-    database.db
+    await database.db
       .update(mileageApplications)
       .set({
         approvalStatus: 'approved',
@@ -857,36 +892,30 @@ describe('Admin mileage reads and review (e2e)', () => {
         mileageAmount: 200,
         decidedAt: '2026-09-22T01:00:00Z',
       })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     await reject({
       reviewVersion: old.reviewVersion,
     }).expect(409);
     const settlementId = randomUUID();
-    database.db
-      .insert(settlements)
-      .values({
-        id: settlementId,
-        logisticsCompanyId: companyId,
-        settlementMonth: '2026-09',
-        transferStatus: 'pending',
-      })
-      .run();
-    database.db
+    await database.db.insert(settlements).values({
+      id: settlementId,
+      logisticsCompanyId: companyId,
+      settlementMonth: '2026-09',
+      transferStatus: 'pending',
+    });
+    await database.db
       .update(mileageApplications)
       .set({ settlementId })
-      .where(eq(mileageApplications.id, applicationId))
-      .run();
+      .where(eq(mileageApplications.id, applicationId));
     for (const complete of [false, true]) {
       if (complete)
-        database.db
+        await database.db
           .update(settlements)
           .set({
             transferStatus: 'completed',
             transferredAt: new Date().toISOString(),
           })
-          .where(eq(settlements.id, settlementId))
-          .run();
+          .where(eq(settlements.id, settlementId));
       const before = await snapshot();
       await reject({
         reviewVersion: before.reviewVersion,
@@ -899,19 +928,31 @@ describe('Admin mileage reads and review (e2e)', () => {
     'rolls back database failures instead of reporting %s success',
     async (action) => {
       const before = await snapshot();
-      database.connection.exec(
-        "CREATE TRIGGER reject_failure BEFORE UPDATE ON mileage_applications BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+      await database.connection.unsafe(
+        `CREATE FUNCTION app.reject_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN RAISE EXCEPTION 'test failure'; END;
+         $$`,
       );
-      const body =
-        action === 'approve'
-          ? {
-              reviewVersion: before.reviewVersion,
-              finalAmount: 10000,
-              liters: '5',
-            }
-          : { reviewVersion: before.reviewVersion };
-      await (action === 'approve' ? approve(body) : reject(body)).expect(500);
-      expect(await snapshot()).toEqual(before);
+      await database.connection.unsafe(
+        'CREATE TRIGGER reject_failure BEFORE UPDATE ON app.mileage_applications FOR EACH ROW EXECUTE FUNCTION app.reject_failure()',
+      );
+      try {
+        const body =
+          action === 'approve'
+            ? {
+                reviewVersion: before.reviewVersion,
+                finalAmount: 10000,
+                liters: '5',
+              }
+            : { reviewVersion: before.reviewVersion };
+        await (action === 'approve' ? approve(body) : reject(body)).expect(500);
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await database.connection.unsafe(
+          'DROP TRIGGER reject_failure ON app.mileage_applications',
+        );
+        await database.connection.unsafe('DROP FUNCTION app.reject_failure()');
+      }
     },
   );
 

@@ -1,32 +1,47 @@
 import { sql } from 'drizzle-orm';
-import { integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import {
+  bigint,
+  boolean,
+  doublePrecision,
+  integer,
+  jsonb,
+  pgSchema,
+  text,
+  timestamp,
+} from 'drizzle-orm/pg-core';
 
-// Runtime query mappings only. schema.sql and numbered migrations own SQLite DDL.
-export const logisticsCompanies = sqliteTable('logistics_companies', {
+// Application data stays outside Supabase's exposed public schema.
+export const appSchema = pgSchema('app');
+
+const createdAt = () =>
+  text('created_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`);
+const updatedAt = () =>
+  text('updated_at')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`);
+const money = (name: string) => bigint(name, { mode: 'number' });
+
+export const logisticsCompanies = appSchema.table('logistics_companies', {
   id: text('id').primaryKey(),
   businessName: text('business_name').notNull(),
-  businessNumber: text('business_number').notNull().unique(),
-  corporateRegistrationNumber: text('corporate_registration_number')
-    .notNull()
-    .unique(),
+  businessNumber: text('business_number').notNull(),
+  corporateRegistrationNumber: text('corporate_registration_number').notNull(),
   businessAddress: text('business_address').notNull(),
   managerName: text('manager_name').notNull(),
   managerPhone: text('manager_phone').notNull(),
   bankCode: text('bank_code').notNull(),
   accountNumber: text('account_number').notNull(),
   accountHolder: text('account_holder').notNull(),
-  active: integer('active', { mode: 'boolean' }).notNull().default(true),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
-  updatedAt: text('updated_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  active: boolean('active').notNull().default(true),
+  createdAt: createdAt(),
+  updatedAt: updatedAt(),
 });
 
-export const users = sqliteTable('users', {
+export const users = appSchema.table('users', {
   id: text('id').primaryKey(),
-  role: text('role').notNull(),
+  role: text('role', { enum: ['admin', 'driver'] }).notNull(),
   email: text('email').notNull(),
   passwordHash: text('password_hash'),
   name: text('name').notNull(),
@@ -35,100 +50,98 @@ export const users = sqliteTable('users', {
     () => logisticsCompanies.id,
     { onDelete: 'restrict' },
   ),
-  serviceTermsConsent: integer('service_terms_consent', { mode: 'boolean' })
+  serviceTermsConsent: boolean('service_terms_consent')
     .notNull()
     .default(false),
-  privacyTermsConsent: integer('privacy_terms_consent', { mode: 'boolean' })
+  privacyTermsConsent: boolean('privacy_terms_consent')
     .notNull()
     .default(false),
-  marketingConsent: integer('marketing_consent', { mode: 'boolean' })
-    .notNull()
-    .default(false),
+  marketingConsent: boolean('marketing_consent').notNull().default(false),
   deactivatedAt: text('deactivated_at'),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
-  updatedAt: text('updated_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  createdAt: createdAt(),
+  updatedAt: updatedAt(),
 });
 
-export const authSessions = sqliteTable('auth_sessions', {
-  // 인증 토큰 원문이 아닌 SHA-256 해시이자 세션 식별자
-  tokenHash: text('token_hash').primaryKey(),
-  // 로그인한 사용자
-  userId: text('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  // 로그인한 시각: 최대 유지기간의 시작점
-  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
-  // 마지막 정상 인증 요청 시각: 미사용 기간의 시작점
-  lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }).notNull(),
-  // 활동 여부와 관계없이 만료되는 시각
-  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
-});
-
-export const adminSessions = sqliteTable('admin_sessions', {
+export const authSessions = appSchema.table('auth_sessions', {
   tokenHash: text('token_hash').primaryKey(),
   userId: text('user_id')
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
-  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
-  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: timestamp('created_at', {
+    withTimezone: true,
+    mode: 'date',
+  }).notNull(),
+  lastUsedAt: timestamp('last_used_at', {
+    withTimezone: true,
+    mode: 'date',
+  }).notNull(),
+  expiresAt: timestamp('expires_at', {
+    withTimezone: true,
+    mode: 'date',
+  }).notNull(),
 });
 
-export const phoneVerifications = sqliteTable('phone_verifications', {
+export const adminSessions = appSchema.table('admin_sessions', {
+  tokenHash: text('token_hash').primaryKey(),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', {
+    withTimezone: true,
+    mode: 'date',
+  }).notNull(),
+  expiresAt: timestamp('expires_at', {
+    withTimezone: true,
+    mode: 'date',
+  }).notNull(),
+});
+
+export const phoneVerifications = appSchema.table('phone_verifications', {
   id: text('id').primaryKey(),
-  purpose: text('purpose').notNull(),
+  purpose: text('purpose', {
+    enum: ['sign_up', 'find_email', 'reset_password', 'change_phone'],
+  }).notNull(),
   phone: text('phone').notNull(),
   scopeEmail: text('scope_email'),
   scopeUserId: text('scope_user_id').references(() => users.id, {
     onDelete: 'cascade',
   }),
   codeHash: text('code_hash').notNull(),
-  proofHash: text('proof_hash').unique(),
+  proofHash: text('proof_hash'),
   expiresAt: text('expires_at').notNull(),
   verifiedAt: text('verified_at'),
   consumedAt: text('consumed_at'),
   invalidatedAt: text('invalidated_at'),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  createdAt: createdAt(),
 });
 
-export const passwordResetTokens = sqliteTable('password_reset_tokens', {
+export const passwordResetTokens = appSchema.table('password_reset_tokens', {
   id: text('id').primaryKey(),
   userId: text('user_id')
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
-  tokenHash: text('token_hash').notNull().unique(),
+  tokenHash: text('token_hash').notNull(),
   expiresAt: text('expires_at').notNull(),
   usedAt: text('used_at'),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  createdAt: createdAt(),
 });
 
-export const installationSites = sqliteTable('installation_sites', {
+export const installationSites = appSchema.table('installation_sites', {
   id: text('id').primaryKey(),
   pole: text('pole').notNull(),
   businessName: text('business_name').notNull(),
   roadAddress: text('road_address').notNull(),
   note: text('note'),
-  latitude: real('latitude'),
-  longitude: real('longitude'),
+  latitude: doublePrecision('latitude'),
+  longitude: doublePrecision('longitude'),
   coordinateSource: text('coordinate_source'),
   coordinateVerifiedAt: text('coordinate_verified_at'),
-  active: integer('active', { mode: 'boolean' }).notNull().default(true),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
-  updatedAt: text('updated_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  active: boolean('active').notNull().default(true),
+  createdAt: createdAt(),
+  updatedAt: updatedAt(),
 });
 
-export const installationSiteDevices = sqliteTable(
+export const installationSiteDevices = appSchema.table(
   'installation_site_devices',
   {
     id: text('id').primaryKey(),
@@ -137,39 +150,45 @@ export const installationSiteDevices = sqliteTable(
       .references(() => installationSites.id, { onDelete: 'cascade' }),
     model: text('model').notNull(),
     capacityLiters: integer('capacity_liters').notNull(),
-    active: integer('active', { mode: 'boolean' }).notNull().default(true),
-    createdAt: text('created_at')
-      .notNull()
-      .default(sql`CURRENT_TIMESTAMP`),
-    updatedAt: text('updated_at')
-      .notNull()
-      .default(sql`CURRENT_TIMESTAMP`),
+    active: boolean('active').notNull().default(true),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
   },
 );
 
-export const settlements = sqliteTable('settlements', {
+export const settlements = appSchema.table('settlements', {
   id: text('id').primaryKey(),
-  logisticsCompanyId: text('logistics_company_id').notNull(),
+  logisticsCompanyId: text('logistics_company_id')
+    .notNull()
+    .references(() => logisticsCompanies.id, { onDelete: 'restrict' }),
   settlementMonth: text('settlement_month').notNull(),
   transferStatus: text('transfer_status', {
     enum: ['pending', 'completed'],
-  }).notNull(),
+  })
+    .notNull()
+    .default('pending'),
   transferredAt: text('transferred_at'),
+  createdAt: createdAt(),
+  updatedAt: updatedAt(),
 });
 
-export const mileageApplications = sqliteTable('mileage_applications', {
+export const mileageApplications = appSchema.table('mileage_applications', {
   id: text('id').primaryKey(),
-  userId: text('user_id').notNull(),
-  logisticsCompanyId: text('logistics_company_id').notNull(),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'restrict' }),
+  logisticsCompanyId: text('logistics_company_id')
+    .notNull()
+    .references(() => logisticsCompanies.id, { onDelete: 'restrict' }),
   idempotencyKey: text('idempotency_key').notNull(),
   requestHash: text('request_hash'),
   photoMode: text('photo_mode', { enum: ['single', 'separate'] })
     .notNull()
     .default('separate'),
-  receiptAmount: integer('receipt_amount'),
-  meterAmount: integer('meter_amount'),
-  finalAmount: integer('final_amount'),
-  mileageAmount: integer('mileage_amount'),
+  receiptAmount: money('receipt_amount'),
+  meterAmount: money('meter_amount'),
+  finalAmount: money('final_amount'),
+  mileageAmount: money('mileage_amount'),
   receiptAt: text('receipt_at'),
   matchStatus: text('match_status', {
     enum: [
@@ -193,14 +212,14 @@ export const mileageApplications = sqliteTable('mileage_applications', {
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
   decidedAt: text('decided_at'),
-  updatedAt: text('updated_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: updatedAt(),
 });
 
-export const mileagePhotos = sqliteTable('mileage_application_photos', {
+export const mileagePhotos = appSchema.table('mileage_application_photos', {
   id: text('id').primaryKey(),
-  mileageApplicationId: text('mileage_application_id').notNull(),
+  mileageApplicationId: text('mileage_application_id')
+    .notNull()
+    .references(() => mileageApplications.id, { onDelete: 'cascade' }),
   kind: text('kind', { enum: ['receipt', 'meter'] }).notNull(),
   storageKey: text('storage_key').notNull(),
   contentType: text('content_type').notNull(),
@@ -208,34 +227,39 @@ export const mileagePhotos = sqliteTable('mileage_application_photos', {
   originalStorageKey: text('original_storage_key'),
   originalContentType: text('original_content_type'),
   originalByteSize: integer('original_byte_size'),
-});
-
-export const mileageUploadAttempts = sqliteTable('mileage_upload_attempts', {
-  id: text('id').primaryKey(),
-  userId: text('user_id').notNull(),
-  storageKeys: text('storage_keys', { mode: 'json' })
-    .$type<string[]>()
-    .notNull(),
-  createdAt: text('created_at')
+  uploadedAt: text('uploaded_at')
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: updatedAt(),
 });
 
-export const mileageResubmissions = sqliteTable('mileage_resubmissions', {
-  id: integer('id').primaryKey(),
-  applicationId: text('application_id').notNull(),
+export const mileageUploadAttempts = appSchema.table(
+  'mileage_upload_attempts',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    storageKeys: jsonb('storage_keys').$type<string[]>().notNull(),
+    createdAt: createdAt(),
+  },
+);
+
+export const mileageResubmissions = appSchema.table('mileage_resubmissions', {
+  id: integer('id').generatedAlwaysAsIdentity().primaryKey(),
+  applicationId: text('application_id')
+    .notNull()
+    .references(() => mileageApplications.id, { onDelete: 'cascade' }),
   idempotencyKey: text('idempotency_key').notNull(),
   requestHash: text('request_hash').notNull(),
   previousVersion: text('previous_version').notNull(),
   submissionVersion: text('submission_version').notNull(),
   previousRejectionReason: text('previous_rejection_reason'),
   previousDecidedAt: text('previous_decided_at'),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  createdAt: createdAt(),
 });
 
-export const mileageOcrJobs = sqliteTable('mileage_ocr_jobs', {
+export const mileageOcrJobs = appSchema.table('mileage_ocr_jobs', {
   id: text('id').primaryKey(),
   applicationId: text('application_id')
     .notNull()
@@ -254,14 +278,37 @@ export const mileageOcrJobs = sqliteTable('mileage_ocr_jobs', {
   lunaDurationMs: integer('luna_duration_ms'),
   lunaInputTokens: integer('luna_input_tokens'),
   lunaOutputTokens: integer('luna_output_tokens'),
-  result: text('result_json', { mode: 'json' }).$type<Record<
-    string,
-    unknown
-  > | null>(),
+  result: jsonb('result_json').$type<Record<string, unknown> | null>(),
   errorCode: text('error_code'),
-  createdAt: text('created_at')
-    .notNull()
-    .default(sql`CURRENT_TIMESTAMP`),
+  createdAt: createdAt(),
   startedAt: text('started_at'),
   finishedAt: text('finished_at'),
+});
+
+export const settlementSnapshots = appSchema.table('settlement_snapshots', {
+  settlementId: text('settlement_id')
+    .primaryKey()
+    .references(() => settlements.id, { onDelete: 'restrict' }),
+  reference: text('reference').notNull(),
+  bankCode: text('bank_code').notNull(),
+  accountNumber: text('account_number').notNull(),
+  accountHolder: text('account_holder').notNull(),
+  mileageAmount: money('mileage_amount').notNull(),
+  capturedAt: text('captured_at').notNull(),
+  capturedBy: text('captured_by')
+    .notNull()
+    .references(() => users.id, { onDelete: 'restrict' }),
+});
+
+export const settlementCompletions = appSchema.table('settlement_completions', {
+  settlementId: text('settlement_id')
+    .primaryKey()
+    .references(() => settlementSnapshots.settlementId, {
+      onDelete: 'restrict',
+    }),
+  fileHash: text('file_hash').notNull(),
+  completedBy: text('completed_by')
+    .notNull()
+    .references(() => users.id, { onDelete: 'restrict' }),
+  completedAt: text('completed_at').notNull(),
 });

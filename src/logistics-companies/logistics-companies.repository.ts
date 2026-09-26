@@ -97,9 +97,9 @@ export class LogisticsCompaniesRepository {
     }
   }
 
-  deactivateActive(id: string): boolean {
-    return this.database.db.transaction((transaction) => {
-      const result = transaction
+  async deactivateActive(id: string): Promise<boolean> {
+    return this.database.db.transaction(async (transaction) => {
+      const [company] = await transaction
         .update(logisticsCompanies)
         .set({ active: false, updatedAt: sql`CURRENT_TIMESTAMP` })
         .where(
@@ -108,25 +108,22 @@ export class LogisticsCompaniesRepository {
             eq(logisticsCompanies.active, true),
           ),
         )
-        .run();
+        .returning({ id: logisticsCompanies.id });
 
-      if (result.changes === 0) return false;
+      if (!company) return false;
 
       // 소속 비활성화와 해당 기사들의 세션 폐기를 함께 확정하거나 함께 롤백한다.
-      transaction
-        .delete(authSessions)
-        .where(
-          inArray(
-            authSessions.userId,
-            transaction
-              .select({ id: users.id })
-              .from(users)
-              .where(
-                and(eq(users.logisticsCompanyId, id), eq(users.role, 'driver')),
-              ),
-          ),
-        )
-        .run();
+      await transaction.delete(authSessions).where(
+        inArray(
+          authSessions.userId,
+          transaction
+            .select({ id: users.id })
+            .from(users)
+            .where(
+              and(eq(users.logisticsCompanyId, id), eq(users.role, 'driver')),
+            ),
+        ),
+      );
       return true;
     });
   }
@@ -153,7 +150,20 @@ function normalizeTimestamps(
 ): LogisticsCompanyRecord {
   return {
     ...company,
-    createdAt: `${company.createdAt.replace(' ', 'T')}Z`,
-    updatedAt: `${company.updatedAt.replace(' ', 'T')}Z`,
+    createdAt: isoTimestamp(company.createdAt),
+    updatedAt: isoTimestamp(company.updatedAt),
   };
+}
+
+function isoTimestamp(value: string): string {
+  const normalized = value.replace(' ', 'T');
+  const withZone = /[+-]\d{2}$/.test(normalized)
+    ? `${normalized}:00`
+    : /(?:Z|[+-]\d{2}(?::?\d{2})?)$/.test(normalized)
+      ? normalized
+      : `${normalized}Z`;
+  const timestamp = new Date(withZone);
+  if (!Number.isFinite(timestamp.getTime()))
+    throw new Error('Invalid logistics company timestamp');
+  return timestamp.toISOString();
 }

@@ -12,6 +12,7 @@ import {
   downloadHeaders,
 } from '../src/settlements/settlement-excel';
 import { ADMIN_WEB_SESSION_COOKIE } from '../src/auth';
+import { createTestDatabase } from './helpers/create-test-database';
 
 const root = '/api/v1/admin/settlements';
 const month = '2026-08';
@@ -109,48 +110,50 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .post(`${root}/import?month=${selectedMonth}`)
       .set('Authorization', authorization)
       .attach('file', bytes, 'paid.xls');
-  const snapshots = () =>
-    db()
-      .prepare('SELECT * FROM settlement_snapshots ORDER BY reference')
-      .all() as Snapshot[];
-  const completed = () =>
-    (
-      db()
-        .prepare(
-          "SELECT COUNT(*) AS count FROM settlements WHERE transfer_status='completed'",
-        )
-        .get() as { count: number }
-    ).count;
-  function addCompany(bank = '4', account = '001234567890') {
+  const snapshots = async (): Promise<Snapshot[]> => {
+    const rows = await db()<
+      (Omit<Snapshot, 'mileage_amount'> & {
+        mileage_amount: string;
+      })[]
+    >`SELECT * FROM app.settlement_snapshots ORDER BY reference`;
+    return rows.map((snapshot) => ({
+      ...snapshot,
+      mileage_amount: Number(snapshot.mileage_amount),
+    }));
+  };
+  const completed = async () =>
+    Number(
+      (
+        await db()<{ count: string }[]>`
+          SELECT COUNT(*)::text AS count FROM app.settlements
+          WHERE transfer_status = 'completed'`
+      )[0].count,
+    );
+  async function addCompany(bank = '4', account = '001234567890') {
     const id = randomUUID();
-    db()
-      .prepare(
-        `INSERT INTO logistics_companies(id,business_name,business_number,corporate_registration_number,business_address,manager_name,manager_phone,bank_code,account_number,account_holder) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-      )
-      .run(
-        id,
-        '테스트 물류',
-        id,
-        id,
-        '서울',
-        '담당자',
-        '01012345678',
-        bank,
-        account,
-        '예금주',
-      );
+    await db()`
+      INSERT INTO app.logistics_companies(
+        id, business_name, business_number, corporate_registration_number,
+        business_address, manager_name, manager_phone, bank_code,
+        account_number, account_holder
+      ) VALUES (
+        ${id}, ${'테스트 물류'}, ${id}, ${id}, ${'서울'}, ${'담당자'},
+        ${'01012345678'}, ${bank}, ${account}, ${'예금주'}
+      )`;
     return id;
   }
-  function addUser(company: string) {
+  async function addUser(company: string) {
     const id = randomUUID();
-    db()
-      .prepare(
-        `INSERT INTO users(id,role,email,password_hash,name,phone,logistics_company_id,service_terms_consent,privacy_terms_consent) VALUES(?,'driver',?,'unused','기사',?,?,1,1)`,
-      )
-      .run(id, `${id}@example.test`, id, company);
+    await db()`
+      INSERT INTO app.users(
+        id, role, email, password_hash, name, phone, logistics_company_id,
+        service_terms_consent, privacy_terms_consent
+      ) VALUES (
+        ${id}, 'driver', ${`${id}@example.test`}, 'unused', ${'기사'}, ${id}, ${company}, true, true
+      )`;
     return id;
   }
-  function addApplication(
+  async function addApplication(
     company = companyId,
     user = userId,
     amount = 3000,
@@ -160,41 +163,39 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     submitted = '2026-08-20T00:00:00Z',
   ) {
     const id = randomUUID();
-    db()
-      .prepare(
-        `INSERT INTO mileage_applications(id,user_id,logistics_company_id,idempotency_key,submitted_at,match_status) VALUES(?,?,?,?,?,?)`,
-      )
-      .run(id, user, company, id, submitted, matched);
+    await db()`
+      INSERT INTO app.mileage_applications(
+        id, user_id, logistics_company_id, idempotency_key, submitted_at, match_status
+      ) VALUES (${id}, ${user}, ${company}, ${id}, ${submitted}, ${matched})`;
     for (const kind of ['receipt', 'meter'])
-      db()
-        .prepare(
-          `INSERT INTO mileage_application_photos(id,mileage_application_id,kind,storage_key,content_type,byte_size) VALUES(?,?,?,?,'image/jpeg',1)`,
-        )
-        .run(randomUUID(), id, kind, randomUUID());
-    db()
-      .prepare(
-        'UPDATE mileage_applications SET approval_status=?,mileage_amount=?,final_amount=200000,decided_at=? WHERE id=?',
-      )
-      .run(status, amount, status === 'pending' ? null : decided, id);
+      await db()`
+        INSERT INTO app.mileage_application_photos(
+          id, mileage_application_id, kind, storage_key, content_type, byte_size
+        ) VALUES (${randomUUID()}, ${id}, ${kind}, ${randomUUID()}, 'image/jpeg', 1)`;
+    await db()`
+      UPDATE app.mileage_applications
+      SET approval_status = ${status}, mileage_amount = ${amount}, final_amount = 200000,
+        decided_at = ${status === 'pending' ? null : decided}
+      WHERE id = ${id}`;
     return id;
   }
   beforeEach(async () => {
     process.env.WEB_ORIGINS = 'http://localhost:5173';
-    app = await createTestApp();
-    database = app.get(DatabaseService);
+    database = await createTestDatabase();
+    app = await createTestApp([], database);
     service = app.get(SettlementsService);
-    authorization = seedAdminSession(database);
+    authorization = await seedAdminSession(database);
     adminId = (
-      db().prepare("SELECT id FROM users WHERE role='admin'").get() as {
-        id: string;
-      }
-    ).id;
-    companyId = addCompany();
-    userId = addUser(companyId);
-    applicationId = addApplication();
+      await db()<
+        { id: string }[]
+      >`SELECT id FROM app.users WHERE role = 'admin'`
+    )[0].id;
+    companyId = await addCompany();
+    userId = await addUser(companyId);
+    applicationId = await addApplication();
   });
   afterEach(async () => {
-    await app.close();
+    await app?.close();
   });
 
   test('closed month export is true BIFF8, preserves template headers and account zeroes, and never completes payment', async () => {
@@ -218,84 +219,72 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect((sheet.A2 as XLSX.CellObject).v).toBe('004');
     expect((sheet.C2 as XLSX.CellObject).v).toBe('3000');
     expect((sheet.H2 as XLSX.CellObject).v).toMatch(/^\d{10}$/);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.headers['content-disposition']).toContain(
       'settlements-2026-08.xls',
     );
   });
-  test('KST cutoff, late approvals, pending and rejected amounts are distinct', () => {
-    addApplication(companyId, userId, 700, '2026-08-31T15:00:00.000Z');
-    addApplication(companyId, userId, 900, undefined, 'pending');
-    addApplication(companyId, userId, 800, undefined, 'rejected');
-    expect(service.list(month)[0].mileage).toBe(3000);
-    service.export(month, adminId);
-    expect(snapshots()[0].mileage_amount).toBe(3000);
-    expect(service.list('2026-09')[0].mileage).toBe(700);
+  test('KST cutoff, late approvals, pending and rejected amounts are distinct', async () => {
+    await addApplication(companyId, userId, 700, '2026-08-31T15:00:00.000Z');
+    await addApplication(companyId, userId, 900, undefined, 'pending');
+    await addApplication(companyId, userId, 800, undefined, 'rejected');
+    expect((await service.list(month))[0].mileage).toBe(3000);
+    await service.export(month, adminId);
+    expect((await snapshots())[0].mileage_amount).toBe(3000);
+    expect((await service.list('2026-09'))[0].mileage).toBe(700);
   });
-  test('first download freezes applications and accounts; later candidates carry into next month', () => {
-    service.export(month, adminId);
-    const original = snapshots()[0];
-    db()
-      .prepare(
-        "UPDATE logistics_companies SET account_number='999999',bank_code='81',account_holder='변경' WHERE id=?",
-      )
-      .run(companyId);
-    addApplication(companyId, userId, 500);
-    service.export(month, adminId);
-    expect(snapshots()).toHaveLength(1);
-    expect(snapshots()[0]).toEqual(original);
-    expect(service.list(month)[0]).toMatchObject({
+  test('first download freezes applications and accounts; later candidates carry into next month', async () => {
+    await service.export(month, adminId);
+    const original = (await snapshots())[0];
+    await db()`UPDATE app.logistics_companies SET account_number = '999999', bank_code = '81', account_holder = '변경' WHERE id = ${companyId}`;
+    await addApplication(companyId, userId, 500);
+    await service.export(month, adminId);
+    expect(await snapshots()).toHaveLength(1);
+    expect((await snapshots())[0]).toEqual(original);
+    expect((await service.list(month))[0]).toMatchObject({
       mileage: 3000,
       accountNumber: '001234567890',
       bankCode: '4',
     });
-    expect(service.list('2026-09')[0].mileage).toBe(500);
-    expect(() =>
-      db()
-        .prepare('UPDATE mileage_applications SET mileage_amount=1 WHERE id=?')
-        .run(applicationId),
-    ).toThrow(/captured/);
-    expect(() =>
-      db()
-        .prepare(
-          'UPDATE mileage_applications SET settlement_id=NULL WHERE id=?',
-        )
-        .run(applicationId),
-    ).toThrow(/captured/);
-    expect(() =>
-      db()
-        .prepare('DELETE FROM mileage_applications WHERE id=?')
-        .run(applicationId),
-    ).toThrow();
-    expect(() =>
-      db().prepare("UPDATE settlements SET settlement_month='2026-07'").run(),
-    ).toThrow();
+    expect((await service.list('2026-09'))[0].mileage).toBe(500);
+    await expect(
+      db()`UPDATE app.mileage_applications SET mileage_amount = 1 WHERE id = ${applicationId}`,
+    ).rejects.toThrow(/captured/);
+    await expect(
+      db()`UPDATE app.mileage_applications SET settlement_id = NULL WHERE id = ${applicationId}`,
+    ).rejects.toThrow(/captured/);
+    await expect(
+      db()`DELETE FROM app.mileage_applications WHERE id = ${applicationId}`,
+    ).rejects.toThrow();
+    await expect(
+      db()`UPDATE app.settlements SET settlement_month = '2026-07'`,
+    ).rejects.toThrow();
   });
   test.each(['biff8', 'xlsx'] as const)(
     '%s valid uploaded paid rows complete once and identical reupload keeps timestamp',
     async (format) => {
-      service.export(month, adminId);
-      const bytes = workbook(snapshots().map(row), format);
+      await service.export(month, adminId);
+      const bytes = workbook((await snapshots()).map(row), format);
       expect((await upload(bytes).expect(200)).body).toEqual({
         completed: 1,
         alreadyCompleted: 0,
       });
-      const first = db().prepare('SELECT * FROM settlements').get();
+      const first = (await db()`SELECT * FROM app.settlements`)[0];
       expect((await upload(bytes).expect(200)).body).toEqual({
         completed: 0,
         alreadyCompleted: 1,
       });
-      expect(db().prepare('SELECT * FROM settlements').get()).toEqual(first);
-      expect(
-        db().prepare('SELECT * FROM settlement_completions').all(),
-      ).toHaveLength(1);
+      expect((await db()`SELECT * FROM app.settlements`)[0]).toEqual(first);
+      expect(await db()`SELECT * FROM app.settlement_completions`).toHaveLength(
+        1,
+      );
     },
   );
   test('two admins uploading the same file concurrently cannot complete twice', async () => {
-    service.export(month, adminId);
-    const bytes = workbook(snapshots().map(row));
-    const second = seedAdminSession(database);
+    await service.export(month, adminId);
+    const bytes = workbook((await snapshots()).map(row));
+    const second = await seedAdminSession(database);
     const results = await Promise.all([
       upload(bytes),
       request(app.getHttpServer())
@@ -307,7 +296,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(
       results.map((r) => (r.body as { completed: number }).completed).sort(),
     ).toEqual([0, 1]);
-    expect(completed()).toBe(1);
+    expect(await completed()).toBe(1);
   });
   test('simultaneous exports create one immutable batch', async () => {
     const replies = await Promise.all(
@@ -318,17 +307,17 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       ),
     );
     expect(replies.map((r) => r.status)).toEqual([200, 200]);
-    expect(snapshots()).toHaveLength(1);
+    expect(await snapshots()).toHaveLength(1);
   });
   test('valid subset leaves other companies pending; mixed valid/error rows roll back the entire file', async () => {
-    const company2 = addCompany('81', '000222');
-    addApplication(company2, addUser(company2), 5000);
-    service.export(month, adminId);
-    const rows = snapshots().map(row);
+    const company2 = await addCompany('81', '000222');
+    await addApplication(company2, await addUser(company2), 5000);
+    await service.export(month, adminId);
+    const rows = (await snapshots()).map(row);
     const bad = [...rows[1]];
     bad[2] = 999;
     await upload(workbook([rows[0], bad])).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
     expect((await upload(workbook([rows[0]])).expect(200)).body).toEqual({
       completed: 1,
       alreadyCompleted: 0,
@@ -337,7 +326,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       completed: 1,
       alreadyCompleted: 1,
     });
-    expect(completed()).toBe(2);
+    expect(await completed()).toBe(2);
   });
   test.each([
     ['amount changed', 2, 3001],
@@ -355,82 +344,76 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     ['wrong reference', 5, '1111111111'],
     ['invalid reference', 5, 'abc'],
   ])('reject %s without mutation', async (_name, column, value) => {
-    service.export(month, adminId);
-    const r = row(snapshots()[0]);
+    await service.export(month, adminId);
+    const r = row((await snapshots())[0]);
     r[column] = value;
     await upload(workbook([r])).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('duplicate rows reject the whole file, including equivalent bank code/name forms', async () => {
-    service.export(month, adminId);
-    const a = row(snapshots()[0]);
+    await service.export(month, adminId);
+    const a = row((await snapshots())[0]);
     const b = [...a];
     b[0] = 'KB국민은행';
     const res = await upload(workbook([a, b])).expect(400);
     expect((res.body as { code: string }).code).toBe(
       'SETTLEMENT_DUPLICATE_ROW',
     );
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('missing CMS is accepted only when bank/account/amount is globally unique', async () => {
-    service.export(month, adminId);
-    const r = row(snapshots()[0]);
+    await service.export(month, adminId);
+    const r = row((await snapshots())[0]);
     r[5] = '';
     await upload(workbook([r])).expect(200);
-    expect(completed()).toBe(1);
+    expect(await completed()).toBe(1);
   });
   test('same account and amount across months require CMS; old file cannot complete the next month', async () => {
-    db()
-      .prepare(
-        "UPDATE mileage_applications SET decided_at='2026-07-31T00:00:00Z' WHERE id=?",
-      )
-      .run(applicationId);
-    service.export('2026-07', adminId);
-    const previous = snapshots()[0];
+    await db()`UPDATE app.mileage_applications SET decided_at = '2026-07-31T00:00:00Z' WHERE id = ${applicationId}`;
+    await service.export('2026-07', adminId);
+    const previous = (await snapshots())[0];
     await upload(workbook([row(previous)]), '2026-07').expect(200);
-    addApplication();
-    service.export(month, adminId);
-    const current = snapshots().find(
+    await addApplication();
+    await service.export(month, adminId);
+    const current = (await snapshots()).find(
       (s) => s.settlement_id !== previous.settlement_id,
     )!;
     const noCms = row(current);
     noCms[5] = '';
     await upload(workbook([noCms])).expect(400);
     await upload(workbook([row(previous)])).expect(400);
-    expect(completed()).toBe(1);
+    expect(await completed()).toBe(1);
     await upload(workbook([row(current)])).expect(200);
-    expect(completed()).toBe(2);
+    expect(await completed()).toBe(2);
   });
   test.each(['2026-07', '2026-09'])(
     'wrong selected month %s refuses an otherwise valid file',
     async (selected) => {
-      service.export(month, adminId);
-      await upload(workbook(snapshots().map(row)), selected).expect(400);
-      expect(completed()).toBe(0);
+      await service.export(month, adminId);
+      await upload(workbook((await snapshots()).map(row)), selected).expect(
+        400,
+      );
+      expect(await completed()).toBe(0);
     },
   );
   test('inactive companies and withdrawn drivers retain settlement records and can be paid', async () => {
-    service.export(month, adminId);
-    db()
-      .prepare('UPDATE users SET deactivated_at=? WHERE id=?')
-      .run(new Date().toISOString(), userId);
-    db()
-      .prepare('UPDATE logistics_companies SET active=0 WHERE id=?')
-      .run(companyId);
-    expect(service.list(month)[0].active).toBe(false);
-    await upload(workbook(snapshots().map(row))).expect(200);
-    expect(completed()).toBe(1);
+    await service.export(month, adminId);
+    await db()`UPDATE app.users SET deactivated_at = ${new Date().toISOString()} WHERE id = ${userId}`;
+    await db()`UPDATE app.logistics_companies SET active = false WHERE id = ${companyId}`;
+    expect((await service.list(month))[0].active).toBe(false);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    expect(await completed()).toBe(1);
   });
   test('same destination across companies requires CMS', async () => {
-    const other = addCompany();
-    addApplication(other, addUser(other));
-    service.export(month, adminId);
-    const r = row(snapshots()[0]);
+    const other = await addCompany();
+    await addApplication(other, await addUser(other));
+    await service.export(month, adminId);
+    const r = row((await snapshots())[0]);
     r[5] = '';
     await upload(workbook([r])).expect(400);
-    expect(completed()).toBe(0);
-    await upload(workbook(snapshots().map(row))).expect(200);
-    expect(completed()).toBe(2);
+    expect(await completed()).toBe(0);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    expect(await completed()).toBe(2);
   });
   test.each([
     'formula',
@@ -443,9 +426,9 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     'external-name',
     'macro',
   ])('reject workbook hazard %s', async (hazard) => {
-    service.export(month, adminId);
+    await service.export(month, adminId);
     const bytes = workbook(
-      snapshots().map(row),
+      (await snapshots()).map(row),
       hazard === 'macro' ? 'xlsm' : 'xlsx',
       (wb) => {
         const s = wb.Sheets.Sheet1;
@@ -475,29 +458,30 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       },
     );
     await upload(bytes).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('empty workbook and disguised text/HTML files are not spreadsheets', async () => {
-    service.export(month, adminId);
+    await service.export(month, adminId);
     for (const bytes of [
       Buffer.from('bank,account,amount'),
       Buffer.from('<table><tr><td>3000</td></tr></table>'),
       workbook([]),
     ])
       await upload(bytes).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('file size and row limits do not write partial results', async () => {
-    service.export(month, adminId);
+    await service.export(month, adminId);
     await upload(Buffer.alloc(5 * 1024 * 1024 + 1)).expect(413);
+    const snapshot = (await snapshots())[0];
     await upload(
-      workbook(Array.from({ length: 10001 }, () => row(snapshots()[0]))),
+      workbook(Array.from({ length: 10001 }, () => row(snapshot))),
     ).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('extra files and multipart fields are rejected', async () => {
-    service.export(month, adminId);
-    const bytes = workbook(snapshots().map(row));
+    await service.export(month, adminId);
+    const bytes = workbook((await snapshots()).map(row));
     await request(app.getHttpServer())
       .post(`${root}/import?month=${month}`)
       .set('Authorization', authorization)
@@ -510,33 +494,29 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .field('complete', 'true')
       .attach('file', bytes, 'paid.xls')
       .expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('session revoked while parsing cannot complete settlement', async () => {
-    service.export(month, adminId);
+    await service.export(month, adminId);
     const pending = service.import(
       month,
-      workbook(snapshots().map(row)),
+      workbook((await snapshots()).map(row)),
       createHash('sha256').update(authorization.slice(7)).digest('hex'),
     );
-    db().prepare('DELETE FROM admin_sessions').run();
+    await db()`DELETE FROM app.admin_sessions`;
     await expect(pending).rejects.toMatchObject({ status: 401 });
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('no administrator, driver token and wrong web origins cannot mutate settlements', async () => {
     const driverToken = randomBytes(32).toString('base64url'),
       now = Date.now();
-    db()
-      .prepare(
-        'INSERT INTO auth_sessions(token_hash,user_id,created_at,last_used_at,expires_at) VALUES(?,?,?,?,?)',
-      )
-      .run(
-        createHash('sha256').update(driverToken).digest('hex'),
-        userId,
-        now,
-        now,
-        now + 600000,
-      );
+    await db()`
+      INSERT INTO app.auth_sessions(token_hash, user_id, created_at, last_used_at, expires_at)
+      VALUES (
+        ${createHash('sha256').update(driverToken).digest('hex')}, ${userId},
+        ${new Date(now).toISOString()}, ${new Date(now).toISOString()},
+        ${new Date(now + 600000).toISOString()}
+      )`;
     for (const path of [
       `${root}?month=${month}`,
       '/api/v1/admin/dashboard?from=2026-08-01&through=2026-08-31',
@@ -566,11 +546,11 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .set('Cookie', cookie)
       .set('Origin', 'http://localhost:5173')
       .expect(200);
-    expect(snapshots()).toHaveLength(1);
-    expect(completed()).toBe(0);
+    expect(await snapshots()).toHaveLength(1);
+    expect(await completed()).toBe(0);
   });
   test('server aggregation uses approval dates for money, submission dates for counts, all companies and newest five', async () => {
-    addApplication(
+    await addApplication(
       companyId,
       userId,
       100,
@@ -578,7 +558,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       'approved',
       'pending',
     );
-    addApplication(
+    await addApplication(
       companyId,
       userId,
       200,
@@ -586,8 +566,15 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       'approved',
       'mismatched',
     );
-    addApplication(companyId, userId, 999, undefined, 'pending', 'ocr_failed');
-    addApplication(
+    await addApplication(
+      companyId,
+      userId,
+      999,
+      undefined,
+      'pending',
+      'ocr_failed',
+    );
+    await addApplication(
       companyId,
       userId,
       999,
@@ -595,9 +582,14 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       'rejected',
       'duplicate_suspected',
     );
-    const other = addCompany('81', '00022');
-    addApplication(other, addUser(other), 400, '2026-08-02T00:00:00Z');
-    const data = service.dashboard('2026-08-01', '2026-08-31', companyId);
+    const other = await addCompany('81', '00022');
+    await addApplication(
+      other,
+      await addUser(other),
+      400,
+      '2026-08-02T00:00:00Z',
+    );
+    const data = await service.dashboard('2026-08-01', '2026-08-31', companyId);
     expect(data).toMatchObject({
       accumulatedMileage: 3400,
       settlementMileage: 3500,
@@ -607,30 +599,30 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(data.receipts).toHaveLength(5);
     expect(data.chart.reduce((sum, r) => sum + r.common, 0)).toBe(3400);
     expect(data.chart.reduce((sum, r) => sum + r.affiliation, 0)).toBe(3000);
-    service.export(month, adminId);
-    await upload(workbook(snapshots().map(row))).expect(200);
-    const after = service.dashboard('2026-08-01', '2026-08-31', companyId);
+    await service.export(month, adminId);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    const after = await service.dashboard(
+      '2026-08-01',
+      '2026-08-31',
+      companyId,
+    );
     expect(after.accumulatedMileage).toBe(0);
     expect(after.settlementMileage).toBe(0);
     expect(after.chart).toEqual(data.chart);
     expect(after.matchedCount).toBe(2);
   });
   test('completed rows disappear from driver list and detail, pending/rejected stay visible', async () => {
-    addApplication(companyId, userId, 999, undefined, 'pending');
-    addApplication(companyId, userId, 999, undefined, 'rejected');
+    await addApplication(companyId, userId, 999, undefined, 'pending');
+    await addApplication(companyId, userId, 999, undefined, 'rejected');
     const token = randomBytes(32).toString('base64url'),
       now = Date.now();
-    db()
-      .prepare(
-        'INSERT INTO auth_sessions(token_hash,user_id,created_at,last_used_at,expires_at) VALUES(?,?,?,?,?)',
-      )
-      .run(
-        createHash('sha256').update(token).digest('hex'),
-        userId,
-        now,
-        now,
-        now + 600000,
-      );
+    await db()`
+      INSERT INTO app.auth_sessions(token_hash, user_id, created_at, last_used_at, expires_at)
+      VALUES (
+        ${createHash('sha256').update(token).digest('hex')}, ${userId},
+        ${new Date(now).toISOString()}, ${new Date(now).toISOString()},
+        ${new Date(now + 600000).toISOString()}
+      )`;
     const driver = request(app.getHttpServer());
     const before = await driver
       .get('/api/v1/mileage/applications?limit=1')
@@ -642,8 +634,8 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .set('Authorization', `Bearer ${token}`)
       .expect(200);
     expect(balance.body).toEqual({ accumulatedMileage: 3000 });
-    service.export(month, adminId);
-    await upload(workbook(snapshots().map(row))).expect(200);
+    await service.export(month, adminId);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
     await driver
       .get(`/api/v1/mileage/applications/${applicationId}`)
       .set('Authorization', `Bearer ${token}`)
@@ -668,20 +660,18 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
   });
 
   test('a database failure on a later completion rolls back all statuses and audit records', async () => {
-    const second = addCompany('81', '00033');
-    addApplication(second, addUser(second), 4000);
-    service.export(month, adminId);
-    db()
-      .exec(`CREATE TRIGGER reject_second_completion BEFORE INSERT ON settlement_completions
-      WHEN EXISTS (SELECT 1 FROM settlement_completions) BEGIN SELECT RAISE(ABORT, 'test failure'); END;`);
-    await upload(workbook(snapshots().map(row))).expect(500);
-    expect(completed()).toBe(0);
-    expect(db().prepare('SELECT * FROM settlement_completions').all()).toEqual(
-      [],
+    const second = await addCompany('81', '00033');
+    await addApplication(second, await addUser(second), 4000);
+    await service.export(month, adminId);
+    await db().unsafe(
+      'ALTER TABLE app.settlement_completions ADD CONSTRAINT test_file_hash_unique UNIQUE(file_hash)',
     );
+    await upload(workbook((await snapshots()).map(row))).expect(500);
+    expect(await completed()).toBe(0);
+    expect(await db()`SELECT * FROM app.settlement_completions`).toEqual([]);
   });
   test('safe individual amounts with an unsafe combined sum cannot be displayed or captured', async () => {
-    addApplication(companyId, userId, Number.MAX_SAFE_INTEGER);
+    await addApplication(companyId, userId, Number.MAX_SAFE_INTEGER);
     await request(app.getHttpServer())
       .get(`${root}?month=${month}`)
       .set('Authorization', authorization)
@@ -690,37 +680,37 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .post(`${root}/export?month=${month}`)
       .set('Authorization', authorization)
       .expect(400);
-    expect(snapshots()).toHaveLength(0);
+    expect(await snapshots()).toHaveLength(0);
   });
   test('zero approved mileage is preserved exactly without including receipt principal', async () => {
-    db()
-      .prepare('UPDATE mileage_applications SET mileage_amount=0 WHERE id=?')
-      .run(applicationId);
-    service.export(month, adminId);
-    expect(snapshots()[0].mileage_amount).toBe(0);
-    await upload(workbook(snapshots().map(row))).expect(200);
-    expect(completed()).toBe(1);
+    await db()`UPDATE app.mileage_applications SET mileage_amount = 0 WHERE id = ${applicationId}`;
+    await service.export(month, adminId);
+    expect((await snapshots())[0].mileage_amount).toBe(0);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    expect(await completed()).toBe(1);
   });
   test('blank sheets and blank rows from the supplied upload format are accepted', async () => {
-    service.export(month, adminId);
-    const bytes = workbook([[], ...snapshots().map(row), []], 'biff8', (wb) => {
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([]), 'Sheet2');
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([]), 'Sheet3');
-    });
+    await service.export(month, adminId);
+    const bytes = workbook(
+      [[], ...(await snapshots()).map(row), []],
+      'biff8',
+      (wb) => {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([]), 'Sheet2');
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([]), 'Sheet3');
+      },
+    );
     await upload(bytes).expect(200);
-    expect(completed()).toBe(1);
+    expect(await completed()).toBe(1);
   });
   test('a supplied download-format file cannot be uploaded as a paid result', async () => {
-    const bytes = service.export(month, adminId);
+    const bytes = await service.export(month, adminId);
     await upload(bytes).expect(400);
-    expect(completed()).toBe(0);
+    expect(await completed()).toBe(0);
   });
   test('legacy pending records without frozen bank data are not silently rebuilt', async () => {
-    db()
-      .prepare(
-        'INSERT INTO settlements(id,logistics_company_id,settlement_month) VALUES(?,?,?)',
-      )
-      .run(randomUUID(), companyId, month);
+    await db()`
+      INSERT INTO app.settlements(id, logistics_company_id, settlement_month, transfer_status)
+      VALUES (${randomUUID()}, ${companyId}, ${month}, 'pending')`;
     const res = await request(app.getHttpServer())
       .post(`${root}/export?month=${month}`)
       .set('Authorization', authorization)
@@ -728,50 +718,46 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect((res.body as { code: string }).code).toBe(
       'SETTLEMENT_SNAPSHOT_MISSING',
     );
-    expect(snapshots()).toHaveLength(0);
+    expect(await snapshots()).toHaveLength(0);
   });
   test('completed batches cannot be cancelled, exported again, or have their evidence changed', async () => {
-    service.export(month, adminId);
-    await upload(workbook(snapshots().map(row))).expect(200);
-    expect(() =>
-      db().exec(
-        "UPDATE settlements SET transfer_status='pending',transferred_at=NULL",
-      ),
-    ).toThrow();
-    expect(() =>
-      db().exec("UPDATE settlement_completions SET file_hash='changed'"),
-    ).toThrow();
-    expect(() => db().exec('DELETE FROM settlement_completions')).toThrow();
-    expect(() => service.export(month, adminId)).toThrow();
+    await service.export(month, adminId);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    await expect(
+      db()`UPDATE app.settlements SET transfer_status = 'pending', transferred_at = NULL`,
+    ).rejects.toThrow();
+    await expect(
+      db()`UPDATE app.settlement_completions SET file_hash = 'changed'`,
+    ).rejects.toThrow();
+    await expect(
+      db()`DELETE FROM app.settlement_completions`,
+    ).rejects.toThrow();
+    await expect(service.export(month, adminId)).rejects.toThrow();
   });
   test('changing account information after export does not accept payment to the new account', async () => {
-    service.export(month, adminId);
-    const r = row(snapshots()[0]);
-    db()
-      .prepare(
-        "UPDATE logistics_companies SET account_number='009999' WHERE id=?",
-      )
-      .run(companyId);
+    await service.export(month, adminId);
+    const r = row((await snapshots())[0]);
+    await db()`UPDATE app.logistics_companies SET account_number = '009999' WHERE id = ${companyId}`;
     r[1] = '009999';
     await upload(workbook([r])).expect(400);
-    expect(completed()).toBe(0);
-    await upload(workbook(snapshots().map(row))).expect(200);
+    expect(await completed()).toBe(0);
+    await upload(workbook((await snapshots()).map(row))).expect(200);
   });
-  test('all-month balance exceeds a single page and isolates the current driver', () => {
-    for (let i = 0; i < 25; i++) addApplication(companyId, userId, 10);
-    addApplication(companyId, addUser(companyId), 700);
-    expect(service.balance(userId)).toEqual({ accumulatedMileage: 3250 });
+  test('all-month balance exceeds a single page and isolates the current driver', async () => {
+    for (let i = 0; i < 25; i++) await addApplication(companyId, userId, 10);
+    await addApplication(companyId, await addUser(companyId), 700);
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3250 });
   });
-  test('no approved record is dropped at the leap-day and year KST boundaries', () => {
-    addApplication(companyId, userId, 10, '2024-02-29T14:59:59.999Z');
-    addApplication(companyId, userId, 20, '2024-02-29T15:00:00Z');
-    addApplication(companyId, userId, 30, '2024-12-31T14:59:59.999Z');
-    addApplication(companyId, userId, 40, '2024-12-31T15:00:00Z');
-    expect(service.list('2024-02')[0].mileage).toBe(10);
+  test('no approved record is dropped at the leap-day and year KST boundaries', async () => {
+    await addApplication(companyId, userId, 10, '2024-02-29T14:59:59.999Z');
+    await addApplication(companyId, userId, 20, '2024-02-29T15:00:00Z');
+    await addApplication(companyId, userId, 30, '2024-12-31T14:59:59.999Z');
+    await addApplication(companyId, userId, 40, '2024-12-31T15:00:00Z');
+    expect((await service.list('2024-02'))[0].mileage).toBe(10);
     expect(
-      service.dashboard('2024-02-29', '2024-02-29').accumulatedMileage,
+      (await service.dashboard('2024-02-29', '2024-02-29')).accumulatedMileage,
     ).toBe(10);
-    expect(service.list('2024-12')[0].mileage).toBe(60);
+    expect((await service.list('2024-12'))[0].mileage).toBe(60);
   });
   test('Swagger publishes all three settlement endpoints, dashboard and full balance contract', async () => {
     const res = await request(app.getHttpServer())
@@ -794,7 +780,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .get(`/api/v1/admin/mileage/applications/${applicationId}`)
       .set('Authorization', authorization)
       .expect(200);
-    service.export(month, adminId);
+    await service.export(month, adminId);
     await request(app.getHttpServer())
       .post(`/api/v1/admin/mileage/applications/${applicationId}/reject`)
       .set('Authorization', authorization)
@@ -803,10 +789,10 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         reviewVersion: (detail.body as { reviewVersion: string }).reviewVersion,
       })
       .expect(409);
-    expect(snapshots()[0].mileage_amount).toBe(3000);
+    expect((await snapshots())[0].mileage_amount).toBe(3000);
   });
   test('concurrent review rejection and settlement export exclude pending mileage consistently', async () => {
-    const pending = addApplication(
+    const pending = await addApplication(
       companyId,
       userId,
       9000,
@@ -831,20 +817,18 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         }),
     ]);
     expect(results.map((r) => r.status)).toEqual([200, 200]);
-    expect(snapshots()[0].mileage_amount).toBe(3000);
+    expect((await snapshots())[0].mileage_amount).toBe(3000);
     expect(
-      db()
-        .prepare(
-          'SELECT settlement_id,approval_status FROM mileage_applications WHERE id=?',
-        )
-        .get(pending),
+      (
+        await db()`SELECT settlement_id, approval_status FROM app.mileage_applications WHERE id = ${pending}`
+      )[0],
     ).toMatchObject({ settlement_id: null, approval_status: 'rejected' });
   });
   test.each(['formula', 'link'] as const)(
     'legacy XLS %s is rejected before completion',
     async (hazard) => {
-      service.export(month, adminId);
-      let bytes = workbook(snapshots().map(row), 'biff8', (wb) => {
+      await service.export(month, adminId);
+      let bytes = workbook((await snapshots()).map(row), 'biff8', (wb) => {
         if (hazard === 'formula')
           wb.Sheets.Sheet1.C2 = { t: 'n', v: 3000, f: 'SUM(1000,2000)' };
         else
@@ -857,17 +841,15 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       expect((response.body as { code: string }).code).toBe(
         'SETTLEMENT_FILE_INVALID',
       );
-      expect(completed()).toBe(0);
+      expect(await completed()).toBe(0);
     },
   );
   test('legacy zero-padded stored bank codes preserve the same financial institution', async () => {
-    db()
-      .prepare("UPDATE logistics_companies SET bank_code='004' WHERE id=?")
-      .run(companyId);
-    expect(service.list(month)[0].bankCode).toBe('4');
-    service.export(month, adminId);
-    expect(snapshots()[0].bank_code).toBe('4');
-    await upload(workbook(snapshots().map(row))).expect(200);
+    await db()`UPDATE app.logistics_companies SET bank_code = '004' WHERE id = ${companyId}`;
+    expect((await service.list(month))[0].bankCode).toBe('4');
+    await service.export(month, adminId);
+    expect((await snapshots())[0].bank_code).toBe('4');
+    await upload(workbook((await snapshots()).map(row))).expect(200);
   });
   test.each(['2026-00', '2026-13', '26-08', '2026-08-01'])(
     'invalid month %s rejected',
@@ -878,13 +860,13 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         .expect(400);
     },
   );
-  test('unclosed month export cannot capture records, and no eligible rows is an error rather than a completed payment', () => {
-    expect(() => service.export('9999-01', adminId)).toThrow();
-    expect(() => service.export('2026-01', adminId)).toThrow();
-    expect(snapshots()).toHaveLength(0);
+  test('unclosed month export cannot capture records, and no eligible rows is an error rather than a completed payment', async () => {
+    await expect(service.export('9999-01', adminId)).rejects.toThrow();
+    await expect(service.export('2026-01', adminId)).rejects.toThrow();
+    expect(await snapshots()).toHaveLength(0);
   });
-  test('empty successful dashboard returns real zeroes and an empty chart', () => {
-    expect(service.dashboard('2025-01-01', '2025-01-31')).toMatchObject({
+  test('empty successful dashboard returns real zeroes and an empty chart', async () => {
+    expect(await service.dashboard('2025-01-01', '2025-01-31')).toMatchObject({
       accumulatedMileage: 0,
       settlementMileage: 0,
       matchedCount: 0,

@@ -52,26 +52,40 @@ type ResetEmailRecipient = {
   passwordHash: string;
 };
 
+type DriverCredentials = Pick<typeof users.$inferSelect, 'id' | 'passwordHash'>;
+type DriverPassword = Pick<typeof users.$inferSelect, 'passwordHash'>;
+type PasswordReset = { userId: string; passwordHash: string | null };
+type SessionUser = {
+  id: string;
+  email: string;
+  name: string;
+  logisticsCompanyId: string;
+};
+
 @Injectable()
 export class AuthRepository {
   constructor(private readonly database: DatabaseService) {}
 
-  findDriverCredentials(email: string) {
-    return this.database.db
+  async findDriverCredentials(
+    email: string,
+  ): Promise<DriverCredentials | undefined> {
+    const [user] = await this.database.db
       .select({ id: users.id, passwordHash: users.passwordHash })
       .from(users)
       .where(
         and(
-          eq(users.email, email),
+          emailEquals(email),
           eq(users.role, 'driver'),
           isNull(users.deactivatedAt),
         ),
-      )
-      .get();
+      );
+    return user;
   }
 
-  findDriverPassword(userId: string) {
-    return this.database.db
+  async findDriverPassword(
+    userId: string,
+  ): Promise<DriverPassword | undefined> {
+    const [user] = await this.database.db
       .select({ passwordHash: users.passwordHash })
       .from(users)
       .where(
@@ -80,8 +94,8 @@ export class AuthRepository {
           eq(users.role, 'driver'),
           isNull(users.deactivatedAt),
         ),
-      )
-      .get();
+      );
+    return user;
   }
 
   changeDriverPassword(input: {
@@ -91,10 +105,10 @@ export class AuthRepository {
     passwordHash: string;
     now: Date;
     idleCutoff: Date;
-  }): boolean {
-    return this.database.db.transaction((transaction) => {
+  }): Promise<boolean> {
+    return this.database.db.transaction(async (transaction) => {
       // Argon2를 기다리는 동안 폐기·만료·소속·자격·비밀번호가 바뀌었는지 다시 확인한다.
-      const session = transaction
+      const [session] = await transaction
         .select({ userId: users.id })
         .from(authSessions)
         .innerJoin(users, eq(authSessions.userId, users.id))
@@ -109,38 +123,37 @@ export class AuthRepository {
             eq(users.passwordHash, input.previousPasswordHash),
           ),
         )
-        .get();
+        .for('update', { of: [users] });
       if (!session) return false;
 
-      transaction
+      await transaction
         .update(users)
         .set({
           passwordHash: input.passwordHash,
-          updatedAt: sql`CURRENT_TIMESTAMP`,
+          updatedAt: utcNow(),
         })
-        .where(eq(users.id, session.userId))
-        .run();
+        .where(eq(users.id, session.userId));
       // 전체 기기의 세션 폐기가 실패하면 새 비밀번호 저장도 롤백한다.
-      transaction
+      await transaction
         .delete(authSessions)
-        .where(eq(authSessions.userId, session.userId))
-        .run();
-      transaction
+        .where(eq(authSessions.userId, session.userId));
+      await transaction
         .update(passwordResetTokens)
-        .set({ usedAt: sql`CURRENT_TIMESTAMP` })
+        .set({ usedAt: utcNow() })
         .where(
           and(
             eq(passwordResetTokens.userId, session.userId),
             isNull(passwordResetTokens.usedAt),
           ),
-        )
-        .run();
+        );
       return true;
     });
   }
 
-  findPasswordReset(tokenHash: string) {
-    return this.database.db
+  async findPasswordReset(
+    tokenHash: string,
+  ): Promise<PasswordReset | undefined> {
+    const [reset] = await this.database.db
       .select({ userId: users.id, passwordHash: users.passwordHash })
       .from(passwordResetTokens)
       .innerJoin(users, eq(passwordResetTokens.userId, users.id))
@@ -148,8 +161,8 @@ export class AuthRepository {
         logisticsCompanies,
         eq(users.logisticsCompanyId, logisticsCompanies.id),
       )
-      .where(validPasswordReset(tokenHash))
-      .get();
+      .where(validPasswordReset(tokenHash));
+    return reset;
   }
 
   claimPasswordResetEmail(
@@ -157,87 +170,82 @@ export class AuthRepository {
     phone: string,
     proofHash: string,
     session?: ResetEmailSession,
-  ): ResetEmailRecipient | undefined {
-    return this.database.db.transaction(
-      (transaction) => {
-        const proof = transaction
-          .update(phoneVerifications)
-          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
-          .where(
-            and(
-              eq(phoneVerifications.purpose, 'reset_password'),
-              eq(phoneVerifications.scopeEmail, email.toLowerCase()),
-              eq(phoneVerifications.phone, phone),
-              eq(phoneVerifications.proofHash, proofHash),
-              isNull(phoneVerifications.scopeUserId),
-              isNotNull(phoneVerifications.verifiedAt),
-              isNull(phoneVerifications.consumedAt),
-              isNull(phoneVerifications.invalidatedAt),
-              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
-            ),
-          )
-          .returning({ id: phoneVerifications.id })
-          .get();
-        if (!proof) throw new PhoneVerificationInvalidError();
-        const candidate = transaction
-          .select({
-            id: users.id,
-            email: users.email,
-            passwordHash: users.passwordHash,
-          })
-          .from(users)
+  ): Promise<ResetEmailRecipient | undefined> {
+    return this.database.db.transaction(async (transaction) => {
+      const [proof] = await transaction
+        .update(phoneVerifications)
+        .set({ consumedAt: utcNow() })
+        .where(
+          and(
+            eq(phoneVerifications.purpose, 'reset_password'),
+            eq(phoneVerifications.scopeEmail, email.toLowerCase()),
+            eq(phoneVerifications.phone, phone),
+            eq(phoneVerifications.proofHash, proofHash),
+            isNull(phoneVerifications.scopeUserId),
+            isNotNull(phoneVerifications.verifiedAt),
+            isNull(phoneVerifications.consumedAt),
+            isNull(phoneVerifications.invalidatedAt),
+            isFuture(phoneVerifications.expiresAt),
+          ),
+        )
+        .returning({ id: phoneVerifications.id });
+      if (!proof) throw new PhoneVerificationInvalidError();
+      const [candidate] = await transaction
+        .select({
+          id: users.id,
+          email: users.email,
+          passwordHash: users.passwordHash,
+        })
+        .from(users)
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            eq(users.phone, phone),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+            eq(logisticsCompanies.active, true),
+            session ? eq(users.id, session.userId) : undefined,
+          ),
+        );
+      // SMS와 같은 소문자 비교를 사용한다. SQLite NOCASE는 비ASCII 문자를 접지 못한다.
+      // 고유 연락처로 한 계정만 조회하며 발송·재검사용 이메일은 DB 원문을 보존한다.
+      const user =
+        candidate?.email.toLowerCase() === email.toLowerCase()
+          ? candidate
+          : undefined;
+      if (session) {
+        const [validSession] = await transaction
+          .select({ id: users.id })
+          .from(authSessions)
+          .innerJoin(users, eq(authSessions.userId, users.id))
           .innerJoin(
             logisticsCompanies,
             eq(users.logisticsCompanyId, logisticsCompanies.id),
           )
+          .for('update', { of: [authSessions] })
           .where(
             and(
-              eq(users.phone, phone),
-              eq(users.role, 'driver'),
-              isNull(users.deactivatedAt),
-              eq(logisticsCompanies.active, true),
-              session ? eq(users.id, session.userId) : undefined,
-            ),
-          )
-          .get();
-        // SMS와 같은 소문자 비교를 사용한다. SQLite NOCASE는 비ASCII 문자를 접지 못한다.
-        // 고유 연락처로 한 계정만 조회하며 발송·재검사용 이메일은 DB 원문을 보존한다.
-        const user =
-          candidate?.email.toLowerCase() === email.toLowerCase()
-            ? candidate
-            : undefined;
-        if (session) {
-          const validSession = transaction
-            .select({ id: users.id })
-            .from(authSessions)
-            .innerJoin(users, eq(authSessions.userId, users.id))
-            .innerJoin(
-              logisticsCompanies,
-              eq(users.logisticsCompanyId, logisticsCompanies.id),
-            )
-            .where(
-              and(
-                validDriverSession(
-                  session.tokenHash,
-                  session.now,
-                  session.idleCutoff,
-                ),
-                eq(users.id, session.userId),
+              validDriverSession(
+                session.tokenHash,
+                session.now,
+                session.idleCutoff,
               ),
-            )
-            .get();
-          if (!validSession) throw new LoginUnavailableError();
-          if (!user) throw new PhoneVerificationInvalidError();
-        }
-        // 계정 불일치도 증명은 소비하며 서비스가 조회 실패로 안내한다.
-        if (user && user.passwordHash === null)
-          throw new Error('Active driver password invariant violated');
-        return user?.passwordHash
-          ? { ...user, passwordHash: user.passwordHash, phone }
-          : undefined;
-      },
-      { behavior: 'immediate' },
-    );
+              eq(users.id, session.userId),
+            ),
+          );
+        if (!validSession) throw new LoginUnavailableError();
+        if (!user) throw new PhoneVerificationInvalidError();
+      }
+      // 계정 불일치도 증명은 소비하며 서비스가 조회 실패로 안내한다.
+      if (user && user.passwordHash === null)
+        throw new Error('Active driver password invariant violated');
+      return user?.passwordHash
+        ? { ...user, passwordHash: user.passwordHash, phone }
+        : undefined;
+    });
   }
 
   activatePasswordResetEmail(
@@ -245,85 +253,78 @@ export class AuthRepository {
     tokenHash: string,
     id: string,
     session?: ResetEmailSession,
-  ): boolean {
-    return this.database.db.transaction(
-      (transaction) => {
-        const user = transaction
+  ): Promise<boolean> {
+    return this.database.db.transaction(async (transaction) => {
+      const [user] = await transaction
+        .select({ id: users.id })
+        .from(users)
+        .innerJoin(
+          logisticsCompanies,
+          eq(users.logisticsCompanyId, logisticsCompanies.id),
+        )
+        .where(
+          and(
+            eq(users.id, recipient.id),
+            emailEquals(recipient.email),
+            eq(users.phone, recipient.phone),
+            eq(users.passwordHash, recipient.passwordHash),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+            eq(logisticsCompanies.active, true),
+          ),
+        )
+        .for('update', { of: [users] });
+      if (!user) return false;
+      if (session) {
+        const [validSession] = await transaction
           .select({ id: users.id })
-          .from(users)
+          .from(authSessions)
+          .innerJoin(users, eq(authSessions.userId, users.id))
           .innerJoin(
             logisticsCompanies,
             eq(users.logisticsCompanyId, logisticsCompanies.id),
           )
+          .for('update', { of: [authSessions] })
           .where(
             and(
-              eq(users.id, recipient.id),
-              eq(users.email, recipient.email),
-              eq(users.phone, recipient.phone),
-              eq(users.passwordHash, recipient.passwordHash),
-              eq(users.role, 'driver'),
-              isNull(users.deactivatedAt),
-              eq(logisticsCompanies.active, true),
-            ),
-          )
-          .get();
-        if (!user) return false;
-        if (session) {
-          const validSession = transaction
-            .select({ id: users.id })
-            .from(authSessions)
-            .innerJoin(users, eq(authSessions.userId, users.id))
-            .innerJoin(
-              logisticsCompanies,
-              eq(users.logisticsCompanyId, logisticsCompanies.id),
-            )
-            .where(
-              and(
-                validDriverSession(
-                  session.tokenHash,
-                  session.now,
-                  session.idleCutoff,
-                ),
-                eq(users.id, session.userId),
+              validDriverSession(
+                session.tokenHash,
+                session.now,
+                session.idleCutoff,
               ),
-            )
-            .get();
-          if (!validSession || session.userId !== recipient.id) return false;
-        }
-        // 메일 ACK 전에 토큰을 저장하지 않는다. 새 저장 실패 시 기존 링크 무효화도 롤백된다.
-        transaction
-          .update(passwordResetTokens)
-          .set({ usedAt: sql`CURRENT_TIMESTAMP` })
-          .where(
-            and(
-              eq(passwordResetTokens.userId, user.id),
-              isNull(passwordResetTokens.usedAt),
+              eq(users.id, session.userId),
             ),
-          )
-          .run();
-        transaction
-          .insert(passwordResetTokens)
-          .values({
-            id,
-            userId: user.id,
-            tokenHash,
-            expiresAt: sql`datetime('now', '+30 minutes')`,
-          })
-          .run();
-        return true;
-      },
-      { behavior: 'immediate' },
-    );
+          );
+        if (!validSession || session.userId !== recipient.id) return false;
+      }
+      // 메일 ACK 전에 토큰을 저장하지 않는다. 새 저장 실패 시 기존 링크 무효화도 롤백된다.
+      await transaction
+        .update(passwordResetTokens)
+        .set({ usedAt: utcNow() })
+        .where(
+          and(
+            eq(passwordResetTokens.userId, user.id),
+            isNull(passwordResetTokens.usedAt),
+          ),
+        );
+      await transaction.insert(passwordResetTokens).values({
+        id,
+        userId: user.id,
+        tokenHash,
+        expiresAt: utcFuture('30 minutes'),
+      });
+      return true;
+    });
   }
 
   resetDriverPassword(
     tokenHash: string,
     previousPasswordHash: string,
     passwordHash: string,
-  ): boolean {
-    return this.database.db.transaction((transaction) => {
+  ): Promise<boolean> {
+    return this.database.db.transaction(async (transaction) => {
       // 해시 생성 중 토큰 소비·만료 또는 계정 자격/비밀번호 변경을 다시 검사한다.
-      const user = transaction
+      const [user] = await transaction
         .select({ id: users.id })
         .from(passwordResetTokens)
         .innerJoin(users, eq(passwordResetTokens.userId, users.id))
@@ -337,72 +338,84 @@ export class AuthRepository {
             eq(users.passwordHash, previousPasswordHash),
           ),
         )
-        .get();
+        .for('update', { of: [users] });
       if (!user) return false;
-      transaction
+      await transaction
         .update(users)
-        .set({ passwordHash, updatedAt: sql`CURRENT_TIMESTAMP` })
-        .where(eq(users.id, user.id))
-        .run();
+        .set({ passwordHash, updatedAt: utcNow() })
+        .where(eq(users.id, user.id));
       // 이전 비밀번호에 대한 다른 미사용 링크도 재사용할 수 없게 함께 소비한다.
-      transaction
+      await transaction
         .update(passwordResetTokens)
-        .set({ usedAt: sql`CURRENT_TIMESTAMP` })
+        .set({ usedAt: utcNow() })
         .where(
           and(
             eq(passwordResetTokens.userId, user.id),
             isNull(passwordResetTokens.usedAt),
           ),
-        )
-        .run();
-      transaction
+        );
+      await transaction
         .delete(authSessions)
-        .where(eq(authSessions.userId, user.id))
-        .run();
+        .where(eq(authSessions.userId, user.id));
       return true;
     });
   }
 
-  createLoginSession(input: CreateLoginSessionInput): void {
-    this.database.db.transaction((transaction) => {
+  async createLoginSession(input: CreateLoginSessionInput): Promise<void> {
+    await this.database.db.transaction(async (transaction) => {
       // 비밀번호 검증을 기다리는 동안 계정·소속·비밀번호가 바뀔 수 있어 다시 확인한다.
-      const user = transaction
-        .select({ passwordHash: users.passwordHash })
+      const [user] = await transaction
+        .select({
+          passwordHash: users.passwordHash,
+          logisticsCompanyId: users.logisticsCompanyId,
+        })
         .from(users)
-        .innerJoin(
-          logisticsCompanies,
-          eq(users.logisticsCompanyId, logisticsCompanies.id),
-        )
         .where(
           and(
             eq(users.id, input.userId),
             eq(users.role, 'driver'),
             isNull(users.deactivatedAt),
-            eq(logisticsCompanies.active, true),
           ),
         )
-        .get();
+        .for('update', { of: [users] });
 
-      if (!user || user.passwordHash !== input.passwordHash) {
+      if (
+        !user ||
+        !user.logisticsCompanyId ||
+        user.passwordHash !== input.passwordHash
+      ) {
         throw new LoginUnavailableError();
       }
 
-      transaction
-        .insert(authSessions)
-        .values({
-          tokenHash: input.tokenHash,
-          userId: input.userId,
-          createdAt: input.createdAt,
-          lastUsedAt: input.createdAt,
-          expiresAt: input.expiresAt,
-        })
-        .run();
+      const [company] = await transaction
+        .select({ id: logisticsCompanies.id })
+        .from(logisticsCompanies)
+        .where(
+          and(
+            eq(logisticsCompanies.id, user.logisticsCompanyId),
+            eq(logisticsCompanies.active, true),
+          ),
+        )
+        .for('update', { of: [logisticsCompanies] });
+      if (!company) throw new LoginUnavailableError();
+
+      await transaction.insert(authSessions).values({
+        tokenHash: input.tokenHash,
+        userId: input.userId,
+        createdAt: input.createdAt,
+        lastUsedAt: input.createdAt,
+        expiresAt: input.expiresAt,
+      });
     });
   }
 
-  useSession(tokenHash: string, now: Date, idleCutoff: Date) {
-    return this.database.db.transaction((transaction) => {
-      const session = transaction
+  async useSession(
+    tokenHash: string,
+    now: Date,
+    idleCutoff: Date,
+  ): Promise<SessionUser | undefined> {
+    return this.database.db.transaction(async (transaction) => {
+      const [session] = await transaction
         .select({
           user: {
             id: users.id,
@@ -419,17 +432,16 @@ export class AuthRepository {
           eq(users.logisticsCompanyId, logisticsCompanies.id),
         )
         .where(validDriverSession(tokenHash, now, idleCutoff))
-        .get();
+        .for('update', { of: [authSessions] });
 
       if (!session) {
-        transaction
+        await transaction
           .delete(authSessions)
-          .where(eq(authSessions.tokenHash, tokenHash))
-          .run();
+          .where(eq(authSessions.tokenHash, tokenHash));
         return undefined;
       }
 
-      transaction
+      await transaction
         .update(authSessions)
         .set({
           // 시계가 되돌아가도 마지막 사용 시각은 감소시키지 않는다.
@@ -437,56 +449,53 @@ export class AuthRepository {
             Math.max(now.getTime(), session.lastUsedAt.getTime()),
           ),
         })
-        .where(eq(authSessions.tokenHash, tokenHash))
-        .run();
+        .where(eq(authSessions.tokenHash, tokenHash));
       return session.user;
     });
   }
 
-  deleteSession(tokenHash: string): void {
-    this.database.db
+  async deleteSession(tokenHash: string): Promise<void> {
+    await this.database.db
       .delete(authSessions)
-      .where(eq(authSessions.tokenHash, tokenHash))
-      .run();
+      .where(eq(authSessions.tokenHash, tokenHash));
   }
 
-  findEmailWithProof(phone: string, proofHash: string): string | undefined {
-    return this.database.db.transaction(
-      (transaction) => {
-        const proof = transaction
-          .update(phoneVerifications)
-          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
-          .where(
-            and(
-              eq(phoneVerifications.purpose, 'find_email'),
-              eq(phoneVerifications.phone, phone),
-              eq(phoneVerifications.proofHash, proofHash),
-              isNull(phoneVerifications.scopeEmail),
-              isNull(phoneVerifications.scopeUserId),
-              isNotNull(phoneVerifications.verifiedAt),
-              isNull(phoneVerifications.consumedAt),
-              isNull(phoneVerifications.invalidatedAt),
-              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
-            ),
-          )
-          .returning({ id: phoneVerifications.id })
-          .get();
-        if (!proof) throw new PhoneVerificationInvalidError();
-        // 결과가 없어도 본인 확인 증명을 한 번 소비한다. DB 실패는 소비까지 롤백한다.
-        return transaction
-          .select({ email: users.email })
-          .from(users)
-          .where(
-            and(
-              eq(users.phone, phone),
-              eq(users.role, 'driver'),
-              isNull(users.deactivatedAt),
-            ),
-          )
-          .get()?.email;
-      },
-      { behavior: 'immediate' },
-    );
+  async findEmailWithProof(
+    phone: string,
+    proofHash: string,
+  ): Promise<string | undefined> {
+    return this.database.db.transaction(async (transaction) => {
+      const [proof] = await transaction
+        .update(phoneVerifications)
+        .set({ consumedAt: utcNow() })
+        .where(
+          and(
+            eq(phoneVerifications.purpose, 'find_email'),
+            eq(phoneVerifications.phone, phone),
+            eq(phoneVerifications.proofHash, proofHash),
+            isNull(phoneVerifications.scopeEmail),
+            isNull(phoneVerifications.scopeUserId),
+            isNotNull(phoneVerifications.verifiedAt),
+            isNull(phoneVerifications.consumedAt),
+            isNull(phoneVerifications.invalidatedAt),
+            isFuture(phoneVerifications.expiresAt),
+          ),
+        )
+        .returning({ id: phoneVerifications.id });
+      if (!proof) throw new PhoneVerificationInvalidError();
+      // 결과가 없어도 본인 확인 증명을 한 번 소비한다. DB 실패는 소비까지 롤백한다.
+      const [user] = await transaction
+        .select({ email: users.email })
+        .from(users)
+        .where(
+          and(
+            eq(users.phone, phone),
+            eq(users.role, 'driver'),
+            isNull(users.deactivatedAt),
+          ),
+        );
+      return user?.email;
+    });
   }
 
   beginPhoneVerification(
@@ -496,34 +505,39 @@ export class AuthRepository {
     purpose: VerificationPurpose,
     email?: string,
     userId?: string,
-  ): void {
+  ): Promise<void> {
     if (purpose === 'change_phone' && !userId)
       throw new Error('Phone change requires an owner');
-    this.database.db.transaction((transaction) => {
-      if (
-        userId &&
-        !transaction
-          .select({ id: users.id })
-          .from(users)
-          .innerJoin(
-            logisticsCompanies,
-            eq(users.logisticsCompanyId, logisticsCompanies.id),
-          )
-          .where(
-            and(
-              eq(users.id, userId),
-              eq(users.role, 'driver'),
-              isNull(users.deactivatedAt),
-              eq(logisticsCompanies.active, true),
-            ),
-          )
-          .get()
-      ) {
+    return this.database.db.transaction(async (transaction) => {
+      // UPDATE가 아직 없는 범위도 동시에 시작될 수 있으므로, 무효화 범위를
+      // 트랜잭션 수명 동안 잠근다. 외부 SMS 호출은 이 트랜잭션 밖에서 한다.
+      await transaction.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtext(${purpose}), hashtext(${phoneVerificationScope(phone, userId)}))`,
+      );
+      const [owner] = userId
+        ? await transaction
+            .select({ id: users.id })
+            .from(users)
+            .innerJoin(
+              logisticsCompanies,
+              eq(users.logisticsCompanyId, logisticsCompanies.id),
+            )
+            .where(
+              and(
+                eq(users.id, userId),
+                eq(users.role, 'driver'),
+                isNull(users.deactivatedAt),
+                eq(logisticsCompanies.active, true),
+              ),
+            )
+            .for('update', { of: [users] })
+        : [];
+      if (userId && !owner) {
         throw new LoginUnavailableError();
       }
-      transaction
+      await transaction
         .update(phoneVerifications)
-        .set({ invalidatedAt: sql`CURRENT_TIMESTAMP` })
+        .set({ invalidatedAt: utcNow() })
         .where(
           and(
             eq(phoneVerifications.purpose, purpose),
@@ -533,33 +547,29 @@ export class AuthRepository {
             isNull(phoneVerifications.consumedAt),
             isNull(phoneVerifications.invalidatedAt),
           ),
-        )
-        .run();
+        );
 
-      transaction
-        .insert(phoneVerifications)
-        .values({
-          id,
-          phone,
-          purpose,
-          scopeEmail: email,
-          scopeUserId: userId,
-          codeHash,
-          // Pending sends use the epoch so a small clock rollback cannot enable them.
-          expiresAt: '1970-01-01 00:00:00',
-        })
-        .run();
+      await transaction.insert(phoneVerifications).values({
+        id,
+        phone,
+        purpose,
+        scopeEmail: email,
+        scopeUserId: userId,
+        codeHash,
+        // Pending sends use the epoch so a small clock rollback cannot enable them.
+        expiresAt: '1970-01-01 00:00:00',
+      });
     });
   }
 
-  activatePhoneVerification(
+  async activatePhoneVerification(
     id: string,
     purpose: VerificationPurpose,
     userId?: string,
-  ): string | undefined {
-    const verification = this.database.db
+  ): Promise<string | undefined> {
+    const [verification] = await this.database.db
       .update(phoneVerifications)
-      .set({ expiresAt: sql`datetime('now', '+3 minutes')` })
+      .set({ expiresAt: utcFuture('3 minutes') })
       .where(
         and(
           eq(phoneVerifications.id, id),
@@ -570,42 +580,36 @@ export class AuthRepository {
           isNull(phoneVerifications.consumedAt),
         ),
       )
-      .returning({ expiresAt: phoneVerifications.expiresAt })
-      .get();
+      .returning({ expiresAt: phoneVerifications.expiresAt });
 
-    return verification
-      ? `${verification.expiresAt.replace(' ', 'T')}Z`
-      : undefined;
+    return verification ? isoUtc(verification.expiresAt) : undefined;
   }
 
-  findActivePhoneVerification(
+  async findActivePhoneVerification(
     id: string,
     purpose: VerificationPurpose,
     userId?: string,
-  ) {
-    return this.database.db
+  ): Promise<{ codeHash: string } | undefined> {
+    const [verification] = await this.database.db
       .select({ codeHash: phoneVerifications.codeHash })
       .from(phoneVerifications)
-      .where(validPhoneVerification(id, purpose, userId))
-      .get();
+      .where(validPhoneVerification(id, purpose, userId));
+    return verification;
   }
 
-  confirmPhoneVerification(
+  async confirmPhoneVerification(
     id: string,
     proofHash: string,
     purpose: VerificationPurpose,
     userId?: string,
-  ): string | undefined {
-    const verification = this.database.db
+  ): Promise<string | undefined> {
+    const [verification] = await this.database.db
       .update(phoneVerifications)
-      .set({ proofHash, verifiedAt: sql`CURRENT_TIMESTAMP` })
+      .set({ proofHash, verifiedAt: utcNow() })
       .where(validPhoneVerification(id, purpose, userId))
-      .returning({ expiresAt: phoneVerifications.expiresAt })
-      .get();
+      .returning({ expiresAt: phoneVerifications.expiresAt });
 
-    return verification
-      ? `${verification.expiresAt.replace(' ', 'T')}Z`
-      : undefined;
+    return verification ? isoUtc(verification.expiresAt) : undefined;
   }
 
   async assertSignUpPrerequisites(
@@ -642,7 +646,7 @@ export class AuthRepository {
     const [emailDuplicate] = await this.database.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.email, email), registeredIdentity()))
+      .where(and(emailEquals(email), registeredIdentity()))
       .limit(1);
 
     if (emailDuplicate) {
@@ -660,21 +664,20 @@ export class AuthRepository {
     }
   }
 
-  createDriver(input: CreateDriverInput): string {
+  async createDriver(input: CreateDriverInput): Promise<string> {
     try {
-      return this.database.db.transaction((transaction) => {
-        const [verification] = transaction
+      return await this.database.db.transaction(async (transaction) => {
+        const [verification] = await transaction
           .update(phoneVerifications)
-          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
+          .set({ consumedAt: utcNow() })
           .where(validSignUpProof(input.phone, input.proofHash))
-          .returning({ id: phoneVerifications.id })
-          .all();
+          .returning({ id: phoneVerifications.id });
 
         if (!verification) {
           throw new PhoneVerificationInvalidError();
         }
 
-        const [company] = transaction
+        const [company] = await transaction
           .select({ id: logisticsCompanies.id })
           .from(logisticsCompanies)
           .where(
@@ -683,36 +686,34 @@ export class AuthRepository {
               eq(logisticsCompanies.active, true),
             ),
           )
-          .limit(1)
-          .all();
+          .for('update', { of: [logisticsCompanies] })
+          .limit(1);
 
         if (!company) {
           throw new LogisticsCompanyUnavailableError();
         }
 
-        const [emailDuplicate] = transaction
+        const [emailDuplicate] = await transaction
           .select({ id: users.id })
           .from(users)
-          .where(and(eq(users.email, input.email), registeredIdentity()))
-          .limit(1)
-          .all();
+          .where(and(emailEquals(input.email), registeredIdentity()))
+          .limit(1);
 
         if (emailDuplicate) {
           throw new EmailAlreadyExistsError();
         }
 
-        const [phoneDuplicate] = transaction
+        const [phoneDuplicate] = await transaction
           .select({ id: users.id })
           .from(users)
           .where(and(eq(users.phone, input.phone), registeredIdentity()))
-          .limit(1)
-          .all();
+          .limit(1);
 
         if (phoneDuplicate) {
           throw new PhoneAlreadyExistsError();
         }
 
-        const [user] = transaction
+        const [user] = await transaction
           .insert(users)
           .values({
             email: input.email,
@@ -726,8 +727,7 @@ export class AuthRepository {
             role: 'driver',
             serviceTermsConsent: input.serviceTerms,
           })
-          .returning({ id: users.id })
-          .all();
+          .returning({ id: users.id });
 
         return user.id;
       });
@@ -737,17 +737,17 @@ export class AuthRepository {
     }
   }
 
-  changeDriverPhone(input: {
+  async changeDriverPhone(input: {
     userId: string;
     tokenHash: string;
     phone: string;
     proofHash: string;
     now: Date;
     idleCutoff: Date;
-  }): boolean {
+  }): Promise<boolean> {
     try {
-      return this.database.db.transaction((transaction) => {
-        const session = transaction
+      return await this.database.db.transaction(async (transaction) => {
+        const [session] = await transaction
           .select({ id: users.id })
           .from(authSessions)
           .innerJoin(users, eq(authSessions.userId, users.id))
@@ -761,11 +761,11 @@ export class AuthRepository {
               eq(users.id, input.userId),
             ),
           )
-          .get();
+          .for('update', { of: [users] });
         if (!session) return false;
-        const proof = transaction
+        const [proof] = await transaction
           .update(phoneVerifications)
-          .set({ consumedAt: sql`CURRENT_TIMESTAMP` })
+          .set({ consumedAt: utcNow() })
           .where(
             and(
               eq(phoneVerifications.purpose, 'change_phone'),
@@ -775,13 +775,12 @@ export class AuthRepository {
               isNotNull(phoneVerifications.verifiedAt),
               isNull(phoneVerifications.invalidatedAt),
               isNull(phoneVerifications.consumedAt),
-              gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+              isFuture(phoneVerifications.expiresAt),
             ),
           )
-          .returning({ id: phoneVerifications.id })
-          .get();
+          .returning({ id: phoneVerifications.id });
         if (!proof) throw new PhoneVerificationInvalidError();
-        const duplicate = transaction
+        const [duplicate] = await transaction
           .select({ id: users.id })
           .from(users)
           .where(
@@ -790,14 +789,12 @@ export class AuthRepository {
               ne(users.id, input.userId),
               registeredIdentity(),
             ),
-          )
-          .get();
+          );
         if (duplicate) throw new PhoneAlreadyExistsError();
-        transaction
+        await transaction
           .update(users)
-          .set({ phone: input.phone, updatedAt: sql`CURRENT_TIMESTAMP` })
-          .where(eq(users.id, input.userId))
-          .run();
+          .set({ phone: input.phone, updatedAt: utcNow() })
+          .where(eq(users.id, input.userId));
         return true;
       });
     } catch (error) {
@@ -812,16 +809,26 @@ export class AuthRepository {
       typeof cause === 'object' && cause !== null && 'message' in cause
         ? String(cause.message)
         : '';
+    const constraint =
+      typeof cause === 'object' && cause !== null && 'constraint' in cause
+        ? String(cause.constraint)
+        : '';
 
     if (!isUniqueConstraintError(cause)) {
       return;
     }
 
-    if (message.includes('users.email')) {
+    if (
+      message.includes('users.email') ||
+      constraint === 'users_registered_email_idx'
+    ) {
       throw new EmailAlreadyExistsError();
     }
 
-    if (message.includes('users.phone')) {
+    if (
+      message.includes('users.phone') ||
+      constraint === 'users_registered_phone_idx'
+    ) {
       throw new PhoneAlreadyExistsError();
     }
   }
@@ -829,6 +836,10 @@ export class AuthRepository {
 
 function registeredIdentity() {
   return or(isNull(users.deactivatedAt), eq(users.role, 'admin'));
+}
+
+function emailEquals(email: string) {
+  return sql`lower(${users.email}) = lower(${email})`;
 }
 
 function validDriverSession(tokenHash: string, now: Date, idleCutoff: Date) {
@@ -846,7 +857,7 @@ function validPasswordReset(tokenHash: string) {
   return and(
     eq(passwordResetTokens.tokenHash, tokenHash),
     isNull(passwordResetTokens.usedAt),
-    gt(sql`julianday(${passwordResetTokens.expiresAt})`, sql`julianday('now')`),
+    isFuture(passwordResetTokens.expiresAt),
     eq(users.role, 'driver'),
     isNull(users.deactivatedAt),
     eq(logisticsCompanies.active, true),
@@ -864,7 +875,7 @@ function validPhoneVerification(
     verificationOwner(userId),
     isNull(phoneVerifications.consumedAt),
     isNull(phoneVerifications.invalidatedAt),
-    gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+    isFuture(phoneVerifications.expiresAt),
   );
 }
 
@@ -876,7 +887,7 @@ function validSignUpProof(phone: string, proofHash: string) {
     isNotNull(phoneVerifications.verifiedAt),
     isNull(phoneVerifications.consumedAt),
     isNull(phoneVerifications.invalidatedAt),
-    gt(phoneVerifications.expiresAt, sql`CURRENT_TIMESTAMP`),
+    isFuture(phoneVerifications.expiresAt),
   );
 }
 
@@ -884,6 +895,29 @@ function verificationOwner(userId?: string) {
   return userId === undefined
     ? isNull(phoneVerifications.scopeUserId)
     : eq(phoneVerifications.scopeUserId, userId);
+}
+
+function phoneVerificationScope(phone: string, userId?: string): string {
+  return userId === undefined ? `phone:${phone}` : `user:${userId}`;
+}
+
+function utcNow() {
+  return sql`to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+}
+
+function utcFuture(interval: string) {
+  return sql`to_char((CURRENT_TIMESTAMP + ${sql.raw(`INTERVAL '${interval}'`)}) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+}
+
+function isFuture(
+  value:
+    typeof passwordResetTokens.expiresAt | typeof phoneVerifications.expiresAt,
+) {
+  return sql`(${value}::timestamp AT TIME ZONE 'UTC') > CURRENT_TIMESTAMP`;
+}
+
+function isoUtc(value: string): string {
+  return value.endsWith('Z') ? value : `${value.replace(' ', 'T')}Z`;
 }
 
 function getDatabaseCause(error: unknown): unknown {

@@ -2,10 +2,16 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { INestApplication } from '@nestjs/common';
 import * as argon2 from 'argon2';
+import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 
 import { DatabaseService } from '../src/database/database.service';
+import {
+  logisticsCompanies,
+  phoneVerifications,
+  users,
+} from '../src/database/schema';
 import { createTestApp } from './helpers/create-test-app';
 
 type SignUpInput = {
@@ -78,19 +84,13 @@ describe('Sign up (e2e)', () => {
     database = app.get(DatabaseService);
   });
 
-  beforeEach(() => {
-    database.connection.exec(`
-      DELETE FROM mileage_application_photos;
-      DELETE FROM mileage_applications;
-      DELETE FROM settlements;
-      DELETE FROM password_reset_tokens;
-      DELETE FROM users;
-      DELETE FROM phone_verifications;
-      DELETE FROM logistics_companies;
-    `);
+  beforeEach(async () => {
+    await database.connection.unsafe(
+      'TRUNCATE app.mileage_application_photos, app.mileage_applications, app.settlements, app.password_reset_tokens, app.users, app.phone_verifications, app.logistics_companies CASCADE',
+    );
   });
 
-  function seedCompany({
+  async function seedCompany({
     active = true,
     businessName = '(주)경인물류',
     id = randomUUID(),
@@ -100,40 +100,24 @@ describe('Sign up (e2e)', () => {
     id?: string;
   } = {}) {
     companySequence += 1;
-    database.connection
-      .prepare(
-        `INSERT INTO logistics_companies (
-          id,
-          business_name,
-          business_number,
-          corporate_registration_number,
-          business_address,
-          manager_name,
-          manager_phone,
-          bank_code,
-          account_number,
-          account_holder,
-          active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        businessName,
-        `${String(companySequence).padStart(3, '0')}-45-67890`,
-        `${String(companySequence).padStart(6, '0')}-0012345`,
-        '서울시 강남구 역삼동 123',
-        '김민수',
-        '010-1234-5678',
-        '19',
-        '110-456-789012',
-        '김민수',
-        Number(active),
-      );
+    await database.db.insert(logisticsCompanies).values({
+      id,
+      businessName,
+      businessNumber: `${String(companySequence).padStart(3, '0')}-45-67890`,
+      corporateRegistrationNumber: `${String(companySequence).padStart(6, '0')}-0012345`,
+      businessAddress: '서울시 강남구 역삼동 123',
+      managerName: '김민수',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '110-456-789012',
+      accountHolder: '김민수',
+      active,
+    });
 
     return { businessName, id };
   }
 
-  function seedVerification({
+  async function seedVerification({
     consumedAt = null,
     expiresAt = '2099-01-01 00:00:00',
     invalidatedAt = null,
@@ -150,36 +134,22 @@ describe('Sign up (e2e)', () => {
     purpose?: string;
     verifiedAt?: string | null;
   } = {}) {
-    database.connection
-      .prepare(
-        `INSERT INTO phone_verifications (
-          id,
-          purpose,
-          phone,
-          code_hash,
-          proof_hash,
-          expires_at,
-          verified_at,
-          consumed_at,
-          invalidated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        randomUUID(),
-        purpose,
-        phone,
-        'verification-code-hash',
-        proofHash(proof),
-        expiresAt,
-        verifiedAt,
-        consumedAt,
-        invalidatedAt,
-      );
+    await database.db.insert(phoneVerifications).values({
+      id: randomUUID(),
+      purpose: purpose as typeof phoneVerifications.$inferInsert.purpose,
+      phone,
+      codeHash: 'verification-code-hash',
+      proofHash: proofHash(proof),
+      expiresAt,
+      verifiedAt,
+      consumedAt,
+      invalidatedAt,
+    });
 
     return { proof, proofHash: proofHash(proof) };
   }
 
-  function seedDriver({
+  async function seedDriver({
     email = 'existing@example.com',
     logisticsCompanyId,
     phone = '010-9999-9999',
@@ -188,29 +158,18 @@ describe('Sign up (e2e)', () => {
     logisticsCompanyId: string;
     phone?: string;
   }) {
-    database.connection
-      .prepare(
-        `INSERT INTO users (
-          id,
-          role,
-          email,
-          password_hash,
-          name,
-          phone,
-          logistics_company_id,
-          service_terms_consent,
-          privacy_terms_consent,
-          marketing_consent
-        ) VALUES (?, 'driver', ?, ?, ?, ?, ?, 1, 1, 0)`,
-      )
-      .run(
-        randomUUID(),
-        email,
-        'not-used-by-this-test',
-        '기존 기사',
-        phone,
-        logisticsCompanyId,
-      );
+    await database.db.insert(users).values({
+      id: randomUUID(),
+      role: 'driver',
+      email,
+      passwordHash: 'not-used-by-this-test',
+      name: '기존 기사',
+      phone,
+      logisticsCompanyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+      marketingConsent: false,
+    });
   }
 
   function signUpInput(
@@ -239,10 +198,26 @@ describe('Sign up (e2e)', () => {
     });
   }
 
+  async function userCount() {
+    return (await database.db.select({ id: users.id }).from(users)).length;
+  }
+
+  async function storedProof(hash: string) {
+    const [proof] = await database.db
+      .select({
+        proofHash: phoneVerifications.proofHash,
+        consumedAt: phoneVerifications.consumedAt,
+      })
+      .from(phoneVerifications)
+      .where(eq(phoneVerifications.proofHash, hash))
+      .limit(1);
+    return proof;
+  }
+
   it('lists only active logistics companies as signup choices in name order', async () => {
-    const second = seedCompany({ businessName: '나래물류' });
-    const first = seedCompany({ businessName: '가람물류' });
-    seedCompany({ active: false, businessName: '비활성물류' });
+    const second = await seedCompany({ businessName: '나래물류' });
+    const first = await seedCompany({ businessName: '가람물류' });
+    await seedCompany({ active: false, businessName: '비활성물류' });
 
     await request(app.getHttpServer())
       .get('/api/v1/logistics-companies')
@@ -254,8 +229,8 @@ describe('Sign up (e2e)', () => {
   });
 
   it('creates a driver, saves its consents, hashes its password, and consumes its proof', async () => {
-    const company = seedCompany();
-    const verification = seedVerification();
+    const company = await seedCompany();
+    const verification = await seedVerification();
     const input = signUpInput(company.id, {
       verificationProof: verification.proof,
     });
@@ -275,68 +250,50 @@ describe('Sign up (e2e)', () => {
       input.verificationProof,
     );
 
-    const user = database.connection
-      .prepare(
-        `SELECT
-          role,
-          email,
-          password_hash AS passwordHash,
-          name,
-          phone,
-          logistics_company_id AS logisticsCompanyId,
-          service_terms_consent AS serviceTerms,
-          privacy_terms_consent AS privacyTerms,
-          marketing_consent AS marketingTerms
-        FROM users
-        WHERE id = ?`,
-      )
-      .get(body.id) as {
-      email: string;
-      logisticsCompanyId: string;
-      marketingTerms: number;
-      name: string;
-      passwordHash: string;
-      phone: string;
-      privacyTerms: number;
-      role: string;
-      serviceTerms: number;
-    };
+    const user = (
+      await database.db
+        .select({
+          role: users.role,
+          email: users.email,
+          passwordHash: users.passwordHash,
+          name: users.name,
+          phone: users.phone,
+          logisticsCompanyId: users.logisticsCompanyId,
+          serviceTerms: users.serviceTermsConsent,
+          privacyTerms: users.privacyTermsConsent,
+          marketingTerms: users.marketingConsent,
+        })
+        .from(users)
+        .where(eq(users.id, body.id))
+        .limit(1)
+    )[0];
 
     expect(user).toMatchObject({
       email: input.email,
       logisticsCompanyId: input.logisticsCompanyId,
-      marketingTerms: 0,
+      marketingTerms: false,
       name: input.name,
       phone: input.phone,
-      privacyTerms: 1,
+      privacyTerms: true,
       role: 'driver',
-      serviceTerms: 1,
+      serviceTerms: true,
     });
     expect(user.passwordHash).not.toBe(input.password);
     await expect(
-      argon2.verify(user.passwordHash, input.password),
+      argon2.verify(user.passwordHash!, input.password),
     ).resolves.toBe(true);
 
-    const verificationRow = database.connection
-      .prepare(
-        `SELECT proof_hash AS proofHash, consumed_at AS consumedAt
-        FROM phone_verifications
-        WHERE proof_hash = ?`,
-      )
-      .get(verification.proofHash) as {
-      consumedAt: string | null;
-      proofHash: string;
-    };
+    const verificationRow = await storedProof(verification.proofHash);
 
     expect(verificationRow).toMatchObject({
       proofHash: verification.proofHash,
     });
-    expect(verificationRow.consumedAt).toBeTruthy();
+    expect(verificationRow?.consumedAt).toBeTruthy();
   });
 
   it('rejects malformed and unknown signup fields before persisting a user', async () => {
-    const company = seedCompany();
-    const verification = seedVerification();
+    const company = await seedCompany();
+    const verification = await seedVerification();
     const input = signUpInput(company.id, {
       email: 'not-an-email',
       logisticsCompanyId: 'not-a-uuid',
@@ -363,20 +320,14 @@ describe('Sign up (e2e)', () => {
     ]) {
       expect(error.fieldErrors?.[field]).toBeDefined();
     }
-    expect(
-      database.connection.prepare('SELECT COUNT(*) AS count FROM users').get(),
-    ).toEqual({ count: 0 });
-    expect(
-      database.connection
-        .prepare(
-          'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-        )
-        .get(verification.proofHash),
-    ).toEqual({ consumedAt: null });
+    expect(await userCount()).toBe(0);
+    expect(await storedProof(verification.proofHash)).toMatchObject({
+      consumedAt: null,
+    });
   });
 
   it('requires a complete password and both mandatory terms', async () => {
-    const company = seedCompany();
+    const company = await seedCompany();
     const cases: { field: string; input: Partial<SignUpInput> }[] = [
       { field: 'password', input: { password: 'Password' } },
       { field: 'serviceTerms', input: { serviceTerms: false } },
@@ -384,7 +335,7 @@ describe('Sign up (e2e)', () => {
     ];
 
     for (const { field, input } of cases) {
-      const verification = seedVerification();
+      const verification = await seedVerification();
       const response = await request(app.getHttpServer())
         .post('/api/v1/auth/signup')
         .send(
@@ -398,26 +349,18 @@ describe('Sign up (e2e)', () => {
 
       expectError(error, 'VALIDATION_ERROR', 400);
       expect(error.fieldErrors?.[field]).toBeDefined();
-      expect(
-        database.connection
-          .prepare('SELECT COUNT(*) AS count FROM users')
-          .get(),
-      ).toEqual({ count: 0 });
-      expect(
-        database.connection
-          .prepare(
-            'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-          )
-          .get(verification.proofHash),
-      ).toEqual({ consumedAt: null });
+      expect(await userCount()).toBe(0);
+      expect(await storedProof(verification.proofHash)).toMatchObject({
+        consumedAt: null,
+      });
     }
   });
 
   it('rejects inactive and missing logistics companies', async () => {
-    const inactiveCompany = seedCompany({ active: false });
+    const inactiveCompany = await seedCompany({ active: false });
 
     for (const companyId of [inactiveCompany.id, randomUUID()]) {
-      const verification = seedVerification();
+      const verification = await seedVerification();
       const response = await request(app.getHttpServer())
         .post('/api/v1/auth/signup')
         .send(
@@ -432,20 +375,16 @@ describe('Sign up (e2e)', () => {
         'LOGISTICS_COMPANY_UNAVAILABLE',
         400,
       );
-      expect(
-        database.connection
-          .prepare(
-            'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-          )
-          .get(verification.proofHash),
-      ).toEqual({ consumedAt: null });
+      expect(await storedProof(verification.proofHash)).toMatchObject({
+        consumedAt: null,
+      });
     }
   });
 
   it('releases a proof after a correctable signup failure', async () => {
-    const inactiveCompany = seedCompany({ active: false });
-    const activeCompany = seedCompany();
-    const verification = seedVerification();
+    const inactiveCompany = await seedCompany({ active: false });
+    const activeCompany = await seedCompany();
+    const verification = await seedVerification();
     const input = signUpInput(inactiveCompany.id, {
       verificationProof: verification.proof,
     });
@@ -462,13 +401,17 @@ describe('Sign up (e2e)', () => {
   });
 
   it('rejects unavailable, expired, phone-mismatched, and already-used proofs', async () => {
-    const company = seedCompany();
-    const expired = seedVerification({ expiresAt: '2000-01-01 00:00:00' });
-    const phoneMismatched = seedVerification({ phone: '010-9999-9999' });
-    const consumed = seedVerification({ consumedAt: '2026-01-02 00:00:00' });
-    const wrongPurpose = seedVerification({ purpose: 'find_email' });
-    const unverified = seedVerification({ verifiedAt: null });
-    const invalidated = seedVerification({
+    const company = await seedCompany();
+    const expired = await seedVerification({
+      expiresAt: '2000-01-01 00:00:00',
+    });
+    const phoneMismatched = await seedVerification({ phone: '010-9999-9999' });
+    const consumed = await seedVerification({
+      consumedAt: '2026-01-02 00:00:00',
+    });
+    const wrongPurpose = await seedVerification({ purpose: 'find_email' });
+    const unverified = await seedVerification({ verifiedAt: null });
+    const invalidated = await seedVerification({
       invalidatedAt: '2026-01-02 00:00:00',
     });
     const proofs = [
@@ -492,23 +435,23 @@ describe('Sign up (e2e)', () => {
         'PHONE_VERIFICATION_INVALID',
         400,
       );
-      expect(
-        database.connection
-          .prepare('SELECT COUNT(*) AS count FROM users')
-          .get(),
-      ).toEqual({ count: 0 });
+      expect(await userCount()).toBe(0);
     }
   });
 
   it('returns conflicts for an existing email or phone', async () => {
-    const company = seedCompany();
-    seedDriver({
+    const company = await seedCompany();
+    await seedDriver({
       email: 'existing-email@example.com',
       logisticsCompanyId: company.id,
       phone: '010-9999-9999',
     });
-    const emailVerification = seedVerification({ phone: '010-1111-1111' });
-    const phoneVerification = seedVerification({ phone: '010-9999-9999' });
+    const emailVerification = await seedVerification({
+      phone: '010-1111-1111',
+    });
+    const phoneVerification = await seedVerification({
+      phone: '010-9999-9999',
+    });
     const emailConflict = await request(app.getHttpServer())
       .post('/api/v1/auth/signup')
       .send(
@@ -539,28 +482,18 @@ describe('Sign up (e2e)', () => {
       'PHONE_ALREADY_EXISTS',
       409,
     );
-    expect(
-      database.connection
-        .prepare(
-          'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-        )
-        .get(emailVerification.proofHash),
-    ).toEqual({ consumedAt: null });
-    expect(
-      database.connection
-        .prepare(
-          'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-        )
-        .get(phoneVerification.proofHash),
-    ).toEqual({ consumedAt: null });
-    expect(
-      database.connection.prepare('SELECT COUNT(*) AS count FROM users').get(),
-    ).toEqual({ count: 1 });
+    expect(await storedProof(emailVerification.proofHash)).toMatchObject({
+      consumedAt: null,
+    });
+    expect(await storedProof(phoneVerification.proofHash)).toMatchObject({
+      consumedAt: null,
+    });
+    expect(await userCount()).toBe(1);
   });
 
   it('allows only one concurrent signup to consume a proof', async () => {
-    const company = seedCompany();
-    const verification = seedVerification();
+    const company = await seedCompany();
+    const verification = await seedVerification();
     const input = signUpInput(company.id, {
       verificationProof: verification.proof,
     });
@@ -580,21 +513,15 @@ describe('Sign up (e2e)', () => {
       'PHONE_VERIFICATION_INVALID',
       400,
     );
-    expect(
-      database.connection.prepare('SELECT COUNT(*) AS count FROM users').get(),
-    ).toEqual({ count: 1 });
-    const storedProof = database.connection
-      .prepare(
-        'SELECT consumed_at AS consumedAt FROM phone_verifications WHERE proof_hash = ?',
-      )
-      .get(verification.proofHash) as { consumedAt: string | null };
+    expect(await userCount()).toBe(1);
+    const proof = await storedProof(verification.proofHash);
 
-    expect(typeof storedProof.consumedAt).toBe('string');
+    expect(typeof proof?.consumedAt).toBe('string');
   });
 
   it('makes a successful signup proof unusable for the next signup', async () => {
-    const company = seedCompany();
-    const verification = seedVerification();
+    const company = await seedCompany();
+    const verification = await seedVerification();
     const input = signUpInput(company.id, {
       verificationProof: verification.proof,
     });
@@ -614,9 +541,7 @@ describe('Sign up (e2e)', () => {
       'PHONE_VERIFICATION_INVALID',
       400,
     );
-    expect(
-      database.connection.prepare('SELECT COUNT(*) AS count FROM users').get(),
-    ).toEqual({ count: 1 });
+    expect(await userCount()).toBe(1);
   });
 
   it('documents public choices and signup without exposing password fields', async () => {

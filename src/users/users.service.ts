@@ -20,29 +20,30 @@ import { normalizeDateRange } from '../common/date-range-query';
 export class UsersService {
   constructor(private readonly users: UsersRepository) {}
 
-  findDrivers(query: AdminDriverListQueryDto): AdminDriverResponseDto[] {
-    return this.users
-      .findDrivers({
-        ...query,
-        ...normalizeDateRange(query),
-      })
-      .map((row) => {
-        if (row.phone === null)
-          throw new Error('Driver phone invariant violated');
-        return {
-          ...row,
-          phone: row.phone,
-          joinedAt: `${row.joinedAt.replace(' ', 'T')}Z`,
-        };
-      });
+  async findDrivers(
+    query: AdminDriverListQueryDto,
+  ): Promise<AdminDriverResponseDto[]> {
+    const rows = await this.users.findDrivers({
+      ...query,
+      ...normalizeDateRange(query),
+    });
+    return rows.map((row) => {
+      if (row.phone === null)
+        throw new Error('Driver phone invariant violated');
+      return {
+        ...row,
+        phone: row.phone,
+        joinedAt: isoTimestamp(row.joinedAt),
+      };
+    });
   }
 
-  findProfile(userId: string): DriverProfileResponseDto {
-    return this.requireProfile(this.users.findProfile(userId));
+  async findProfile(userId: string): Promise<DriverProfileResponseDto> {
+    return this.requireProfile(await this.users.findProfile(userId));
   }
 
-  withdrawDriver(userId: string): void {
-    if (!this.users.withdrawDriver(userId)) {
+  async withdrawDriver(userId: string): Promise<void> {
+    if (!(await this.users.withdrawDriver(userId))) {
       throw new NotFoundException({
         code: 'DRIVER_NOT_FOUND',
         message: '탈퇴 처리할 기사를 찾을 수 없습니다.',
@@ -50,21 +51,21 @@ export class UsersService {
     }
   }
 
-  updateProfile(
+  async updateProfile(
     userId: string,
     input: UpdateDriverProfileDto,
-  ): DriverProfileResponseDto {
+  ): Promise<DriverProfileResponseDto> {
     if (input.name === undefined && input.marketingConsent === undefined) {
       throw new BadRequestException({
         code: 'PROFILE_CHANGES_REQUIRED',
         message: '변경할 성함 또는 마케팅 수신 동의 여부를 입력해 주세요.',
       });
     }
-    return this.requireProfile(this.users.updateProfile(userId, input));
+    return this.requireProfile(await this.users.updateProfile(userId, input));
   }
 
   private requireProfile(
-    profile: ReturnType<UsersRepository['findProfile']>,
+    profile: Awaited<ReturnType<UsersRepository['findProfile']>>,
   ): DriverProfileResponseDto {
     if (!profile) {
       throw new UnauthorizedException({
@@ -78,4 +79,17 @@ export class UsersService {
       throw new Error('Driver phone invariant violated');
     return { ...profile, phone: profile.phone };
   }
+}
+
+function isoTimestamp(value: string): string {
+  const normalized = value.replace(' ', 'T');
+  const withZone = /[+-]\d{2}$/.test(normalized)
+    ? `${normalized}:00`
+    : /(?:Z|[+-]\d{2}(?::?\d{2})?)$/.test(normalized)
+      ? normalized
+      : `${normalized}Z`;
+  const timestamp = new Date(withZone);
+  if (!Number.isFinite(timestamp.getTime()))
+    throw new Error('Invalid driver timestamp');
+  return timestamp.toISOString();
 }

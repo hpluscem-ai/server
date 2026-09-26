@@ -42,7 +42,7 @@ export function evaluateReading(result: ReadingResult, truth: Case['truth']) {
   const candidate =
     result.clovaError === null &&
     result.lunaError === null &&
-    automaticApprovalAmounts(result.receipt, result.meter, at) !== null;
+    automaticApprovalAmounts(result.receipt, result.meter) !== null;
   const receiptExact =
     truth.receiptAmount !== null && receipt === truth.receiptAmount;
   const meterExact = truth.meterAmount !== null && meter === truth.meterAmount;
@@ -57,19 +57,11 @@ export function evaluateReading(result: ReadingResult, truth: Case['truth']) {
     truth.receiptAmount !== null &&
     truth.meterAmount !== null &&
     truth.liters !== null &&
-    Boolean(truth.transactionAt) &&
-    truth.documentKind != null &&
-    truth.documentKind !== 'unknown' &&
-    typeof truth.uncertain === 'boolean' &&
     typeof truth.autoApprove === 'boolean';
   const wrong =
     (truth.receiptAmount !== null && !receiptExact) ||
     (truth.meterAmount !== null && !meterExact) ||
     (truth.liters !== null && !litersExact) ||
-    (Boolean(truth.transactionAt) && !transactionExact) ||
-    (truth.documentKind != null &&
-      truth.documentKind !== 'unknown' &&
-      truth.documentKind !== 'sale') ||
     truth.uncertain === true ||
     truth.autoApprove === false;
   return {

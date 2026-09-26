@@ -31,27 +31,29 @@ describe('Admin authentication (e2e)', () => {
     database = app.get(DatabaseService);
     hash = await argon2.hash(password, { type: argon2.argon2id });
   });
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.replaceProperty(process, 'env', {
       ...process.env,
       ADMIN_SESSION_TTL_SECONDS: '600',
     });
-    database.db.delete(users).run();
-    database.db.delete(logisticsCompanies).run();
+    await database.db.delete(users);
+    await database.db.delete(logisticsCompanies);
     adminId = randomUUID();
-    database.db
-      .insert(users)
-      .values({
-        id: adminId,
-        role: 'admin',
-        email: 'admin@example.com',
-        name: '관리자',
-        passwordHash: hash,
-      })
-      .run();
+    await database.db.insert(users).values({
+      id: adminId,
+      role: 'admin',
+      email: 'admin@example.com',
+      name: '관리자',
+      passwordHash: hash,
+    });
   });
-  afterEach(() => {
-    database.connection.exec('DROP TRIGGER IF EXISTS fail_admin_session');
+  afterEach(async () => {
+    await database.connection.unsafe(
+      'DROP TRIGGER IF EXISTS fail_admin_session ON app.admin_sessions',
+    );
+    await database.connection.unsafe(
+      'DROP FUNCTION IF EXISTS app.fail_admin_session()',
+    );
     jest.restoreAllMocks();
   });
   afterAll(async () => {
@@ -73,10 +75,12 @@ describe('Admin authentication (e2e)', () => {
       .get(`${PATH}/me`)
       .set('Authorization', `Bearer ${value}`);
   }
-  function count() {
-    return database.connection
-      .prepare('SELECT COUNT(*) AS count FROM admin_sessions')
-      .get();
+  async function count() {
+    return {
+      count: (
+        await database.connection.unsafe('SELECT 1 FROM app.admin_sessions')
+      ).length,
+    };
   }
 
   it('issues a separately stored opaque session using the explicitly configured expiry', async () => {
@@ -89,13 +93,15 @@ describe('Admin authentication (e2e)', () => {
     expect(Date.parse(body.expiresAt)).toBeGreaterThanOrEqual(before + 600000);
     expect(Date.parse(body.expiresAt)).toBeLessThanOrEqual(Date.now() + 600000);
     expect(
-      database.connection
-        .prepare('SELECT token_hash FROM admin_sessions')
-        .get(),
+      (
+        await database.connection.unsafe(
+          'SELECT token_hash FROM app.admin_sessions',
+        )
+      )[0],
     ).toEqual({
       token_hash: createHash('sha256').update(body.token).digest('hex'),
     });
-    expect(database.db.select().from(authSessions).all()).toEqual([]);
+    expect(await database.db.select().from(authSessions)).toEqual([]);
     await me(body.token)
       .expect(200)
       .expect({ id: adminId, email: 'admin@example.com', name: '관리자' });
@@ -125,7 +131,7 @@ describe('Admin authentication (e2e)', () => {
       .expect(({ body }: { body: { code: string } }) =>
         expect(body.code).toBe('ADMIN_AUTH_NOT_CONFIGURED'),
       );
-    expect(count()).toEqual({ count: 0 });
+    expect(await count()).toEqual({ count: 0 });
   });
 
   it.each([
@@ -137,7 +143,7 @@ describe('Admin authentication (e2e)', () => {
       .expect(({ body }: { body: { code: string } }) =>
         expect(body.code).toBe('INVALID_CREDENTIALS'),
       );
-    expect(count()).toEqual({ count: 0 });
+    expect(await count()).toEqual({ count: 0 });
   });
 
   it('blocks every existing admin method without an admin session', async () => {
@@ -161,46 +167,37 @@ describe('Admin authentication (e2e)', () => {
 
   it('rejects driver credentials and tokens, including a driver token after role promotion', async () => {
     const companyId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1234-5678',
-        bankCode: '19',
-        accountNumber: '12345',
-        accountHolder: '물류사',
-      })
-      .run();
-    database.db
-      .update(users)
-      .set({
-        role: 'driver',
-        phone: '010-1234-5678',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '12345',
+      accountHolder: '물류사',
+    });
+    await database.db.update(users).set({
+      role: 'driver',
+      phone: '010-1234-5678',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     await login().expect(401);
     const driverToken = randomBytes(32).toString('base64url');
     const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(driverToken).digest('hex'),
-        userId: adminId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 60000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(driverToken).digest('hex'),
+      userId: adminId,
+      createdAt: now,
+      lastUsedAt: now,
+      expiresAt: new Date(now.getTime() + 60000),
+    });
     await me(driverToken).expect(401);
-    database.db.update(users).set({ role: 'admin' }).run();
+    await database.db.update(users).set({ role: 'admin' });
     await me(driverToken).expect(401);
   });
 
@@ -219,8 +216,8 @@ describe('Admin authentication (e2e)', () => {
   it('distinguishes storage failure from an invalid session', async () => {
     const value = await token();
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      'ALTER TABLE admin_sessions RENAME TO unavailable_admin_sessions',
+    await database.connection.unsafe(
+      'ALTER TABLE app.admin_sessions RENAME TO unavailable_admin_sessions',
     );
     try {
       await me(value)
@@ -229,8 +226,8 @@ describe('Admin authentication (e2e)', () => {
           expect(body.code).toBe('INTERNAL_SERVER_ERROR'),
         );
     } finally {
-      database.connection.exec(
-        'ALTER TABLE unavailable_admin_sessions RENAME TO admin_sessions',
+      await database.connection.unsafe(
+        'ALTER TABLE app.unavailable_admin_sessions RENAME TO admin_sessions',
       );
     }
     await me(value).expect(200);
@@ -244,44 +241,37 @@ describe('Admin authentication (e2e)', () => {
     { email: 'admin@example.com', password, role: 'admin' },
   ])('rejects invalid login inputs: %j', async (input) => {
     await login(input).expect(400);
-    expect(count()).toEqual({ count: 0 });
+    expect(await count()).toEqual({ count: 0 });
   });
 
   it('rejects login by an inactive admin and rejects an issued token after loss of admin role', async () => {
     const value = await token();
-    database.db
+    await database.db
       .update(users)
-      .set({ deactivatedAt: '2026-09-08 00:00:00' })
-      .run();
+      .set({ deactivatedAt: '2026-09-08 00:00:00' });
     await login().expect(401);
     // A role transition must satisfy the existing driver DB constraints too.
     const companyId = randomUUID();
-    database.db
-      .insert(logisticsCompanies)
-      .values({
-        id: companyId,
-        businessName: '물류사',
-        businessNumber: '123-45-67890',
-        corporateRegistrationNumber: '123456-1234567',
-        businessAddress: '서울시',
-        managerName: '담당자',
-        managerPhone: '010-1234-5678',
-        bankCode: '19',
-        accountNumber: '12345',
-        accountHolder: '물류사',
-      })
-      .run();
-    database.db
-      .update(users)
-      .set({
-        role: 'driver',
-        deactivatedAt: null,
-        phone: '010-1234-5678',
-        logisticsCompanyId: companyId,
-        serviceTermsConsent: true,
-        privacyTermsConsent: true,
-      })
-      .run();
+    await database.db.insert(logisticsCompanies).values({
+      id: companyId,
+      businessName: '물류사',
+      businessNumber: '123-45-67890',
+      corporateRegistrationNumber: '123456-1234567',
+      businessAddress: '서울시',
+      managerName: '담당자',
+      managerPhone: '010-1234-5678',
+      bankCode: '19',
+      accountNumber: '12345',
+      accountHolder: '물류사',
+    });
+    await database.db.update(users).set({
+      role: 'driver',
+      deactivatedAt: null,
+      phone: '010-1234-5678',
+      logisticsCompanyId: companyId,
+      serviceTermsConsent: true,
+      privacyTermsConsent: true,
+    });
     await me(value).expect(401);
   });
 
@@ -290,16 +280,19 @@ describe('Admin authentication (e2e)', () => {
     async (state) => {
       const value = await token();
       if (state === 'expired')
-        database.connection
-          .prepare('UPDATE admin_sessions SET created_at = ?, expires_at = ?')
-          .run(Date.now() - 1000, Date.now() - 1);
+        await database.connection.unsafe(
+          'UPDATE app.admin_sessions SET created_at = $1, expires_at = $2',
+          [
+            new Date(Date.now() - 1000).toISOString(),
+            new Date(Date.now() - 1).toISOString(),
+          ],
+        );
       if (state === 'deactivated')
-        database.db
+        await database.db
           .update(users)
-          .set({ deactivatedAt: '2026-09-08 00:00:00' })
-          .run();
+          .set({ deactivatedAt: '2026-09-08 00:00:00' });
       if (state === 'deleted')
-        database.db.delete(users).where(eq(users.id, adminId)).run();
+        await database.db.delete(users).where(eq(users.id, adminId));
       await me(value).expect(401);
     },
   );
@@ -310,14 +303,13 @@ describe('Admin authentication (e2e)', () => {
       .spyOn(jest.requireActual<typeof argon2>('argon2'), 'verify')
       .mockImplementationOnce(async (...args) => {
         const result = await verify(...args);
-        database.db
+        await database.db
           .update(users)
-          .set({ passwordHash: 'concurrently-changed' })
-          .run();
+          .set({ passwordHash: 'concurrently-changed' });
         return result;
       });
     await login().expect(401);
-    expect(count()).toEqual({ count: 0 });
+    expect(await count()).toEqual({ count: 0 });
   });
 
   it('propagates session insert and deletion failures without false success or secret logs', async () => {
@@ -325,19 +317,25 @@ describe('Admin authentication (e2e)', () => {
     const log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
-    database.connection.exec(
-      "CREATE TRIGGER fail_admin_session AFTER DELETE ON admin_sessions BEGIN SELECT RAISE(FAIL, 'secret'); END;",
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_admin_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'secret'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_admin_session AFTER DELETE ON app.admin_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_admin_session()',
     );
     await request(app.getHttpServer())
       .post(`${PATH}/logout`)
       .set('Authorization', `Bearer ${value}`)
       .expect(500);
-    expect(count()).toEqual({ count: 1 });
-    database.connection.exec(
-      "DROP TRIGGER fail_admin_session; CREATE TRIGGER fail_admin_session AFTER INSERT ON admin_sessions BEGIN SELECT RAISE(FAIL, 'secret'); END;",
+    expect(await count()).toEqual({ count: 1 });
+    await database.connection.unsafe(
+      'DROP TRIGGER fail_admin_session ON app.admin_sessions',
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_admin_session AFTER INSERT ON app.admin_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_admin_session()',
     );
     await login().expect(500);
-    expect(count()).toEqual({ count: 1 });
+    expect(await count()).toEqual({ count: 1 });
     expect(JSON.stringify(log.mock.calls)).not.toContain(value);
     expect(JSON.stringify(log.mock.calls)).not.toContain(hash);
   });
@@ -406,15 +404,15 @@ describe('Admin authentication (e2e)', () => {
     expect(cookie).not.toContain('hpluseco_driver_session');
     expect(cookie).not.toContain('Domain=');
     expect(cookie).not.toContain('Secure');
-    const stored = database.connection
-      .prepare('SELECT * FROM admin_sessions')
-      .all();
+    const stored = await database.connection.unsafe(
+      'SELECT * FROM app.admin_sessions',
+    );
     await browser
       .get(`${PATH}/me`)
       .expect(200)
       .expect({ id: adminId, email: 'admin@example.com', name: '관리자' });
     expect(
-      database.connection.prepare('SELECT * FROM admin_sessions').all(),
+      await database.connection.unsafe('SELECT * FROM app.admin_sessions'),
     ).toEqual(stored);
     await browser.get('/api/v1/admin/drivers').expect(200);
     await browser.get('/api/v1/admin/stations').expect(200);
@@ -461,7 +459,7 @@ describe('Admin authentication (e2e)', () => {
         expect(result.headers['set-cookie']).toBeUndefined();
       }
       await me(value).expect(200);
-      expect(count()).toEqual({ count: 1 });
+      expect(await count()).toEqual({ count: 1 });
     },
   );
 
@@ -510,23 +508,24 @@ describe('Admin authentication (e2e)', () => {
       expect(result.headers['set-cookie']).toBeUndefined();
     }
     const driverToken = randomBytes(32).toString('base64url');
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(driverToken).digest('hex'),
-        userId: adminId,
-        createdAt: new Date(),
-        lastUsedAt: new Date(),
-        expiresAt: new Date(Date.now() + 60000),
-      })
-      .run();
+    await database.db.insert(authSessions).values({
+      tokenHash: createHash('sha256').update(driverToken).digest('hex'),
+      userId: adminId,
+      createdAt: new Date(),
+      lastUsedAt: new Date(),
+      expiresAt: new Date(Date.now() + 60000),
+    });
     await request(app.getHttpServer())
       .get(`${PATH}/me`)
       .set('Cookie', `${COOKIE}=${driverToken}`)
       .expect(401);
-    database.connection
-      .prepare('UPDATE admin_sessions SET created_at = ?, expires_at = ?')
-      .run(Date.now() - 1000, Date.now() - 1);
+    await database.connection.unsafe(
+      'UPDATE app.admin_sessions SET created_at = $1, expires_at = $2',
+      [
+        new Date(Date.now() - 1000).toISOString(),
+        new Date(Date.now() - 1).toISOString(),
+      ],
+    );
     const newer = await token();
     const expired = await request(app.getHttpServer())
       .get(`${PATH}/me`)
@@ -540,8 +539,8 @@ describe('Admin authentication (e2e)', () => {
     const value = await token();
     const cookie = `${COOKIE}=${value}`;
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    database.connection.exec(
-      'ALTER TABLE admin_sessions RENAME TO unavailable_admin_sessions',
+    await database.connection.unsafe(
+      'ALTER TABLE app.admin_sessions RENAME TO unavailable_admin_sessions',
     );
     try {
       const result = await request(app.getHttpServer())
@@ -550,12 +549,15 @@ describe('Admin authentication (e2e)', () => {
         .expect(500);
       expect(result.headers['set-cookie']).toBeUndefined();
     } finally {
-      database.connection.exec(
-        'ALTER TABLE unavailable_admin_sessions RENAME TO admin_sessions',
+      await database.connection.unsafe(
+        'ALTER TABLE app.unavailable_admin_sessions RENAME TO admin_sessions',
       );
     }
-    database.connection.exec(
-      "CREATE TRIGGER fail_admin_session AFTER DELETE ON admin_sessions BEGIN SELECT RAISE(FAIL, 'forced failure'); END;",
+    await database.connection.unsafe(
+      "CREATE OR REPLACE FUNCTION app.fail_admin_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced failure'; END; $$",
+    );
+    await database.connection.unsafe(
+      'CREATE TRIGGER fail_admin_session AFTER DELETE ON app.admin_sessions FOR EACH ROW EXECUTE FUNCTION app.fail_admin_session()',
     );
     const result = await request(app.getHttpServer())
       .post(`${PATH}/logout`)
