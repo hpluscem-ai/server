@@ -1,10 +1,13 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  IsInt,
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateIf,
 } from 'class-validator';
 
@@ -38,6 +41,33 @@ export class RejectAdminMileageDto {
   @IsString()
   @Matches(/^[a-f0-9]{64}$/)
   reviewVersion!: string;
+}
+
+export class ApproveAdminMileageDto {
+  @ApiProperty({ description: '관리자가 사진을 확인한 신청의 reviewVersion' })
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  reviewVersion!: string;
+
+  @ApiProperty({
+    description: '관리자가 확인한 확정 금액(원)',
+    minimum: 0,
+    maximum: Number.MAX_SAFE_INTEGER,
+  })
+  @IsInt()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
+  finalAmount!: number;
+
+  @ApiProperty({
+    description:
+      '계기판에서 확인한 주유량(L). 정수 5자리·소수점 3자리 이내의 십진 문자열',
+    example: '5.125',
+    pattern: '^\\d{1,5}(?:\\.\\d{1,3})?$',
+  })
+  @IsString()
+  @Matches(/^\d{1,5}(?:\.\d{1,3})?$/)
+  liters!: string;
 }
 
 export class AdminMileagePhotoPathsDto {

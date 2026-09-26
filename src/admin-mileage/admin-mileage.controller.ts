@@ -37,6 +37,7 @@ import { ApiErrorResponseDto } from '../common/api-error-response.dto';
 import {
   AdminMileageQueryDto,
   AdminMileageResponseDto,
+  ApproveAdminMileageDto,
   RejectAdminMileageDto,
 } from './admin-mileage.dto';
 import { AdminMileageService } from './admin-mileage.service';
@@ -88,6 +89,34 @@ export class AdminMileageController {
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
   ): AdminMileageResponseDto {
     return this.mileage.detail(id);
+  }
+
+  @Post(':id/approve')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: '대기 신청 수동 승인',
+    description:
+      '관리자가 두 사진을 확인한 확정 금액과 계기판 주유량(L), reviewVersion을 제출합니다. 서버가 리터×20을 정확한 십진 연산으로 반올림하여 승인·확정 금액·마일리지·결정 시각을 원자적으로 저장합니다. OCR 원본 판독값은 보존하며 클라이언트 마일리지는 받지 않습니다. 같은 버전·확정 금액·계산 마일리지 재전송은 기존 결과와 결정 시각을 유지합니다. 사진/판독값 변경·다른 결정·정산 편입은 409입니다.',
+  })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOkResponse({ type: AdminMileageResponseDto })
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'MILEAGE_REVIEW_CONFLICT',
+  })
+  @ApiNotFoundResponse({
+    type: ApiErrorResponseDto,
+    description: 'MILEAGE_APPLICATION_NOT_FOUND',
+  })
+  approve(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @Body() body: ApproveAdminMileageDto,
+  ): AdminMileageResponseDto {
+    return this.mileage.approve(id, body);
   }
 
   @Post(':id/reject')

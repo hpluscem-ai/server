@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   InternalServerErrorException,
@@ -20,10 +21,15 @@ import {
   mileageResubmissions as resubmissions,
   users,
 } from '../database/schema';
-import { PhotoStorageService, OCR_VERSION } from '../mileage';
+import {
+  PhotoStorageService,
+  OCR_VERSION,
+  mileageFromLiters,
+} from '../mileage';
 import {
   AdminMileageQueryDto,
   AdminMileageResponseDto,
+  ApproveAdminMileageDto,
   RejectAdminMileageDto,
 } from './admin-mileage.dto';
 
@@ -51,6 +57,37 @@ export class AdminMileageService {
   }
 
   reject(id: string, input: RejectAdminMileageDto): AdminMileageResponseDto {
+    return this.review(id, input, {
+      approvalStatus: 'rejected',
+      finalAmount: null,
+      mileageAmount: null,
+    });
+  }
+
+  approve(id: string, input: ApproveAdminMileageDto): AdminMileageResponseDto {
+    const mileageAmount = mileageFromLiters(`${input.liters} L`);
+    if (mileageAmount === null) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: '주유량을 확인해 주세요.',
+      });
+    }
+    return this.review(id, input, {
+      approvalStatus: 'approved',
+      finalAmount: input.finalAmount,
+      mileageAmount,
+    });
+  }
+
+  private review(
+    id: string,
+    input: Pick<RejectAdminMileageDto, 'reviewVersion'>,
+    decision: {
+      approvalStatus: 'approved' | 'rejected';
+      finalAmount: number | null;
+      mileageAmount: number | null;
+    },
+  ): AdminMileageResponseDto {
     return this.database.db.transaction(
       (tx) => {
         const current = this.detail(id);
@@ -61,16 +98,24 @@ export class AdminMileageService {
           throw this.conflict();
         }
         // A lost response can be retried without rewriting the decision or its timestamp.
-        if (current.status === 'rejected') return current;
+        if (
+          current.status === decision.approvalStatus &&
+          current.finalAmount === decision.finalAmount &&
+          current.mileageAmount === decision.mileageAmount
+        )
+          return current;
         if (current.status !== 'pending') throw this.conflict();
+        if (
+          decision.approvalStatus === 'approved' &&
+          (!current.photos.receipt || !current.photos.meter)
+        )
+          throw this.conflict();
         const now = new Date().toISOString();
         const changed = tx
           .update(applications)
           .set({
-            approvalStatus: 'rejected',
+            ...decision,
             rejectionReason: null,
-            finalAmount: null,
-            mileageAmount: null,
             decidedAt: now,
             updatedAt: now,
           })

@@ -27,10 +27,11 @@ import {
   OCR_VERSION,
 } from '../src/mileage';
 import { seedAdminSession } from './helpers/seed-admin-session';
+import { SettlementsService } from '../src/settlements';
 
 const URL = '/api/v1/admin/mileage/applications';
 
-describe('Admin mileage reads and rejection (e2e)', () => {
+describe('Admin mileage reads and review (e2e)', () => {
   let app: INestApplication<App>;
   let database: DatabaseService;
   let authorization: string;
@@ -407,6 +408,168 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       .set('Authorization', auth)
       .send(input);
   }
+  function approve(input: object, auth = authorization) {
+    return request(app.getHttpServer())
+      .post(`${URL}/${applicationId}/approve`)
+      .set('Authorization', auth)
+      .send(input);
+  }
+
+  it.each([
+    ['5.124', 102],
+    ['5.125', 103],
+    ['11', 220],
+    ['0', 0],
+  ])(
+    'approves admin-confirmed values using exact rounding for %s L',
+    async (liters, mileageAmount) => {
+      database.db
+        .update(mileageApplications)
+        .set({
+          receiptAmount: 10000,
+          meterAmount: 8000,
+          matchStatus: 'mismatched',
+        })
+        .where(eq(mileageApplications.id, applicationId))
+        .run();
+      const before = await snapshot();
+      const result = await approve({
+        reviewVersion: before.reviewVersion,
+        finalAmount: 10000,
+        liters,
+      }).expect(200);
+      expect(result.body).toMatchObject({
+        status: 'approved',
+        finalAmount: 10000,
+        mileageAmount,
+        receiptAmount: 10000,
+        meterAmount: 8000,
+        matchStatus: 'mismatched',
+        rejectionReason: null,
+        reviewVersion: before.reviewVersion,
+      });
+      expect((result.body as AdminMileageResponseDto).decidedAt).not.toBeNull();
+      expect(await snapshot()).toEqual(result.body);
+      expect(app.get(SettlementsService).balance(userId)).toEqual({
+        accumulatedMileage: mileageAmount,
+      });
+    },
+  );
+
+  it('validates manual approval inputs and refuses client-supplied mileage', async () => {
+    const reviewVersion = (await snapshot()).reviewVersion;
+    const valid = { reviewVersion, finalAmount: 10000, liters: '5.125' };
+    for (const input of [
+      {},
+      { reviewVersion },
+      ...[-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '10000', null].map(
+        (finalAmount) => ({ ...valid, finalAmount }),
+      ),
+      ...['', '-1', '1e2', '5 L', '1.2345', '100000', 5, null].map(
+        (liters) => ({ ...valid, liters }),
+      ),
+      { ...valid, reviewVersion: 'wrong' },
+      { ...valid, mileageAmount: 999 },
+    ])
+      await approve(input).expect(400);
+    expect((await snapshot()).status).toBe('pending');
+    await approve({ ...valid, finalAmount: 0, liters: '0' }).expect(200);
+  });
+
+  it('preserves repeated approval and rejects different decisions or late OCR overwrites', async () => {
+    const job = ocrJob();
+    const reviewVersion = (await snapshot()).reviewVersion;
+    const body = { reviewVersion, finalAmount: 10000, liters: '5.125' };
+    const responses = await Promise.all(
+      [authorization, seedAdminSession(database)].map((auth) =>
+        approve(body, auth),
+      ),
+    );
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(responses[0].body).toEqual(responses[1].body);
+    app.get(MileageRepository).finishOcrJob(job, reading);
+    await approve(body).expect(200).expect(responses[0].body);
+    await approve({ ...body, finalAmount: 20000 }).expect(409);
+    await approve({ ...body, liters: '10' }).expect(409);
+    await reject({ reviewVersion }).expect(409);
+    expect(await snapshot()).toEqual(responses[0].body);
+  });
+
+  it('blocks stale, rejected, missing-photo and settlement-attached approval', async () => {
+    const old = await snapshot();
+    database.db
+      .update(mileagePhotos)
+      .set({ storageKey: 'private/replaced.jpg' })
+      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'))
+      .run();
+    await approve({
+      reviewVersion: old.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    }).expect(409);
+    let current = await snapshot();
+    await reject({ reviewVersion: current.reviewVersion }).expect(200);
+    await approve({
+      reviewVersion: current.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    }).expect(409);
+    database.db
+      .update(mileageApplications)
+      .set({ approvalStatus: 'pending', decidedAt: null })
+      .where(eq(mileageApplications.id, applicationId))
+      .run();
+    current = await snapshot();
+    await approve({
+      reviewVersion: current.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    }).expect(200);
+    const settlementId = randomUUID();
+    database.db
+      .insert(settlements)
+      .values({
+        id: settlementId,
+        logisticsCompanyId: companyId,
+        settlementMonth: '2026-09',
+        transferStatus: 'pending',
+      })
+      .run();
+    database.db
+      .update(mileageApplications)
+      .set({ settlementId })
+      .where(eq(mileageApplications.id, applicationId))
+      .run();
+    current = await snapshot();
+    await approve({
+      reviewVersion: current.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    }).expect(409);
+    expect(await snapshot()).toEqual(current);
+    database.db
+      .update(mileageApplications)
+      .set({
+        settlementId: null,
+        approvalStatus: 'pending',
+        finalAmount: null,
+        mileageAmount: null,
+        decidedAt: null,
+      })
+      .where(eq(mileageApplications.id, applicationId))
+      .run();
+    database.db
+      .delete(mileagePhotos)
+      .where(eq(mileagePhotos.kind, 'meter'))
+      .run();
+    current = await snapshot();
+    await approve({
+      reviewVersion: current.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    }).expect(409);
+    expect(await snapshot()).toEqual(current);
+  });
 
   function ocrJob() {
     const repository = app.get(MileageRepository);
@@ -526,56 +689,66 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     expect(await snapshot()).toEqual(before);
   });
 
-  it('requires administrator authentication and exact Origin for cookie rejection', async () => {
-    const { reviewVersion } = await snapshot();
-    const body = { reviewVersion };
-    const token = randomBytes(32).toString('base64url');
-    const now = new Date();
-    database.db
-      .insert(authSessions)
-      .values({
-        tokenHash: createHash('sha256').update(token).digest('hex'),
-        userId,
-        createdAt: now,
-        lastUsedAt: now,
-        expiresAt: new Date(now.getTime() + 600000),
-      })
-      .run();
-    await request(app.getHttpServer())
-      .post(`${URL}/${applicationId}/reject`)
-      .send(body)
-      .expect(401);
-    await reject(body, `Bearer ${token}`).expect(401);
-    const previousOrigins = process.env.WEB_ORIGINS;
-    process.env.WEB_ORIGINS = 'http://localhost:5173';
-    try {
-      for (const origin of [
-        null,
-        'https://evil.example',
-        'http://localhost:5173.evil.example',
-      ]) {
-        const req = request(app.getHttpServer())
-          .post(`${URL}/${applicationId}/reject`)
+  it.each(['approve', 'reject'])(
+    'requires administrator authentication and exact Origin for cookie %s',
+    async (action) => {
+      const { reviewVersion } = await snapshot();
+      const body =
+        action === 'approve'
+          ? { reviewVersion, finalAmount: 10000, liters: '5' }
+          : { reviewVersion };
+      const send = action === 'approve' ? approve : reject;
+      const token = randomBytes(32).toString('base64url');
+      const now = new Date();
+      database.db
+        .insert(authSessions)
+        .values({
+          tokenHash: createHash('sha256').update(token).digest('hex'),
+          userId,
+          createdAt: now,
+          lastUsedAt: now,
+          expiresAt: new Date(now.getTime() + 600000),
+        })
+        .run();
+      await request(app.getHttpServer())
+        .post(`${URL}/${applicationId}/${action}`)
+        .send(body)
+        .expect(401);
+      await send(body, `Bearer ${token}`).expect(401);
+      const previousOrigins = process.env.WEB_ORIGINS;
+      process.env.WEB_ORIGINS = 'http://localhost:5173';
+      try {
+        for (const origin of [
+          null,
+          'https://evil.example',
+          'http://localhost:5173.evil.example',
+        ]) {
+          const req = request(app.getHttpServer())
+            .post(`${URL}/${applicationId}/${action}`)
+            .set(
+              'Cookie',
+              `${ADMIN_WEB_SESSION_COOKIE}=${authorization.slice(7)}`,
+            )
+            .send(body);
+          if (origin) req.set('Origin', origin);
+          await req.expect(403);
+        }
+        expect((await snapshot()).status).toBe('pending');
+        await request(app.getHttpServer())
+          .post(`${URL}/${applicationId}/${action}`)
           .set(
             'Cookie',
             `${ADMIN_WEB_SESSION_COOKIE}=${authorization.slice(7)}`,
           )
-          .send(body);
-        if (origin) req.set('Origin', origin);
-        await req.expect(403);
+          .set('Origin', 'http://localhost:5173')
+          .send(body)
+          .expect(200);
+      } finally {
+        if (previousOrigins === undefined) delete process.env.WEB_ORIGINS;
+        else process.env.WEB_ORIGINS = previousOrigins;
       }
-      expect((await snapshot()).status).toBe('pending');
-      await request(app.getHttpServer())
-        .post(`${URL}/${applicationId}/reject`)
-        .set('Cookie', `${ADMIN_WEB_SESSION_COOKIE}=${authorization.slice(7)}`)
-        .set('Origin', 'http://localhost:5173')
-        .send(body)
-        .expect(200);
-    } finally {
-      if (previousOrigins === undefined) delete process.env.WEB_ORIGINS;
-      else process.env.WEB_ORIGINS = previousOrigins;
-    }
-  });
+    },
+  );
 
   it('serializes identical reasonless rejections and preserves the first decision', async () => {
     const { reviewVersion } = await snapshot();
@@ -695,18 +868,27 @@ describe('Admin mileage reads and rejection (e2e)', () => {
     }
   });
 
-  it('rolls back database failures instead of reporting rejection success', async () => {
-    const before = await snapshot();
-    database.connection.exec(
-      "CREATE TRIGGER reject_failure BEFORE UPDATE ON mileage_applications BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
-    );
-    await reject({
-      reviewVersion: before.reviewVersion,
-    }).expect(500);
-    expect(await snapshot()).toEqual(before);
-  });
+  it.each(['approve', 'reject'])(
+    'rolls back database failures instead of reporting %s success',
+    async (action) => {
+      const before = await snapshot();
+      database.connection.exec(
+        "CREATE TRIGGER reject_failure BEFORE UPDATE ON mileage_applications BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+      );
+      const body =
+        action === 'approve'
+          ? {
+              reviewVersion: before.reviewVersion,
+              finalAmount: 10000,
+              liters: '5',
+            }
+          : { reviewVersion: before.reviewVersion };
+      await (action === 'approve' ? approve(body) : reject(body)).expect(500);
+      expect(await snapshot()).toEqual(before);
+    },
+  );
 
-  it('publishes read and rejection contracts without promising approval', async () => {
+  it('publishes read and both review contracts', async () => {
     const swagger = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -719,6 +901,9 @@ describe('Admin mileage reads and rejection (e2e)', () => {
       ),
     ).toContain('image/jpeg');
     expect(document.paths[URL + '/{id}/reject']?.post).toBeDefined();
-    expect(document.paths[URL + '/{id}/approve']?.post).toBeUndefined();
+    expect(document.paths[URL + '/{id}/approve']?.post).toBeDefined();
+    expect(document.components?.schemas?.ApproveAdminMileageDto).toMatchObject({
+      required: ['reviewVersion', 'finalAmount', 'liters'],
+    });
   });
 });
