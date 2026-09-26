@@ -58,8 +58,8 @@ export class MileageUploadInterceptor implements NestInterceptor {
     const limits = {
       fileSize: MAX_PHOTO_BYTES,
       files: 2,
-      fields: 2,
-      parts: 4,
+      fields: 3,
+      parts: 5,
       fieldNameSize: 64,
       fieldSize: 128,
       fieldArrayIndexLimit: 0,

@@ -72,16 +72,32 @@ export class MileageController {
   @UseInterceptors(MileageUploadInterceptor)
   @ApiConsumes('multipart/form-data')
   @ApiOperation({
-    summary: '사진 두 장과 마일리지 신청 접수',
+    summary: '사진 1장 또는 2장으로 마일리지 신청 접수',
     description:
-      '영수증·계기판 각 50MiB 이하, 원본 최대 60,000,000픽셀. JPEG/PNG/HEIC/HEIF를 실제 디코딩하고 방향 보정·sRGB JPEG 품질 90·긴 변 4096px 이하로 정규화합니다. 원본·정규화본은 비공개 보관합니다. 두 사진과 신청 DB 저장이 모두 성공하면 pending입니다. OCR·자동 승인·금액 계산은 하지 않습니다. 같은 사용자/UUID/원본 바이트는 기존 신청을 반환하며 다른 바이트는 409입니다. 키는 신청 기록과 함께 유지합니다. 동시 처리 제한·일시 장애에는 같은 키와 원본으로 재시도합니다.',
+      '영수증·계기판 각 50MiB 이하, 원본 최대 60,000,000픽셀. JPEG/PNG/HEIC/HEIF를 실제 디코딩하고 방향 보정·sRGB JPEG 품질 90·긴 변 4096px 이하로 정규화합니다. 원본·정규화본은 비공개 보관합니다. photoMode=single은 receipt에 영수증·계기판이 함께 찍힌 1장, separate(생략 기본값)는 receipt와 meter 각 1장입니다. 저장 성공 시 pending이며 설정 시 GPT-6 Luna 판독을 비동기로 요청합니다. 같은 사용자/UUID/원본 바이트는 기존 신청을 반환하며 다른 바이트는 409입니다. 키는 신청 기록과 함께 유지합니다. 동시 처리 제한·일시 장애에는 같은 키와 원본으로 재시도합니다.',
   })
   @ApiBody({
     schema: {
       type: 'object',
       additionalProperties: false,
-      required: ['idempotencyKey', 'receipt', 'meter'],
+      required: ['idempotencyKey', 'receipt'],
+      anyOf: [
+        {
+          required: ['photoMode'],
+          properties: { photoMode: { enum: ['single'] } },
+          not: { required: ['meter'] },
+        },
+        {
+          required: ['meter'],
+          properties: { photoMode: { enum: ['separate'] } },
+        },
+      ],
       properties: {
+        photoMode: {
+          type: 'string',
+          enum: ['single', 'separate'],
+          default: 'separate',
+        },
         idempotencyKey: { type: 'string', format: 'uuid' },
         receipt: { type: 'string', format: 'binary' },
         meter: { type: 'string', format: 'binary' },
@@ -137,7 +153,7 @@ export class MileageController {
   @ApiOperation({
     summary: '본인 반려 신청 재등록',
     description:
-      '본인 소유·반려·정산 미편입·현재 submissionVersion을 확인합니다. 선택한 사진 한 장 또는 두 장만 교체하고 같은 신청 ID와 최초 신청일을 유지합니다. 동일 파일 재선택도 허용합니다. 심사/OCR 파생값 초기화와 설정된 OCR 작업 등록은 원자적입니다. 원신청 키는 유지하며 재등록 키는 별도 보관합니다. 같은 키/버전/원본 바이트 재전송은 추가 처리 없이 최신 상세를 반환합니다. 과거 요청 재전송은 최신 상태를 되돌리지 않습니다. 새 선택에는 새 키를 사용합니다.',
+      '본인 소유·반려·정산 미편입·현재 submissionVersion을 확인합니다. single은 receipt 한 장으로 교체합니다. separate에서 single로 전환할 때도 새 receipt가 필요하며 single에서 separate로 전환할 때는 두 장을 새로 제출합니다. separate를 유지하면 선택한 사진만 교체하고 같은 신청 ID와 최초 신청일을 유지합니다. 동일 파일 재선택도 허용합니다. 심사/OCR 파생값 초기화와 설정된 OCR 작업 등록은 원자적입니다. 원신청 키는 유지하며 재등록 키는 별도 보관합니다. 같은 키/버전/원본 바이트 재전송은 추가 처리 없이 최신 상세를 반환합니다. 과거 요청 재전송은 최신 상태를 되돌리지 않습니다. 새 선택에는 새 키를 사용합니다.',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiBody({
@@ -147,6 +163,11 @@ export class MileageController {
       required: ['idempotencyKey', 'submissionVersion'],
       anyOf: [{ required: ['receipt'] }, { required: ['meter'] }],
       properties: {
+        photoMode: {
+          type: 'string',
+          enum: ['single', 'separate'],
+          default: 'separate',
+        },
         idempotencyKey: { type: 'string', format: 'uuid' },
         submissionVersion: { type: 'string', pattern: '^[0-9a-f]{64}$' },
         receipt: { type: 'string', format: 'binary' },

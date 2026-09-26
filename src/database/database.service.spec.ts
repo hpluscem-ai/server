@@ -48,7 +48,7 @@ describe('DatabaseService', () => {
 
     expect(
       databaseService.connection.prepare('PRAGMA user_version').get(),
-    ).toEqual({ user_version: 10 });
+    ).toEqual({ user_version: 11 });
 
     expect(() => {
       databaseService.connection
@@ -72,12 +72,15 @@ describe('DatabaseService', () => {
       created.onModuleDestroy();
       const old = new DatabaseSync(path);
       old.exec(
+        `DROP TRIGGER mileage_applications_approved_photos_update; DROP TRIGGER mileage_applications_approved_mode_update; ALTER TABLE mileage_applications DROP COLUMN photo_mode; CREATE TRIGGER mileage_applications_approved_photos_update BEFORE UPDATE OF approval_status ON mileage_applications WHEN NEW.approval_status = 'approved' AND (NOT EXISTS (SELECT 1 FROM mileage_application_photos WHERE mileage_application_id = NEW.id AND kind = 'receipt') OR NOT EXISTS (SELECT 1 FROM mileage_application_photos WHERE mileage_application_id = NEW.id AND kind = 'meter')) BEGIN SELECT RAISE(ABORT, 'approved mileage application requires both photos'); END;`,
+      );
+      old.exec(
         'DROP TABLE mileage_resubmissions; DROP TABLE mileage_ocr_jobs; PRAGMA user_version = 8;',
       );
       old.close();
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 10,
+        user_version: 11,
       });
       expect(
         upgraded.connection
@@ -113,6 +116,9 @@ describe('DatabaseService', () => {
         const created = new DatabaseService();
         created.onModuleDestroy();
         old = new DatabaseSync(path);
+        old.exec(
+          `DROP TRIGGER mileage_applications_approved_photos_update; DROP TRIGGER mileage_applications_approved_mode_update; ALTER TABLE mileage_applications DROP COLUMN photo_mode; DROP INDEX mileage_ocr_jobs_luna_retry_reservation_idx; ALTER TABLE mileage_ocr_jobs DROP COLUMN luna_retry_reserved_at; CREATE TRIGGER mileage_applications_approved_photos_update BEFORE UPDATE OF approval_status ON mileage_applications WHEN NEW.approval_status = 'approved' AND (NOT EXISTS (SELECT 1 FROM mileage_application_photos WHERE mileage_application_id = NEW.id AND kind = 'receipt') OR NOT EXISTS (SELECT 1 FROM mileage_application_photos WHERE mileage_application_id = NEW.id AND kind = 'meter')) BEGIN SELECT RAISE(ABORT, 'approved mileage application requires both photos'); END;`,
+        );
         old.exec(`DROP TABLE mileage_resubmissions; DROP TABLE mileage_upload_attempts;
         CREATE TABLE mileage_upload_attempts (
           id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
@@ -167,7 +173,7 @@ describe('DatabaseService', () => {
             [],
           );
           expect(connection.prepare('PRAGMA user_version').get()).toEqual({
-            user_version: 10,
+            user_version: 11,
           });
         }
       } finally {
@@ -228,7 +234,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 10 });
+          ).toEqual({ user_version: 11 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(original);
@@ -472,7 +478,7 @@ describe('DatabaseService', () => {
           WHERE id = ?`,
         )
         .run('application-1');
-    }).toThrow('approved mileage application requires both photos');
+    }).toThrow('approved mileage application requires selected photos');
 
     const insertPhoto = connection.prepare(
       `INSERT INTO mileage_application_photos (
@@ -599,7 +605,7 @@ describe('DatabaseService', () => {
 
       const originalSchema = connection
         .prepare(
-          "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
+          "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites') AND name NOT IN ('mileage_applications_approved_photos_update', 'mileage_applications_approved_mode_update') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
         )
         .all();
       const tables = [
@@ -616,7 +622,7 @@ describe('DatabaseService', () => {
             table === 'phone_verifications'
               ? { ...row, scope_user_id: null }
               : table === 'mileage_applications'
-                ? { ...row, request_hash: null }
+                ? { ...row, request_hash: null, photo_mode: 'separate' }
                 : row,
           ),
       );
@@ -626,12 +632,12 @@ describe('DatabaseService', () => {
 
       upgraded = new DatabaseService();
       expect(upgraded.connection.prepare('PRAGMA user_version').get()).toEqual({
-        user_version: 10,
+        user_version: 11,
       });
       expect(
         upgraded.connection
           .prepare(
-            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions', 'settlement_snapshots', 'settlement_completions', 'mileage_ocr_jobs', 'mileage_resubmissions') AND name NOT GLOB 'settlement_capture_*' AND name <> 'mileage_approved_decided_idx' AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema WHERE tbl_name NOT IN ('users', 'installation_sites', 'auth_sessions', 'admin_sessions', 'settlement_snapshots', 'settlement_completions', 'mileage_ocr_jobs', 'mileage_resubmissions') AND name NOT GLOB 'settlement_capture_*' AND name <> 'mileage_approved_decided_idx' AND name NOT IN ('mileage_applications_approved_photos_update', 'mileage_applications_approved_mode_update') AND NOT (type = 'table' AND name IN ('phone_verifications', 'mileage_applications', 'mileage_application_photos')) AND tbl_name <> 'mileage_upload_attempts' AND name <> 'mileage_photos_original_key_idx' ORDER BY name",
           )
           .all(),
       ).toEqual(originalSchema);
@@ -765,7 +771,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 10 });
+          ).toEqual({ user_version: 11 });
         }
         const checked = upgraded?.connection ?? connection!;
         expect(checked.prepare('SELECT * FROM users').all()).toEqual(
@@ -795,13 +801,13 @@ describe('DatabaseService', () => {
       'unversioned.sqlite',
     );
 
-    newerDatabase.exec('PRAGMA user_version = 11;');
+    newerDatabase.exec('PRAGMA user_version = 12;');
     newerDatabase.close();
     process.env.DATABASE_PATH = databasePath;
 
     try {
       expect(() => new DatabaseService()).toThrow(
-        'Database schema version 11 is newer than supported version 10',
+        'Database schema version 12 is newer than supported version 11',
       );
 
       const unversionedDatabase = new DatabaseSync(unversionedDatabasePath);
@@ -885,7 +891,7 @@ describe('DatabaseService', () => {
               fail
                 ? row
                 : table === 'mileage_applications'
-                  ? { ...row, request_hash: null }
+                  ? { ...row, request_hash: null, photo_mode: 'separate' }
                   : table === 'mileage_application_photos'
                     ? {
                         ...row,
@@ -911,7 +917,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 10 });
+          ).toEqual({ user_version: 11 });
           expect(
             upgraded.connection.prepare('PRAGMA foreign_keys').get(),
           ).toEqual({ foreign_keys: 1 });
@@ -987,7 +993,7 @@ describe('DatabaseService', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 10 });
+          ).toEqual({ user_version: 11 });
           expect(() =>
             upgraded!.connection.exec(
               "UPDATE phone_verifications SET scope_user_id = 'missing-user'",

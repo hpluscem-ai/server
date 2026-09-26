@@ -62,7 +62,7 @@ describe('settlement snapshot migration', () => {
           upgraded = new DatabaseService();
           expect(
             upgraded.connection.prepare('PRAGMA user_version').get(),
-          ).toEqual({ user_version: 10 });
+          ).toEqual({ user_version: 11 });
           expect(
             upgraded.connection
               .prepare('SELECT * FROM settlement_snapshots')

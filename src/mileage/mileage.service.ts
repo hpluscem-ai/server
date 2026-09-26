@@ -43,18 +43,34 @@ export class MileageService {
     input: CreateMileageDto,
     files: { receipt?: Express.Multer.File[]; meter?: Express.Multer.File[] },
   ): Promise<MileageDetailDto> {
-    if (files?.receipt?.length !== 1 || files?.meter?.length !== 1) {
+    const photoMode = input.photoMode ?? 'separate';
+    if (
+      files?.receipt?.length !== 1 ||
+      (photoMode === 'single'
+        ? Boolean(files?.meter?.length)
+        : files?.meter?.length !== 1)
+    ) {
       throw new BadRequestException({
         code: 'VALIDATION_ERROR',
-        message: '영수증과 계기판 사진을 한 장씩 등록해 주세요.',
+        message:
+          photoMode === 'single'
+            ? '영수증과 계기판이 함께 찍힌 사진 한 장을 등록해 주세요.'
+            : '영수증과 계기판 사진을 한 장씩 등록해 주세요.',
       });
     }
-    const pair = await this.processor.processPair(
-      files.receipt[0],
-      files.meter[0],
+    const pair = await this.processor.processPhotos(
+      photoMode === 'single'
+        ? [files.receipt[0]]
+        : [files.receipt[0], files.meter![0]],
     );
     const requestHash = createHash('sha256')
-      .update(JSON.stringify(pair.map((photo) => photo.hash)))
+      .update(
+        JSON.stringify(
+          photoMode === 'single'
+            ? ['single', pair[0].hash]
+            : pair.map((photo) => photo.hash),
+        ),
+      )
       .digest('hex');
     const key = input.idempotencyKey.toLowerCase();
     this.revalidate(session);
@@ -104,6 +120,7 @@ export class MileageService {
         idempotencyKey: key,
         requestHash,
         queueOcr: this.ocr.isConfigured(),
+        photoMode,
         photos,
       });
       if (saved.id !== id) await this.cleanup(id, keys, false);
@@ -133,7 +150,21 @@ export class MileageService {
       });
     const row = this.repository.findOne(session.user.id, id);
     if (!row) throw this.notFound();
+    const photoMode = input.photoMode ?? 'separate';
     const key = input.idempotencyKey.toLowerCase();
+    if (
+      (photoMode === 'single' &&
+        (kinds.length !== 1 || kinds[0] !== 'receipt')) ||
+      (!this.repository.findResubmission(id, key) &&
+        photoMode === 'separate' &&
+        row.photoMode === 'single' &&
+        kinds.length !== 2)
+    ) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: '선택한 장수에 맞는 사진을 새로 등록해 주세요.',
+      });
+    }
     if (!this.repository.findResubmission(id, key))
       this.repository.assertResubmittable(row, input.submissionVersion);
     const processed = await this.processor.processPhotos(
@@ -143,6 +174,7 @@ export class MileageService {
       .update(
         JSON.stringify([
           input.submissionVersion,
+          ...(photoMode === 'single' ? ['single'] : []),
           ...processed.map((photo, index) => [kinds[index], photo.hash]),
         ]),
       )
@@ -193,6 +225,7 @@ export class MileageService {
         requestHash,
         submissionVersion: input.submissionVersion,
         queueOcr: this.ocr.isConfigured(),
+        photoMode,
         photos,
       });
       if (!saved.committed) await this.cleanup(attemptId, keys, false);
@@ -234,11 +267,15 @@ export class MileageService {
     const row = this.repository.findOne(userId, id);
     if (!row) throw this.notFound();
     const path = (kind: 'receipt' | 'meter') =>
-      row.photos.some((photo) => photo.kind === kind)
+      row.photos.some(
+        (photo) =>
+          photo.kind === (row.photoMode === 'single' ? 'receipt' : kind),
+      )
         ? `/api/v1/mileage/applications/${id}/photos/${kind}`
         : null;
     return {
       ...this.present(row),
+      photoMode: row.photoMode,
       submissionVersion: this.repository.submissionVersion(row),
       photos: { receipt: path('receipt'), meter: path('meter') },
     };
@@ -255,13 +292,17 @@ export class MileageService {
         message: '사진 종류를 확인해 주세요.',
       });
     const row = this.repository.findOne(session.user.id, id);
-    const photo = row?.photos.find((item) => item.kind === kind);
+    const photo = row?.photos.find(
+      (item) => item.kind === (row.photoMode === 'single' ? 'receipt' : kind),
+    );
     if (!photo) throw this.notFound();
     const content = await this.storage.get(photo.storageKey);
     this.revalidate(session);
-    const current = this.repository
-      .findOne(session.user.id, id)
-      ?.photos.find((item) => item.kind === kind);
+    const latest = this.repository.findOne(session.user.id, id);
+    const current = latest?.photos.find(
+      (item) =>
+        item.kind === (latest.photoMode === 'single' ? 'receipt' : kind),
+    );
     if (!current || current.storageKey !== photo.storageKey)
       throw this.notFound();
     return content;

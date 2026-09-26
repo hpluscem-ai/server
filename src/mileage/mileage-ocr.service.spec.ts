@@ -18,7 +18,6 @@ import {
   type MeterReading,
   litersValue,
   MileageOcrService,
-  OcrFailure,
   parseReceiptFields,
 } from './mileage-ocr.service';
 
@@ -86,102 +85,105 @@ describe('mileage OCR', () => {
     expect(litersValue('11')).toBeNull();
   });
 
-  it('sends one private CLOVA General V2 request and checks inferResult', async () => {
-    process.env.CLOVA_OCR_INVOKE_URL = 'https://test.apigw.ntruss.com/general';
-    process.env.CLOVA_OCR_SECRET = 'secret';
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          images: [{ inferResult: 'SUCCESS', fields: [field('승인', 0, 0)] }],
-        }),
-    }) as typeof fetch;
-    await new MileageOcrService().readReceipt(Buffer.from('private'));
-    expect(global.fetch).toHaveBeenCalledTimes(1);
-    const call = (global.fetch as jest.Mock).mock.calls[0] as [
-      string,
-      RequestInit,
-    ];
-    const body = JSON.parse(call[1].body as string) as Record<string, unknown>;
-    expect(body).toMatchObject({
-      version: 'V2',
-      lang: 'ko',
-      enableTableDetection: false,
-    });
-    expect(body.images).toEqual([
-      {
-        format: 'jpg',
-        name: 'receipt',
-        data: Buffer.from('private').toString('base64'),
-      },
-    ]);
-    expect(JSON.stringify(body)).not.toContain('https://storage');
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({ images: [{ inferResult: 'FAILURE', fields: [] }] }),
-    }) as typeof fetch;
-    await expect(
-      new MileageOcrService().readReceipt(Buffer.from('x')),
-    ).rejects.toMatchObject({
-      code: 'CLOVA_INFER_FAILED',
-    } satisfies Partial<OcrFailure>);
-  });
-
-  it('parses one completed Luna output and rejects incomplete or refused outputs', async () => {
+  it('reads one or two private photos with Luna and rejects incomplete, refused or malformed outputs', async () => {
     process.env.OPENAI_API_KEY = 'secret';
-    const good = {
+    const reading = {
+      receipt: {
+        amountText: '158',
+        transactionDateText: '2026-09-10',
+        transactionTimeText: '15:26:38',
+        quantityText: '0.132',
+        quantityUnit: 'L',
+        unitPriceText: '1200',
+        documentKind: 'mixed',
+        approvalNumber: '05697078',
+        reprinted: false,
+        issues: [],
+      },
+      meter: {
+        amountText: '158',
+        litersText: '0.132 L',
+        unitPriceText: '1200',
+        issues: [],
+      },
+      mirroredImages: [false],
+    };
+    const good = (value: unknown = reading) => ({
       status: 'completed',
       output: [
-        {
-          content: [
-            {
-              type: 'output_text',
-              text: JSON.stringify({
-                amountText: '7,356원',
-                litersText: '11.000 L',
-                unitPriceText: null,
-                issues: [],
-              }),
-            },
-          ],
-        },
+        { content: [{ type: 'output_text', text: JSON.stringify(value) }] },
       ],
-      usage: { input_tokens: 1200, output_tokens: 65 },
+      usage: {
+        input_tokens: 1200,
+        output_tokens: 80,
+        input_tokens_details: { cached_tokens: 1024, cache_write_tokens: 0 },
+      },
+    });
+    const respond = (body: unknown) => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve(body),
+      }) as typeof fetch;
     };
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(good),
-    }) as typeof fetch;
-    const result = await new MileageOcrService().readMeter(
-      Buffer.from('meter'),
-    );
-    expect(result.reading.amountText).toBe('7,356원');
-    expect(result.usage).toEqual({ inputTokens: 1200, outputTokens: 65 });
-    const call = (global.fetch as jest.Mock).mock.calls[0] as [
-      string,
-      RequestInit,
-    ];
-    const body = JSON.parse(call[1].body as string) as Record<string, unknown>;
-    expect(body).toMatchObject({ model: 'gpt-5.6-luna', store: false });
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ ...good, status: 'incomplete' }),
-    }) as typeof fetch;
+    const service = new MileageOcrService();
+    for (const count of [1, 2]) {
+      respond(good({ ...reading, mirroredImages: Array(count).fill(false) }));
+      const result = await service.readApplication(
+        Array(count).fill(Buffer.from('private')) as Buffer[],
+      );
+      expect(result.reading.receipt.amountText).toBe('158');
+      expect(result.usage).toMatchObject({
+        inputTokens: 1200,
+        cachedTokens: 1024,
+        outputTokens: 80,
+      });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      const [url, options] = (global.fetch as jest.Mock).mock.calls[0] as [
+        string,
+        RequestInit,
+      ];
+      expect(url).toBe('https://api.openai.com/v1/responses');
+      const body = JSON.parse(options.body as string) as {
+        model: string;
+        store: boolean;
+        input: { content: unknown[] }[];
+      };
+      expect(body).toMatchObject({ model: 'gpt-6-luna', store: false });
+      expect(body.input[1].content).toHaveLength(count);
+      expect(JSON.stringify(body)).not.toContain('https://storage');
+    }
+    respond({ ...good(), status: 'incomplete' });
     await expect(
-      new MileageOcrService().readMeter(Buffer.from('meter')),
+      service.readApplication([Buffer.from('x')]),
     ).rejects.toMatchObject({ code: 'LUNA_INCOMPLETE' });
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          ...good,
-          output: [{ content: [{ type: 'refusal', refusal: 'no' }] }],
-        }),
-    }) as typeof fetch;
+    respond({ ...good(), output: [{ content: [{ type: 'refusal' }] }] });
     await expect(
-      new MileageOcrService().readMeter(Buffer.from('meter')),
+      service.readApplication([Buffer.from('x')]),
     ).rejects.toMatchObject({ code: 'LUNA_REFUSAL' });
+    for (const invalid of [
+      { ...reading, mirroredImages: [] },
+      { ...reading, receipt: {} },
+      { ...reading, extra: 1 },
+    ]) {
+      respond(good(invalid));
+      await expect(
+        service.readApplication([Buffer.from('x')]),
+      ).rejects.toMatchObject({ code: 'LUNA_INVALID_RESPONSE' });
+    }
+    respond(
+      good({
+        ...reading,
+        receipt: { ...reading.receipt, reprinted: null },
+        meter: { ...reading.meter, issues: ['unit_missing'] },
+        mirroredImages: [null],
+      }),
+    );
+    const uncertain = await service.readApplication([Buffer.from('x')]);
+    expect(uncertain.reading.meter.litersText).toBeNull();
+    expect(uncertain.reading.receipt.issues).toContain('REPRINT_UNCLEAR');
+    expect(uncertain.reading.meter.issues).toContain(
+      'IMAGE_ORIENTATION_UNCERTAIN',
+    );
   });
 });
 
@@ -566,7 +568,7 @@ describe('benchmark CLI without external calls', () => {
           '--used-clova-calls',
           '11',
           '--used-luna-calls',
-          '10',
+          '11',
         ],
         preload,
       ).status,
@@ -599,16 +601,16 @@ describe('benchmark CLI without external calls', () => {
       evaluations: unknown[];
     };
     expect(report).toMatchObject({
-      cumulativeClovaCalls: 11,
+      cumulativeClovaCalls: 0,
       cumulativeLunaCalls: 11,
-      stats: { clovaCalls: 1, lunaCalls: 1, verifiedApprovals: 0 },
+      stats: { clovaCalls: 0, lunaCalls: 1, verifiedApprovals: 0 },
     });
     expect(report.results[0]).toMatchObject({
-      clovaError: 'CLOVA_FAILED',
+      clovaError: null,
       lunaError: 'LUNA_FAILED',
     });
     const calls = readFileSync(join(folder, 'calls'), 'utf8');
-    expect(calls.split('call').length - 1).toBe(2);
+    expect(calls.split('call').length - 1).toBe(1);
     expect(run(args, preload).status).toBe(1);
     expect(readFileSync(join(folder, 'calls'), 'utf8')).toBe(calls);
   });

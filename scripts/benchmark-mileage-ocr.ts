@@ -245,24 +245,19 @@ async function main(): Promise<void> {
       mode: live ? 'live' : 'dry-run',
       samples: cases.length,
       uniquePairs: count,
-      maxClovaCalls: count,
+      maxClovaCalls: 0,
       maxLunaCalls: count,
     }) + '\n',
   );
   if (!live) return;
-  const clovaLimit = limit('max-clova-calls');
   const lunaLimit = limit('max-luna-calls');
-  const clovaUsed = limit('used-clova-calls');
+  const clovaUsed = 0;
   const lunaUsed = limit('used-luna-calls');
-  if (clovaLimit - clovaUsed < count || lunaLimit - lunaUsed < count)
+  if (lunaLimit - lunaUsed < count)
     throw new Error(
       'Remaining approved provider calls are lower than unique pairs',
     );
-  if (
-    !process.env.CLOVA_OCR_INVOKE_URL ||
-    !process.env.CLOVA_OCR_SECRET ||
-    !process.env.OPENAI_API_KEY
-  )
+  if (!process.env.OPENAI_API_KEY)
     throw new Error('Provider credentials are missing');
   const service = new MileageOcrService();
   const results: Array<{
@@ -294,9 +289,9 @@ async function main(): Promise<void> {
     writeReport(
       {
         evaluatedAt: new Date().toISOString(),
-        clovaCalls: reservedPairs,
+        clovaCalls: 0,
         lunaCalls: reservedPairs,
-        cumulativeClovaCalls: clovaUsed + reservedPairs,
+        cumulativeClovaCalls: clovaUsed,
         cumulativeLunaCalls: lunaUsed + reservedPairs,
         results,
       },
@@ -306,18 +301,18 @@ async function main(): Promise<void> {
   for (const { item, receipt, meter } of unique.values()) {
     reservedPairs++;
     await save();
-    const [clova, luna] = await Promise.allSettled([
-      service.readReceipt(receipt),
-      service.readMeter(meter),
+    const [luna] = await Promise.allSettled([
+      service.readApplication(
+        receipt.equals(meter) ? [receipt] : [receipt, meter],
+      ),
     ]);
     results.push({
       id: item.id,
-      receipt: clova.status === 'fulfilled' ? clova.value.reading : null,
-      meter: luna.status === 'fulfilled' ? luna.value.reading : null,
-      clovaError: clova.status === 'rejected' ? 'CLOVA_FAILED' : null,
+      receipt: luna.status === 'fulfilled' ? luna.value.reading.receipt : null,
+      meter: luna.status === 'fulfilled' ? luna.value.reading.meter : null,
+      clovaError: null,
       lunaError: luna.status === 'rejected' ? 'LUNA_FAILED' : null,
-      clovaDurationMs:
-        clova.status === 'fulfilled' ? clova.value.durationMs : null,
+      clovaDurationMs: null,
       lunaDurationMs:
         luna.status === 'fulfilled' ? luna.value.durationMs : null,
       lunaInputTokens:
@@ -342,7 +337,7 @@ async function main(): Promise<void> {
     verifiedApprovals: 0,
     unverifiedApprovals: 0,
     manualReview: 0,
-    clovaCalls: results.length,
+    clovaCalls: 0,
     lunaCalls: results.length,
     lunaInputTokens: 0,
     lunaOutputTokens: 0,
@@ -368,7 +363,7 @@ async function main(): Promise<void> {
     evaluatedAt: new Date().toISOString(),
     uniquePairs: count,
     stats,
-    cumulativeClovaCalls: clovaUsed + reservedPairs,
+    cumulativeClovaCalls: clovaUsed,
     cumulativeLunaCalls: lunaUsed + reservedPairs,
     billing: 'Use actual account usage and invoices; no fixed-price estimate',
     results,

@@ -163,6 +163,9 @@ export const mileageApplications = sqliteTable('mileage_applications', {
   logisticsCompanyId: text('logistics_company_id').notNull(),
   idempotencyKey: text('idempotency_key').notNull(),
   requestHash: text('request_hash'),
+  photoMode: text('photo_mode', { enum: ['single', 'separate'] })
+    .notNull()
+    .default('separate'),
   receiptAmount: integer('receipt_amount'),
   meterAmount: integer('meter_amount'),
   finalAmount: integer('final_amount'),
@@ -246,6 +249,7 @@ export const mileageOcrJobs = sqliteTable('mileage_ocr_jobs', {
     .default('queued'),
   clovaReservedAt: text('clova_reserved_at'),
   lunaReservedAt: text('luna_reserved_at'),
+  lunaRetryReservedAt: text('luna_retry_reserved_at'),
   clovaDurationMs: integer('clova_duration_ms'),
   lunaDurationMs: integer('luna_duration_ms'),
   lunaInputTokens: integer('luna_input_tokens'),

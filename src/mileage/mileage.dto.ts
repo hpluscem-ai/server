@@ -14,6 +14,16 @@ import {
 import { DateRangeQueryDto } from '../common/date-range-query';
 
 export class CreateMileageDto {
+  @ApiPropertyOptional({
+    enum: ['single', 'separate'],
+    default: 'separate',
+    description:
+      'single: combined image in receipt; separate: receipt and meter images.',
+  })
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsIn(['single', 'separate'])
+  photoMode?: 'single' | 'separate';
+
   @ApiProperty({
     format: 'uuid',
     description:
@@ -81,6 +91,8 @@ export class MileagePhotoPathsDto {
 }
 
 export class MileageDetailDto extends MileageResponseDto {
+  @ApiProperty({ enum: ['single', 'separate'] }) photoMode!:
+    'single' | 'separate';
   @ApiProperty({
     description: 'Opaque version of the current submitted photos.',
     pattern: '^[0-9a-f]{64}$',

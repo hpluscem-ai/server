@@ -37,6 +37,9 @@ export type OcrResult = {
   lunaDurationMs: number | null;
   lunaInputTokens: number | null;
   lunaOutputTokens: number | null;
+  lunaCachedTokens?: number;
+  lunaCacheWriteTokens?: number;
+  attempts?: number;
 };
 export type MileageCursor = {
   at: string;
@@ -154,6 +157,7 @@ export class MileageRepository {
     idempotencyKey: string;
     requestHash: string;
     queueOcr: boolean;
+    photoMode?: 'single' | 'separate';
     photos: Omit<PhotoRecord, 'id' | 'mileageApplicationId'>[];
   }): MileageRecord {
     return this.database.db.transaction(
@@ -229,9 +233,9 @@ export class MileageRepository {
       record.approvalStatus !== 'rejected' ||
       record.settlementId !== null ||
       this.submissionVersion(record) !== version ||
-      !['receipt', 'meter'].every((kind) =>
-        record.photos.some((photo) => photo.kind === kind),
-      )
+      !(
+        record.photoMode === 'single' ? ['receipt'] : ['receipt', 'meter']
+      ).every((kind) => record.photos.some((photo) => photo.kind === kind))
     ) {
       throw new ConflictException({
         code: 'MILEAGE_RESUBMISSION_CONFLICT',
@@ -249,6 +253,7 @@ export class MileageRepository {
     requestHash: string;
     submissionVersion: string;
     queueOcr: boolean;
+    photoMode?: 'single' | 'separate';
     photos: Omit<PhotoRecord, 'id' | 'mileageApplicationId'>[];
   }): { committed: boolean; requestHash: string } {
     return this.database.db.transaction(
@@ -289,6 +294,20 @@ export class MileageRepository {
           { ...application, photos: savedPhotos },
           input.submissionVersion,
         );
+        if (input.photoMode === 'single') {
+          tx.delete(photos)
+            .where(
+              and(
+                eq(photos.mileageApplicationId, input.id),
+                eq(photos.kind, 'meter'),
+              ),
+            )
+            .run();
+          const index = savedPhotos.findIndex(
+            (photo) => photo.kind === 'meter',
+          );
+          if (index >= 0) savedPhotos.splice(index, 1);
+        }
         for (const photo of input.photos) {
           tx.delete(photos)
             .where(
@@ -304,9 +323,11 @@ export class MileageRepository {
             mileageApplicationId: input.id,
           };
           tx.insert(photos).values(replacement).run();
-          savedPhotos[
-            savedPhotos.findIndex((previous) => previous.kind === photo.kind)
-          ] = replacement;
+          const index = savedPhotos.findIndex(
+            (previous) => previous.kind === photo.kind,
+          );
+          if (index >= 0) savedPhotos[index] = replacement;
+          else savedPhotos.push(replacement);
         }
         const version = photoVersion(application.requestHash, savedPhotos);
         tx.insert(resubmissions)
@@ -323,6 +344,7 @@ export class MileageRepository {
         tx.update(applications)
           .set({
             approvalStatus: 'pending',
+            photoMode: input.photoMode ?? 'separate',
             matchStatus: 'pending',
             receiptAmount: null,
             meterAmount: null,
@@ -425,18 +447,18 @@ export class MileageRepository {
       )
         return null;
       const receipt = savedPhotos.find((photo) => photo.kind === 'receipt');
-      const meter = savedPhotos.find((photo) => photo.kind === 'meter');
+      const meter =
+        application.photoMode === 'single'
+          ? receipt
+          : savedPhotos.find((photo) => photo.kind === 'meter');
       return receipt && meter
         ? { receiptKey: receipt.storageKey, meterKey: meter.storageKey }
         : null;
     });
   }
 
-  reserveOcrCalls(
-    jobId: string,
-    clovaLimit: number,
-    lunaLimit: number,
-  ): boolean {
+  reserveOcrCall(jobId: string, lunaLimit: number, retry = false): boolean {
+    if (!Number.isSafeInteger(lunaLimit) || lunaLimit <= 0) return false;
     return this.database.db.transaction(
       (tx) => {
         const job = tx
@@ -447,30 +469,28 @@ export class MileageRepository {
         if (
           !job ||
           job.status !== 'running' ||
-          job.clovaReservedAt ||
-          job.lunaReservedAt
+          job.extractorVersion !== OCR_VERSION ||
+          (retry
+            ? !job.lunaReservedAt || Boolean(job.lunaRetryReservedAt)
+            : Boolean(job.lunaReservedAt))
         )
           return false;
-        const now = new Date();
-        const today = now.toISOString().slice(0, 10);
-        const from = today + 'T00:00:00.000Z';
+        const now = new Date().toISOString();
+        const from = now.slice(0, 10) + 'T00:00:00.000Z';
         const until = new Date(Date.parse(from) + 86400000).toISOString();
-        const used = (column: typeof ocrJobs.clovaReservedAt) =>
+        const used = (column: typeof ocrJobs.lunaReservedAt) =>
           tx
             .select({ count: sql<number>`count(*)` })
             .from(ocrJobs)
             .where(and(gte(column, from), lt(column, until)))
             .get()!.count;
         if (
-          used(ocrJobs.clovaReservedAt) >= clovaLimit ||
-          used(ocrJobs.lunaReservedAt) >= lunaLimit
+          used(ocrJobs.lunaReservedAt) + used(ocrJobs.lunaRetryReservedAt) >=
+          lunaLimit
         )
           return false;
         tx.update(ocrJobs)
-          .set({
-            clovaReservedAt: now.toISOString(),
-            lunaReservedAt: now.toISOString(),
-          })
+          .set(retry ? { lunaRetryReservedAt: now } : { lunaReservedAt: now })
           .where(eq(ocrJobs.id, jobId))
           .run();
         return true;
@@ -508,7 +528,8 @@ export class MileageRepository {
         const stillCurrent =
           current.extractorVersion === OCR_VERSION &&
           savedPhotos.some((photo) => photo.kind === 'receipt') &&
-          savedPhotos.some((photo) => photo.kind === 'meter') &&
+          (application?.photoMode === 'single' ||
+            savedPhotos.some((photo) => photo.kind === 'meter')) &&
           application?.approvalStatus === 'pending' &&
           application.settlementId === null &&
           photoVersion(application.requestHash, savedPhotos) ===
@@ -609,7 +630,8 @@ export class MileageRepository {
                 meterAmount !== null &&
                 receiptAmount !== meterAmount
               ? 'mismatched'
-              : receiptAmount !== null &&
+              : !failed &&
+                  receiptAmount !== null &&
                   meterAmount !== null &&
                   result.receipt?.documentKind === 'sale' &&
                   result.receipt.issues.length === 0 &&

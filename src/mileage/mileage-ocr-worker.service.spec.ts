@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { DatabaseService } from '../database/database.service';
@@ -13,7 +14,12 @@ import { AdminAuthRepository } from '../admin-auth';
 import { AdminMileageService } from '../admin-mileage/admin-mileage.service';
 import { SettlementsService } from '../settlements';
 import { MileageRepository, type OcrResult } from './mileage.repository';
-import { MileageOcrService } from './mileage-ocr.service';
+import {
+  MileageOcrService,
+  type ProviderResult,
+  type ReceiptReading,
+  type MeterReading,
+} from './mileage-ocr.service';
 import { MileageOcrWorkerService } from './mileage-ocr-worker.service';
 import { PhotoStorageService } from './photo-storage.service';
 
@@ -22,8 +28,8 @@ describe('MileageOcrWorkerService', () => {
   let repository: MileageRepository;
   let ocr: MileageOcrService;
   let worker: MileageOcrWorkerService;
-  let receiptCall: jest.SpyInstance;
-  let meterCall: jest.SpyInstance;
+  let receiptCall: jest.Mock<Promise<ProviderResult<ReceiptReading>>, []>;
+  let meterCall: jest.Mock<Promise<ProviderResult<MeterReading>>, []>;
   let applicationId: string;
   const userId = randomUUID();
   const companyId = randomUUID();
@@ -66,28 +72,44 @@ describe('MileageOcrWorkerService', () => {
       .run();
     ocr = new MileageOcrService();
     jest.spyOn(ocr, 'isConfigured').mockReturnValue(true);
-    receiptCall = jest.spyOn(ocr, 'readReceipt').mockResolvedValue({
-      reading: {
-        amountText: '11700',
-        transactionDateText: '2026-09-23',
-        transactionTimeText: '12:34:56',
-        quantityText: '11.000',
-        quantityUnit: 'L',
-        unitPriceText: null,
-        documentKind: 'sale',
-        issues: [],
-      },
-      durationMs: 10,
-    });
-    meterCall = jest.spyOn(ocr, 'readMeter').mockResolvedValue({
-      reading: {
-        amountText: '11,700원',
-        litersText: '11.000 L',
-        unitPriceText: null,
-        issues: [],
-      },
-      durationMs: 12,
-      usage: { inputTokens: 1000, outputTokens: 50 },
+    receiptCall = jest
+      .fn<Promise<ProviderResult<ReceiptReading>>, []>()
+      .mockResolvedValue({
+        reading: {
+          amountText: '11700',
+          transactionDateText: '2026-09-23',
+          transactionTimeText: '12:34:56',
+          quantityText: '11.000',
+          quantityUnit: 'L',
+          unitPriceText: null,
+          documentKind: 'sale',
+          issues: [],
+        },
+        durationMs: 10,
+      });
+    meterCall = jest
+      .fn<Promise<ProviderResult<MeterReading>>, []>()
+      .mockResolvedValue({
+        reading: {
+          amountText: '11,700원',
+          litersText: '11.000 L',
+          unitPriceText: null,
+          issues: [],
+        },
+        durationMs: 12,
+        usage: { inputTokens: 1000, outputTokens: 50 },
+      });
+    jest.spyOn(ocr, 'readApplication').mockImplementation(async (images) => {
+      const [receipt, meter] = await Promise.all([receiptCall(), meterCall()]);
+      return {
+        reading: {
+          receipt: receipt.reading,
+          meter: meter.reading,
+          mirroredImages: images.map(() => false),
+        },
+        durationMs: 22,
+        usage: meter.usage,
+      };
     });
     const storage = {
       get: jest.fn().mockResolvedValue(Buffer.from('private photo')),
@@ -128,6 +150,77 @@ describe('MileageOcrWorkerService', () => {
     return id;
   }
 
+  it.each([1, 2])(
+    'bounds mirrored correction and accounts every reserved request (budget %i)',
+    async (limit) => {
+      process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = String(limit);
+      const image = await sharp({
+        create: { width: 2, height: 1, channels: 3, background: '#112233' },
+      })
+        .jpeg()
+        .toBuffer();
+      const storage = {
+        get: jest.fn().mockResolvedValue(image),
+      } as unknown as PhotoStorageService;
+      worker = new MileageOcrWorkerService(repository, ocr, storage);
+      const before = Buffer.from(image);
+      const call = jest
+        .spyOn(ocr, 'readApplication')
+        .mockImplementation(async (images) => ({
+          reading: {
+            receipt: (await receiptCall()).reading,
+            meter: (await meterCall()).reading,
+            mirroredImages: images.map(
+              (_image, index) => call.mock.calls.length === 1 && index === 0,
+            ),
+          },
+          durationMs: 2,
+          usage: { inputTokens: 100, outputTokens: 20, cachedTokens: 80 },
+        }));
+      await worker.processOne();
+      expect(call).toHaveBeenCalledTimes(limit);
+      const job = database.db.select().from(mileageOcrJobs).get()!;
+      expect(job.lunaReservedAt).toBeTruthy();
+      expect(Boolean(job.lunaRetryReservedAt)).toBe(limit === 2);
+      expect(job.clovaReservedAt).toBeNull();
+      expect(job.lunaInputTokens).toBe(limit * 100);
+      expect(job.status).toBe(limit === 2 ? 'completed' : 'failed');
+      expect(image.equals(before)).toBe(true);
+      if (limit === 2) {
+        expect(call.mock.calls[1][0][0]).not.toBe(image);
+        expect(call.mock.calls[1][0][1]).toBe(image);
+      }
+      createApplication('c'.repeat(64));
+      await worker.processOne();
+      expect(call).toHaveBeenCalledTimes(limit);
+    },
+  );
+
+  it('sends a single combined image once and retains unknown outcomes without paid retry', async () => {
+    database.db
+      .delete(mileagePhotos)
+      .where(eq(mileagePhotos.kind, 'meter'))
+      .run();
+    database.db.update(mileageApplications).set({ photoMode: 'single' }).run();
+    const row = repository.findOne(userId, applicationId)!;
+    database.db
+      .update(mileageOcrJobs)
+      .set({ sourceVersion: repository.submissionVersion(row) })
+      .run();
+    const call = jest
+      .spyOn(ocr, 'readApplication')
+      .mockRejectedValue(new Error('timeout'));
+    await worker.processOne();
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(call.mock.calls[0][0]).toHaveLength(1);
+    expect(
+      database.db.select().from(mileageOcrJobs).get()?.lunaRetryReservedAt,
+    ).toBeNull();
+    expect(
+      database.db.select().from(mileageApplications).get()?.approvalStatus,
+    ).toBe('pending');
+  });
+
   it('records both readings but keeps matched applications pending', async () => {
     expect(await worker.processOne()).toBe(true);
     const application = database.db
@@ -155,17 +248,17 @@ describe('MileageOcrWorkerService', () => {
   });
 
   it('does not use a failed receipt reading as proof of a match', async () => {
-    jest.spyOn(ocr, 'readReceipt').mockRejectedValue(new Error('offline'));
+    receiptCall.mockRejectedValue(new Error('offline'));
     await worker.processOne();
     expect(database.db.select().from(mileageApplications).get()).toMatchObject({
       receiptAmount: null,
-      meterAmount: 11700,
+      meterAmount: null,
       matchStatus: 'ocr_failed',
       approvalStatus: 'pending',
     });
     expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
       status: 'failed',
-      errorCode: 'CLOVA_FAILED',
+      errorCode: 'LUNA_FAILED',
     });
   });
 
@@ -247,7 +340,7 @@ describe('MileageOcrWorkerService', () => {
 
   it('keeps an interrupted running call unknown instead of recharging it', async () => {
     const job = repository.claimOcrJob()!;
-    expect(repository.reserveOcrCalls(job.id, 10, 10)).toBe(true);
+    expect(repository.reserveOcrCall(job.id, 10)).toBe(true);
     repository.interruptRunningOcrJobs();
     expect(await worker.processOne()).toBe(false);
     expect(database.db.select().from(mileageOcrJobs).get()).toMatchObject({
@@ -428,8 +521,8 @@ describe('MileageOcrWorkerService', () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
     const before = review().detail(applicationId);
     const result = validResult();
-    receiptCall.mockResolvedValue({ reading: result.receipt, durationMs: 1 });
-    meterCall.mockResolvedValue({ reading: result.meter, durationMs: 1 });
+    receiptCall.mockResolvedValue({ reading: result.receipt!, durationMs: 1 });
+    meterCall.mockResolvedValue({ reading: result.meter!, durationMs: 1 });
     await worker.processOne();
     const decided = application();
     expect(decided).toMatchObject({

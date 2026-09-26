@@ -637,32 +637,122 @@ describe('Mileage applications (e2e)', () => {
       );
   });
 
-  it.each([false, true])(
-    'runs saved photos through OCR with automatic approval enabled=%s',
-    async (enabled) => {
+  it('stores a combined photo once, aliases protected meter access and supports idempotent mode changes', async () => {
+    const single = () =>
+      request(app.getHttpServer())
+        .post(URL)
+        .set('Authorization', authorization)
+        .field('idempotencyKey', key)
+        .field('photoMode', 'single')
+        .attach('receipt', receipt, 'combined.jpg');
+    const first = (await single().expect(201)).body as MileageDetailDto;
+    expect(first.photoMode).toBe('single');
+    expect(storage.writes).toBe(2);
+    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(1);
+    await single().expect(201).expect(first);
+    expect(storage.writes).toBe(2);
+    const one = await get(`${URL}/${first.id}/photos/receipt`).expect(200);
+    const two = await get(`${URL}/${first.id}/photos/meter`).expect(200);
+    expect(one.body).toEqual(two.body);
+    const admin = app.get(AdminMileageService);
+    expect(admin.detail(first.id).photos.meter).toBeTruthy();
+    const reject = () =>
+      admin.reject(first.id, {
+        reviewVersion: admin.detail(first.id).reviewVersion,
+      });
+    reject();
+    const original = (await get(`${URL}/${first.id}`).expect(200))
+      .body as MileageDetailDto;
+    await resubmit(original, randomUUID(), receipt)
+      .field('photoMode', 'separate')
+      .expect(400);
+    const separateKey = randomUUID();
+    const separate = (
+      await resubmit(original, separateKey, receipt, meter)
+        .field('photoMode', 'separate')
+        .expect(200)
+    ).body as MileageDetailDto;
+    expect(separate.photoMode).toBe('separate');
+    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(2);
+    reject();
+    const combinedKey = randomUUID();
+    const combined = (
+      await resubmit(separate, combinedKey, receipt)
+        .field('photoMode', 'single')
+        .expect(200)
+    ).body as MileageDetailDto;
+    expect(combined.photoMode).toBe('single');
+    expect(database.db.select().from(mileagePhotos).all()).toHaveLength(1);
+    const writes = storage.writes;
+    await resubmit(original, separateKey, receipt, meter)
+      .field('photoMode', 'separate')
+      .expect(200)
+      .expect(combined);
+    expect(storage.writes).toBe(writes);
+    expect(
+      ((await get(`${URL}/${first.id}`).expect(200)).body as MileageDetailDto)
+        .photoMode,
+    ).toBe('single');
+    admin.approve(first.id, {
+      reviewVersion: admin.detail(first.id).reviewVersion,
+      finalAmount: 13000,
+      liters: '10',
+    });
+    expect(database.db.select().from(mileageApplications).get()).toMatchObject({
+      approvalStatus: 'approved',
+      mileageAmount: 200,
+    });
+    expect(() =>
+      database.db
+        .update(mileageApplications)
+        .set({ photoMode: 'separate' })
+        .run(),
+    ).toThrow();
+  });
+
+  it('rejects invalid photo mode/file combinations without storage writes', async () => {
+    await submit().field('photoMode', 'single').expect(400);
+    await submit().field('photoMode', 'invalid').expect(400);
+    await request(app.getHttpServer())
+      .post(URL)
+      .set('Authorization', authorization)
+      .field('idempotencyKey', key)
+      .attach('receipt', receipt, 'receipt.jpg')
+      .expect(400);
+    expect(storage.writes).toBe(0);
+  });
+
+  it.each([
+    [false, 'separate'],
+    [true, 'separate'],
+    [false, 'single'],
+    [true, 'single'],
+  ] as const)(
+    'runs saved photos through OCR with automatic approval enabled=%s, mode=%s',
+    async (enabled, photoMode) => {
       const previousAutoApprove = process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
       process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = String(enabled);
       const ocr = app.get(MileageOcrService);
       jest.spyOn(ocr, 'isConfigured').mockReturnValue(true);
-      jest.spyOn(ocr, 'readReceipt').mockResolvedValue({
+      const read = jest.spyOn(ocr, 'readApplication').mockResolvedValue({
         reading: {
-          amountText: '11700',
-          transactionDateText: '2026-09-23',
-          transactionTimeText: '12:34:56+09:00',
-          quantityText: '11.000',
-          quantityUnit: 'L',
-          unitPriceText: null,
-          documentKind: 'sale',
-          issues: [],
-        },
-        durationMs: 1,
-      });
-      jest.spyOn(ocr, 'readMeter').mockResolvedValue({
-        reading: {
-          amountText: '11,700원',
-          litersText: '11.000 L',
-          unitPriceText: null,
-          issues: [],
+          mirroredImages: photoMode === 'single' ? [false] : [false, false],
+          receipt: {
+            amountText: '11700',
+            transactionDateText: '2026-09-23',
+            transactionTimeText: '12:34:56+09:00',
+            quantityText: '11.000',
+            quantityUnit: 'L',
+            unitPriceText: null,
+            documentKind: 'sale',
+            issues: [],
+          },
+          meter: {
+            amountText: '11,700원',
+            litersText: '11.000 L',
+            unitPriceText: null,
+            issues: [],
+          },
         },
         durationMs: 1,
         usage: { inputTokens: 100, outputTokens: 20 },
@@ -670,12 +760,27 @@ describe('Mileage applications (e2e)', () => {
       process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT = '10';
       process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = '10';
       try {
-        const accepted = await saved();
+        const accepted =
+          photoMode === 'separate'
+            ? await saved()
+            : ((
+                await request(app.getHttpServer())
+                  .post(URL)
+                  .set('Authorization', authorization)
+                  .field('idempotencyKey', key)
+                  .field('photoMode', 'single')
+                  .attach('receipt', receipt, 'combined.jpg')
+                  .expect(201)
+              ).body as MileageDetailDto);
         expect(accepted.status).toBe('pending');
         expect(database.db.select().from(mileageOcrJobs).get()?.status).toBe(
           'queued',
         );
         expect(await app.get(MileageOcrWorkerService).processOne()).toBe(true);
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(read.mock.calls[0][0]).toHaveLength(
+          photoMode === 'single' ? 1 : 2,
+        );
         expect(app.get(AdminMileageService).detail(accepted.id)).toMatchObject({
           receiptAmount: 11700,
           meterAmount: 11700,

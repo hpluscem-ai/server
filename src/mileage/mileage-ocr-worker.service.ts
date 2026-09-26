@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 import {
   Injectable,
   Logger,
@@ -70,13 +71,13 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
       this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
       return true;
     }
-    let receipt: Buffer;
-    let meter: Buffer;
+    let images: Buffer[];
     try {
-      [receipt, meter] = await Promise.all([
-        this.storage.get(source.receiptKey),
-        this.storage.get(source.meterKey),
-      ]);
+      images = await Promise.all(
+        [...new Set([source.receiptKey, source.meterKey])].map((key) =>
+          this.storage.get(key),
+        ),
+      );
     } catch {
       this.repository.finishOcrJob(job, result, 'PHOTO_READ_FAILED');
       return true;
@@ -85,35 +86,51 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
       this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
       return true;
     }
-    const clovaLimit = positiveLimit(
-      process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT,
-    )!;
-    const lunaLimit = positiveLimit(process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT)!;
-    if (!this.repository.reserveOcrCalls(job.id, clovaLimit, lunaLimit)) {
+    const lunaLimit = positiveLimit(process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT);
+    if (
+      lunaLimit === null ||
+      !this.repository.reserveOcrCall(job.id, lunaLimit)
+    ) {
       this.repository.finishOcrJob(job, result, 'DAILY_LIMIT_REACHED');
       return true;
     }
-    if (!this.repository.ocrSource(job)) {
-      this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
-      return true;
-    }
-    const [clova, luna] = await Promise.allSettled([
-      this.ocr.readReceipt(receipt),
-      this.ocr.readMeter(meter),
-    ]);
-    if (clova.status === 'fulfilled') {
-      result.receipt = clova.value.reading;
-      result.clovaDurationMs = clova.value.durationMs;
-    } else {
-      result.clovaError = errorCode(clova.reason, 'CLOVA_FAILED');
-    }
-    if (luna.status === 'fulfilled') {
-      result.meter = luna.value.reading;
-      result.lunaDurationMs = luna.value.durationMs;
-      result.lunaInputTokens = luna.value.usage?.inputTokens ?? null;
-      result.lunaOutputTokens = luna.value.usage?.outputTokens ?? null;
-    } else {
-      result.lunaError = errorCode(luna.reason, 'LUNA_FAILED');
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (!this.repository.ocrSource(job))
+          throw new OcrFailure('STALE_SOURCE');
+        const response = await this.ocr.readApplication(images);
+        result.receipt = response.reading.receipt;
+        result.meter = response.reading.meter;
+        result.lunaDurationMs =
+          (result.lunaDurationMs ?? 0) + response.durationMs;
+        result.lunaInputTokens =
+          (result.lunaInputTokens ?? 0) + (response.usage?.inputTokens ?? 0);
+        result.lunaOutputTokens =
+          (result.lunaOutputTokens ?? 0) + (response.usage?.outputTokens ?? 0);
+        result.lunaCachedTokens =
+          (result.lunaCachedTokens ?? 0) + (response.usage?.cachedTokens ?? 0);
+        result.lunaCacheWriteTokens =
+          (result.lunaCacheWriteTokens ?? 0) +
+          (response.usage?.cacheWriteTokens ?? 0);
+        result.attempts = attempt + 1;
+        if (!response.reading.mirroredImages.some((value) => value === true))
+          break;
+        if (attempt === 1) throw new OcrFailure('MIRROR_CORRECTION_FAILED');
+        // Work on an in-memory copy; originals and stored normalized photos stay intact.
+        images = await Promise.all(
+          images.map(async (image, index) =>
+            response.reading.mirroredImages[index] === true
+              ? sharp(image).flop().jpeg({ quality: 90 }).toBuffer()
+              : image,
+          ),
+        );
+        if (!this.repository.ocrSource(job))
+          throw new OcrFailure('STALE_SOURCE');
+        if (!this.repository.reserveOcrCall(job.id, lunaLimit, true))
+          throw new OcrFailure('DAILY_LIMIT_REACHED');
+      }
+    } catch (error) {
+      result.lunaError = errorCode(error, 'LUNA_FAILED');
     }
     this.repository.finishOcrJob(job, result);
     return true;

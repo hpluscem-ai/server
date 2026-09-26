@@ -156,7 +156,12 @@ export class AdminMileageService {
           applications,
           eq(photos.mileageApplicationId, applications.id),
         )
-        .where(and(eq(applications.id, id), eq(photos.kind, kind)))
+        .where(
+          and(
+            eq(applications.id, id),
+            sql`${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE ${kind} END`,
+          ),
+        )
         .get();
     const photo = find();
     if (!photo) throw this.notFound();
@@ -213,7 +218,7 @@ export class AdminMileageService {
         >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = 'receipt')`,
         meterPhotoIdentity: sql<
           string | null
-        >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = 'meter')`,
+        >`(SELECT json_array(${photos.id}, ${photos.storageKey}, ${photos.originalStorageKey}, ${photos.byteSize}) FROM ${photos} WHERE ${photos.mileageApplicationId} = ${applications.id} AND ${photos.kind} = CASE WHEN ${applications.photoMode} = 'single' THEN 'receipt' ELSE 'meter' END)`,
       })
       .from(applications)
       .innerJoin(users, eq(applications.userId, users.id))
