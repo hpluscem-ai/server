@@ -799,6 +799,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .post(`/api/v1/admin/mileage/applications/${applicationId}/reject`)
       .set('Authorization', authorization)
       .send({
+        rejectionReason: '금액 불일치',
         reviewVersion: (detail.body as { reviewVersion: string }).reviewVersion,
       })
       .expect(409);
@@ -824,6 +825,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         .post(`/api/v1/admin/mileage/applications/${pending}/reject`)
         .set('Authorization', authorization)
         .send({
+          rejectionReason: '금액 불일치',
           reviewVersion: (detail.body as { reviewVersion: string })
             .reviewVersion,
         }),

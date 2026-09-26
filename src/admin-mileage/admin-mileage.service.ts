@@ -59,6 +59,7 @@ export class AdminMileageService {
   reject(id: string, input: RejectAdminMileageDto): AdminMileageResponseDto {
     return this.review(id, input, {
       approvalStatus: 'rejected',
+      rejectionReason: input.rejectionReason,
       finalAmount: null,
       mileageAmount: null,
     });
@@ -74,6 +75,7 @@ export class AdminMileageService {
     }
     return this.review(id, input, {
       approvalStatus: 'approved',
+      rejectionReason: null,
       finalAmount: input.finalAmount,
       mileageAmount,
     });
@@ -84,6 +86,7 @@ export class AdminMileageService {
     input: Pick<RejectAdminMileageDto, 'reviewVersion'>,
     decision: {
       approvalStatus: 'approved' | 'rejected';
+      rejectionReason: string | null;
       finalAmount: number | null;
       mileageAmount: number | null;
     },
@@ -100,6 +103,7 @@ export class AdminMileageService {
         // A lost response can be retried without rewriting the decision or its timestamp.
         if (
           current.status === decision.approvalStatus &&
+          current.rejectionReason === decision.rejectionReason &&
           current.finalAmount === decision.finalAmount &&
           current.mileageAmount === decision.mileageAmount
         )
@@ -115,7 +119,6 @@ export class AdminMileageService {
           .update(applications)
           .set({
             ...decision,
-            rejectionReason: null,
             decidedAt: now,
             updatedAt: now,
           })

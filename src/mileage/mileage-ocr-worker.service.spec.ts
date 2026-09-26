@@ -543,7 +543,10 @@ describe('MileageOcrWorkerService', () => {
     expect(database.db.select().from(mileageOcrJobs).get()).toEqual(job);
     expect(balance()).toBe(220);
     expect(() =>
-      review().reject(applicationId, { reviewVersion: before.reviewVersion }),
+      review().reject(applicationId, {
+        rejectionReason: '금액 불일치',
+        reviewVersion: before.reviewVersion,
+      }),
     ).toThrow();
     expect(await worker.processOne()).toBe(false);
     expect(receiptCall).toHaveBeenCalledTimes(1);
@@ -652,6 +655,7 @@ describe('MileageOcrWorkerService', () => {
     const job = repository.claimOcrJob()!;
     if (kind === 'rejected')
       review().reject(applicationId, {
+        rejectionReason: '금액 불일치',
         reviewVersion: review().detail(applicationId).reviewVersion,
       });
     if (kind === 'approved')
@@ -720,6 +724,7 @@ describe('MileageOcrWorkerService', () => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
     const oldJob = repository.claimOcrJob()!;
     review().reject(applicationId, {
+      rejectionReason: '금액 불일치',
       reviewVersion: review().detail(applicationId).reviewVersion,
     });
     const current = repository.findOne(userId, applicationId)!;

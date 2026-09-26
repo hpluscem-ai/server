@@ -406,7 +406,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     return request(app.getHttpServer())
       .post(`${URL}/${applicationId}/reject`)
       .set('Authorization', auth)
-      .send(input);
+      .send({ rejectionReason: '금액 불일치', ...input });
   }
   function approve(input: object, auth = authorization) {
     return request(app.getHttpServer())
@@ -632,7 +632,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     await reject({ reviewVersion: before.reviewVersion }).expect(409);
   });
 
-  it('preserves a reasonless rejection replay after late OCR finishes without applying its readings', async () => {
+  it('preserves a rejection reason on replay after late OCR finishes without applying its readings', async () => {
     const job = ocrJob();
     const before = await snapshot();
     const rejected = await reject({
@@ -645,34 +645,57 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect((await snapshot()).meterAmount).toBeNull();
   });
 
-  it('requires only the current review version and stores no new rejection reason', async () => {
+  it('requires a nonblank reason of at most 150 characters and stores trimmed multiline text', async () => {
     const { reviewVersion } = await snapshot();
     for (const input of [
       {},
       { reviewVersion: 'wrong' },
-      { reviewVersion, rejectionReason: '사유' },
-      { reviewVersion, rejectionReason: null },
+      ...[undefined, null, '', ' \n ', 1, [], '가'.repeat(151)].map(
+        (rejectionReason) => ({ reviewVersion, rejectionReason }),
+      ),
       { reviewVersion, finalAmount: 100 },
       { reviewVersion, status: 'approved' },
-    ]) {
+    ])
       await reject(input).expect(400);
-    }
-    const result = await reject({ reviewVersion }).expect(200);
+    expect((await snapshot()).status).toBe('pending');
+    const rejectionReason = '가'.repeat(148) + '\n나';
+    const result = await reject({
+      reviewVersion,
+      rejectionReason: `  ${rejectionReason}  `,
+    }).expect(200);
     const body = result.body as AdminMileageResponseDto;
     expect(body).toMatchObject({
       status: 'rejected',
-      rejectionReason: null,
+      rejectionReason,
       finalAmount: null,
       mileageAmount: null,
       settlementId: null,
       reviewVersion,
     });
     expect(Date.parse(body.decidedAt!)).toBeLessThanOrEqual(Date.now());
-    await reject({ reviewVersion }).expect(200).expect(body);
+    await reject({ reviewVersion, rejectionReason }).expect(200).expect(body);
+    await reject({ reviewVersion, rejectionReason: '다른 사유' }).expect(409);
     expect(await snapshot()).toEqual(body);
+    const token = randomBytes(32).toString('base64url');
+    const now = new Date();
+    database.db
+      .insert(authSessions)
+      .values({
+        tokenHash: createHash('sha256').update(token).digest('hex'),
+        userId,
+        createdAt: now,
+        lastUsedAt: now,
+        expiresAt: new Date(now.getTime() + 600000),
+      })
+      .run();
+    const detail = await request(app.getHttpServer())
+      .get(`/api/v1/mileage/applications/${applicationId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(detail.body).toMatchObject({ status: 'rejected', rejectionReason });
   });
 
-  it('preserves a historical rejection reason and decision timestamp on reasonless replay', async () => {
+  it('preserves historical reasons and prevents rewriting an existing rejection', async () => {
     database.db
       .update(mileageApplications)
       .set({
@@ -683,9 +706,13 @@ describe('Admin mileage reads and review (e2e)', () => {
       .where(eq(mileageApplications.id, applicationId))
       .run();
     const before = await snapshot();
-    await reject({ reviewVersion: before.reviewVersion })
+    await reject({
+      reviewVersion: before.reviewVersion,
+      rejectionReason: '과거 사유',
+    })
       .expect(200)
       .expect(before);
+    await reject({ reviewVersion: before.reviewVersion }).expect(409);
     expect(await snapshot()).toEqual(before);
   });
 
@@ -696,7 +723,7 @@ describe('Admin mileage reads and review (e2e)', () => {
       const body =
         action === 'approve'
           ? { reviewVersion, finalAmount: 10000, liters: '5' }
-          : { reviewVersion };
+          : { reviewVersion, rejectionReason: '금액 불일치' };
       const send = action === 'approve' ? approve : reject;
       const token = randomBytes(32).toString('base64url');
       const now = new Date();
@@ -750,7 +777,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     },
   );
 
-  it('serializes identical reasonless rejections and preserves the first decision', async () => {
+  it('serializes identical rejections and preserves the first decision', async () => {
     const { reviewVersion } = await snapshot();
     const secondAdmin = seedAdminSession(database);
     const responses = await Promise.all(
@@ -902,6 +929,10 @@ describe('Admin mileage reads and review (e2e)', () => {
     ).toContain('image/jpeg');
     expect(document.paths[URL + '/{id}/reject']?.post).toBeDefined();
     expect(document.paths[URL + '/{id}/approve']?.post).toBeDefined();
+    expect(document.components?.schemas?.RejectAdminMileageDto).toMatchObject({
+      required: ['reviewVersion', 'rejectionReason'],
+      properties: { rejectionReason: { minLength: 1, maxLength: 150 } },
+    });
     expect(document.components?.schemas?.ApproveAdminMileageDto).toMatchObject({
       required: ['reviewVersion', 'finalAmount', 'liters'],
     });

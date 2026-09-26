@@ -414,6 +414,7 @@ describe('Mileage applications (e2e)', () => {
     await resubmit(original, firstKey, receipt).expect(200);
     const admin = app.get(AdminMileageService);
     admin.reject(original.id, {
+      rejectionReason: '금액 불일치',
       reviewVersion: admin.detail(original.id).reviewVersion,
     });
     const next = (await get(`${URL}/${original.id}`).expect(200))
@@ -433,7 +434,7 @@ describe('Mileage applications (e2e)', () => {
         .all(),
     ).toEqual([
       { previous_rejection_reason: '기존에 저장된 사유' },
-      { previous_rejection_reason: null },
+      { previous_rejection_reason: '금액 불일치' },
     ]);
   });
 
@@ -579,6 +580,7 @@ describe('Mileage applications (e2e)', () => {
     );
     expect(() =>
       admin.reject(original.id, {
+        rejectionReason: '금액 불일치',
         reviewVersion,
       }),
     ).toThrow();
@@ -658,6 +660,7 @@ describe('Mileage applications (e2e)', () => {
     expect(admin.detail(first.id).photos.meter).toBeTruthy();
     const reject = () =>
       admin.reject(first.id, {
+        rejectionReason: '금액 불일치',
         reviewVersion: admin.detail(first.id).reviewVersion,
       });
     reject();

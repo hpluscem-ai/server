@@ -148,4 +148,8 @@ The evaluator flags matching but incorrect totals, incorrect liters/time, unsafe
 
 A rejected application can change modes. Switching to single requires a new combined receipt image. Switching from single to separate requires both new images. Staying separate still allows replacing either image. Existing files are retained; idempotency, source versions, ownership and settlement guards remain in force.
 
+### Administrator rejection reason
+
+`POST /api/v1/admin/mileage/applications/:id/reject` requires `{ reviewVersion, rejectionReason }`. The reason is trimmed and must contain 1–150 characters. It is stored in the existing `rejection_reason` column and returned to the driver's detail view. Replaying the same version and reason preserves the decision timestamp; a different reason returns `409 MILEAGE_REVIEW_CONFLICT`. Existing historical reasons remain unchanged. Deploy the administrator form and API together; older clients that omit the reason receive a validation error. No database migration is required.
+
 Database v11 adds the mode and a second Luna reservation timestamp, preserving existing applications as separate. Start the updated server to apply the migration. Configure `OPENAI_API_KEY`, `MILEAGE_OCR_ENABLED=true` and an approved positive `MILEAGE_OCR_LUNA_DAILY_LIMIT` to enable new OCR jobs. Automatic approval remains independently gated; timezone policy is unchanged. The benchmark performs one pass only; the production worker handles mirrored correction.
