@@ -315,13 +315,17 @@ export class AuthController {
   @ApiOperation({
     summary: 'SMS 인증 후 비밀번호 재설정 메일 요청',
     description:
-      'reset_password 목적·이메일·연락처에 묶인 증명을 발송 전에 한 번 소비합니다. 활성 기사·소속의 일치 계정에만 Resend로 발송하며 계정 불일치도 동일한 접수 응답입니다. 설정 누락·발송 실패·저장 오류는 성공으로 바꾸지 않습니다. Resend 접수 후 30분 링크를 활성화하고 이전 링크를 무효화합니다. 메일 실패 시 기존 링크를 유지하고 재요청은 SMS 재인증이 필요합니다. 토큰 원문을 반환하지 않고 실제 배달 완료를 보장하지 않습니다.',
+      'reset_password 목적·이메일·연락처에 묶인 증명을 발송 전에 한 번 소비합니다. 활성 기사·소속의 일치 계정에만 Resend로 발송하며 불일치는 404로 안내합니다. 설정 누락·발송 실패·저장 오류는 성공으로 바꾸지 않습니다. Resend 접수 후 30분 링크를 활성화하고 이전 링크를 무효화합니다. 메일 실패 시 기존 링크를 유지하고 재요청은 SMS 재인증이 필요합니다. 토큰 원문을 반환하지 않고 실제 배달 완료를 보장하지 않습니다.',
   })
   @ApiAcceptedResponse({ type: PasswordResetEmailResponseDto })
   @ApiBadRequestResponse({
     type: ApiErrorResponseDto,
     description:
       'VALIDATION_ERROR | PHONE_VERIFICATION_INVALID | PASSWORD_RESET_REQUEST_INVALID',
+  })
+  @ApiNotFoundResponse({
+    type: ApiErrorResponseDto,
+    description: 'ACCOUNT_NOT_FOUND',
   })
   @ApiServiceUnavailableResponse({
     type: ApiErrorResponseDto,

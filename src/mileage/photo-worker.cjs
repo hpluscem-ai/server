@@ -23,6 +23,8 @@ function identify(data) {
     data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
   )
     return 'image/png';
+  if (data.length >= 12 && data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP')
+    return 'image/webp';
   if (data.length >= 16 && data.toString('ascii', 4, 8) === 'ftyp') {
     const size = data.readUInt32BE(0);
     if (size >= 16 && size <= data.length && size <= 4096) {
@@ -83,7 +85,7 @@ function identify(data) {
   });
   const metadata = await decoder.metadata();
   checkSize(metadata.width, metadata.height);
-  if (!['jpeg', 'png'].includes(metadata.format))
+  if (!['jpeg', 'png', 'webp'].includes(metadata.format) || (metadata.pages ?? 1) > 1)
     throw new Error('UNSUPPORTED_PHOTO_TYPE');
   const output = await decoder
     .autoOrient()

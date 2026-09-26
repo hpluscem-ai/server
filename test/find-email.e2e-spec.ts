@@ -144,9 +144,10 @@ describe('Find email (e2e)', () => {
   });
 
   it.each([
-    ['a@example.com', '*@example.com'],
-    ['ab@example.com', '**@example.com'],
+    ['a@example.com', 'a@example.com'],
+    ['ab@example.com', 'ab@example.com'],
     ['abc@example.com', 'ab*@example.com'],
+    ['abcd@example.com', 'ab**@example.com'],
   ])('masks %s', async (email, maskedEmail) => {
     database.db.update(users).set({ email }).where(eq(users.id, userId)).run();
     expect((await find(proof().value).expect(200)).body).toEqual({

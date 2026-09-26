@@ -229,7 +229,7 @@ export class AuthRepository {
           if (!validSession) throw new LoginUnavailableError();
           if (!user) throw new PhoneVerificationInvalidError();
         }
-        // 계정 불일치도 같은 접수 응답을 반환하지만 증명은 재사용할 수 없다.
+        // 계정 불일치도 증명은 소비하며 서비스가 조회 실패로 안내한다.
         if (user && user.passwordHash === null)
           throw new Error('Active driver password invariant violated');
         return user?.passwordHash

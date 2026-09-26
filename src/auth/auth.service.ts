@@ -149,9 +149,9 @@ export class AuthService {
     }
     const at = email.lastIndexOf('@');
     const local = Array.from(email.slice(0, at));
-    const visible = local.length > 2 ? local.slice(0, 2).join('') : '';
+    const visible = local.slice(0, Math.min(local.length, 2)).join('');
     return {
-      maskedEmail: `${visible}${'*'.repeat(local.length - (local.length > 2 ? 2 : 0))}${email.slice(at)}`,
+      maskedEmail: `${visible}${'*'.repeat(local.length - visible.length)}${email.slice(at)}`,
       phoneLastFour: input.phone.slice(-4),
     };
   }
@@ -234,7 +234,12 @@ export class AuthService {
       this.throwIfDomainError(error);
       throw error;
     }
-    if (!recipient) return;
+    if (!recipient) {
+      throw new NotFoundException({
+        code: 'ACCOUNT_NOT_FOUND',
+        message: '일치하는 회원정보를 찾을 수 없습니다.',
+      });
+    }
     const token = randomBytes(32).toString('base64url');
     await this.emailService.sendPasswordReset(
       configuration,

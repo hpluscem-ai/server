@@ -721,6 +721,28 @@ describe('Mileage applications (e2e)', () => {
       expect(Math.abs(pixel[index] - expected)).toBeLessThanOrEqual(8);
   });
 
+  it('accepts a static WebP image and stores a normalized JPEG', async () => {
+    const webp = await sharp(receipt).webp().toBuffer();
+    const result = (await submit(webp).expect(201)).body as MileageDetailDto;
+    const output = storage.objects.get(`mileage/${result.id}/receipt.jpg`)!;
+    expect((await sharp(output).metadata()).format).toBe('jpeg');
+  });
+
+  it('rejects animated WebP before storing an application', async () => {
+    const frames = await Promise.all(
+      ['red', 'blue'].map((background) =>
+        sharp({ create: { width: 8, height: 8, channels: 3, background } })
+          .png()
+          .toBuffer(),
+      ),
+    );
+    const animated = await sharp(frames, { join: { animated: true } })
+      .webp()
+      .toBuffer();
+    await submit(animated).expect(415);
+    expect(storage.writes).toBe(0);
+  });
+
   it('shrinks the long edge to 4096 without upscaling smaller photos', async () => {
     const large = await sharp({
       create: { width: 5000, height: 10, channels: 3, background: '#123456' },

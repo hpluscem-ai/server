@@ -460,7 +460,7 @@ describe('Resend password reset email (e2e)', () => {
     'wrong_phone',
     'wrong_email',
   ])(
-    'returns the same generic acceptance for %s, without sending',
+    'reports no matching account for %s after SMS verification, without sending',
     async (kind) => {
       if (kind === 'absent') database.db.delete(users).run();
       else if (kind === 'inactive_company')
@@ -479,9 +479,9 @@ describe('Resend password reset email (e2e)', () => {
           )
           .run();
       const item = proof();
-      expect((await send(item.value).expect(202)).body).toEqual({
-        message:
-          '요청을 접수했습니다. 입력한 정보와 일치하는 계정이 있다면 메일을 확인해 주세요.',
+      expect((await send(item.value).expect(404)).body).toMatchObject({
+        code: 'ACCOUNT_NOT_FOUND',
+        message: '일치하는 회원정보를 찾을 수 없습니다.',
       });
       expect(storedProof(item.id).consumedAt).not.toBeNull();
       expect(fetchMock).not.toHaveBeenCalled();
@@ -805,6 +805,7 @@ describe('Resend password reset email (e2e)', () => {
     expect(Object.keys(docs.paths[path].post!.responses).sort()).toEqual([
       '202',
       '400',
+      '404',
       '500',
       '502',
       '503',
