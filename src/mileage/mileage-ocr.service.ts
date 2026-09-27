@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import sharp from 'sharp';
 
 export const OCR_VERSION = 'gpt-6-luna-photos-v2';
 export type ReceiptReading = {
@@ -119,6 +120,36 @@ export class MileageOcrService {
     const key = process.env.OPENAI_API_KEY?.trim();
     if (!key) throw new OcrFailure('LUNA_NOT_CONFIGURED');
     const started = Date.now();
+    const imageContent = [];
+    try {
+      // Resize only the outgoing copy, one image at a time to bound decoder memory.
+      for (let image of images) {
+        const decoder = sharp(image, {
+          limitInputPixels: 60000000,
+          failOn: 'warning',
+        });
+        const { width, height } = await decoder.metadata();
+        if (Math.max(width, height) > 2048)
+          image = await decoder
+            .autoOrient()
+            .resize({
+              width: 2048,
+              height: 2048,
+              fit: 'inside',
+              withoutEnlargement: true,
+            })
+            .jpeg({ quality: 90 })
+            .timeout({ seconds: 25 })
+            .toBuffer();
+        imageContent.push({
+          type: 'input_image',
+          image_url: 'data:image/jpeg;base64,' + image.toString('base64'),
+          detail: 'high',
+        });
+      }
+    } catch {
+      throw new OcrFailure('LUNA_INVALID_INPUT');
+    }
     let response: Response;
     try {
       response = await fetch('https://api.openai.com/v1/responses', {
@@ -140,11 +171,7 @@ export class MileageOcrService {
             },
             {
               role: 'user',
-              content: images.map((image) => ({
-                type: 'input_image',
-                image_url: 'data:image/jpeg;base64,' + image.toString('base64'),
-                detail: 'high',
-              })),
+              content: imageContent,
             },
           ],
           text: {

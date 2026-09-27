@@ -8,6 +8,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import sharp from 'sharp';
 import { evaluateReading } from '../../scripts/benchmark-mileage-ocr';
 import {
   amountValue,
@@ -126,11 +127,33 @@ describe('mileage OCR', () => {
       }) as typeof fetch;
     };
     const service = new MileageOcrService();
-    for (const count of [1, 2]) {
-      respond(good({ ...reading, mirroredImages: Array(count).fill(false) }));
-      const result = await service.readApplication(
-        Array(count).fill(Buffer.from('private')) as Buffer[],
+    const smallImage = await sharp({
+      create: { width: 32, height: 16, channels: 3, background: 'white' },
+    })
+      .jpeg()
+      .toBuffer();
+    for (const sizes of [
+      [[32, 16]],
+      [
+        [4096, 2048],
+        [2048, 4096],
+      ],
+      [
+        [4096, 4096],
+        [2048, 1024],
+      ],
+    ]) {
+      const images = await Promise.all(
+        sizes.map(([width, height]) =>
+          sharp({ create: { width, height, channels: 3, background: 'white' } })
+            .jpeg({ quality: 90 })
+            .toBuffer(),
+        ),
       );
+      const savedImages = images.map((image) => Buffer.from(image));
+      const count = images.length;
+      respond(good({ ...reading, mirroredImages: Array(count).fill(false) }));
+      const result = await service.readApplication(images);
       expect(result.reading.receipt.amountText).toBe('158');
       expect(result.usage).toMatchObject({
         inputTokens: 1200,
@@ -146,29 +169,46 @@ describe('mileage OCR', () => {
       const body = JSON.parse(options.body as string) as {
         model: string;
         store: boolean;
-        input: { content: unknown[] }[];
+        input: { content: { image_url: string; detail: string }[] }[];
       };
       expect(body).toMatchObject({ model: 'gpt-6-luna', store: false });
       expect(body.input[1].content).toHaveLength(count);
       expect(JSON.stringify(body)).not.toContain('https://storage');
+      for (const [index, [width, height]] of sizes.entries()) {
+        const content = body.input[1].content[index];
+        expect(content.detail).toBe('high');
+        expect(content.image_url).toMatch(/^data:image\/jpeg;base64,/);
+        const sentImage = Buffer.from(
+          content.image_url.split(',')[1],
+          'base64',
+        );
+        const scale = Math.min(1, 2048 / Math.max(width, height));
+        expect(await sharp(sentImage).metadata()).toMatchObject({
+          format: 'jpeg',
+          width: Math.round(width * scale),
+          height: Math.round(height * scale),
+        });
+        if (scale === 1) expect(sentImage).toEqual(savedImages[index]);
+        expect(images[index]).toEqual(savedImages[index]);
+      }
     }
     respond({ ...good(), status: 'incomplete' });
-    await expect(
-      service.readApplication([Buffer.from('x')]),
-    ).rejects.toMatchObject({ code: 'LUNA_INCOMPLETE' });
+    await expect(service.readApplication([smallImage])).rejects.toMatchObject({
+      code: 'LUNA_INCOMPLETE',
+    });
     respond({ ...good(), output: [{ content: [{ type: 'refusal' }] }] });
-    await expect(
-      service.readApplication([Buffer.from('x')]),
-    ).rejects.toMatchObject({ code: 'LUNA_REFUSAL' });
+    await expect(service.readApplication([smallImage])).rejects.toMatchObject({
+      code: 'LUNA_REFUSAL',
+    });
     for (const invalid of [
       { ...reading, mirroredImages: [] },
       { ...reading, receipt: {} },
       { ...reading, extra: 1 },
     ]) {
       respond(good(invalid));
-      await expect(
-        service.readApplication([Buffer.from('x')]),
-      ).rejects.toMatchObject({ code: 'LUNA_INVALID_RESPONSE' });
+      await expect(service.readApplication([smallImage])).rejects.toMatchObject(
+        { code: 'LUNA_INVALID_RESPONSE' },
+      );
     }
     respond(
       good({
@@ -178,12 +218,17 @@ describe('mileage OCR', () => {
         mirroredImages: [null],
       }),
     );
-    const uncertain = await service.readApplication([Buffer.from('x')]);
+    const uncertain = await service.readApplication([smallImage]);
     expect(uncertain.reading.meter.litersText).toBeNull();
     expect(uncertain.reading.receipt.issues).toContain('REPRINT_UNCLEAR');
     expect(uncertain.reading.meter.issues).toContain(
       'IMAGE_ORIENTATION_UNCERTAIN',
     );
+    respond(good());
+    await expect(
+      service.readApplication([Buffer.from('invalid image')]),
+    ).rejects.toMatchObject({ code: 'LUNA_INVALID_INPUT' });
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -501,8 +546,17 @@ describe('OCR benchmark approval truth', () => {
 
 describe('benchmark CLI without external calls', () => {
   let folder: string;
-  beforeEach(() => {
+  beforeEach(async () => {
     folder = mkdtempSync(join(tmpdir(), 'hplus-ocr-benchmark-'));
+    for (const [name, background] of [
+      ['receipt', 'white'],
+      ['meter', 'black'],
+    ])
+      await sharp({
+        create: { width: 32, height: 16, channels: 3, background },
+      })
+        .jpeg()
+        .toFile(join(folder, name + '.jpg'));
   });
   afterEach(() => {
     rmSync(folder, { recursive: true, force: true });
@@ -530,8 +584,6 @@ describe('benchmark CLI without external calls', () => {
   function setup() {
     const receiptPath = join(folder, 'receipt.jpg'),
       meterPath = join(folder, 'meter.jpg');
-    writeFileSync(receiptPath, 'synthetic receipt');
-    writeFileSync(meterPath, 'synthetic meter');
     const item = {
       id: 'one',
       receiptPath,
