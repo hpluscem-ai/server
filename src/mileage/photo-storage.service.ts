@@ -1,6 +1,6 @@
 import {
   Injectable,
-  OnModuleDestroy,
+  OnApplicationShutdown,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import {
@@ -15,7 +15,7 @@ import { Readable } from 'node:stream';
 export const MAX_PHOTO_BYTES = 50 * 1024 * 1024;
 
 @Injectable()
-export class PhotoStorageService implements OnModuleDestroy {
+export class PhotoStorageService implements OnApplicationShutdown {
   private client?: S3Client;
   private bucket?: string;
 
@@ -138,7 +138,7 @@ export class PhotoStorageService implements OnModuleDestroy {
     }
   }
 
-  onModuleDestroy(): void {
+  onApplicationShutdown(): void {
     this.client?.destroy();
   }
 

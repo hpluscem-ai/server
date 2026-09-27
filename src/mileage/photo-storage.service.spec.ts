@@ -38,7 +38,7 @@ describe('PhotoStorageService', () => {
     storage = new PhotoStorageService();
   });
   afterEach(() => {
-    storage.onModuleDestroy();
+    storage.onApplicationShutdown();
     names.forEach((name, i) => {
       if (previous[i] === undefined) delete process.env[name];
       else process.env[name] = previous[i];

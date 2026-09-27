@@ -282,6 +282,10 @@ export const mileageOcrJobs = appSchema.table('mileage_ocr_jobs', {
   errorCode: text('error_code'),
   createdAt: createdAt(),
   startedAt: text('started_at'),
+  leaseExpiresAt: timestamp('lease_expires_at', {
+    withTimezone: true,
+    mode: 'date',
+  }),
   finishedAt: text('finished_at'),
 });
 

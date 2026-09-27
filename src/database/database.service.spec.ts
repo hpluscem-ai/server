@@ -11,7 +11,7 @@ describe('DatabaseService', () => {
   });
 
   afterEach(async () => {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
   });
 
   it('creates the PostgreSQL schema and enforces foreign keys', async () => {
@@ -129,7 +129,7 @@ describe('DatabaseService', () => {
       expect(database.connection.options.ssl).toBe(false);
       expect(remote.connection.options.prepare).toBe(false);
     } finally {
-      await remote.onModuleDestroy();
+      await remote.onApplicationShutdown();
     }
   });
 
@@ -137,6 +137,9 @@ describe('DatabaseService', () => {
     await database.connection`
       insert into app.users (id, role, email, password_hash, name)
       values ('preserved-admin', 'admin', 'preserved@example.com', 'hash', '관리자')
+    `;
+    const before = await database.connection`
+      select id from app.__drizzle_migrations
     `;
     await migrateDatabase(database.connection);
     const rows = await database.connection`
@@ -146,7 +149,109 @@ describe('DatabaseService', () => {
     const migrations = await database.connection`
       select id from app.__drizzle_migrations
     `;
-    expect(migrations).toHaveLength(1);
+    expect(migrations).toHaveLength(before.length);
+  });
+
+  it('adds nullable OCR leases without changing existing OCR records', async () => {
+    const [latest] = await database.connection<{ id: number }[]>`
+      select id from app.__drizzle_migrations order by id desc limit 1
+    `;
+    if (!latest) throw new Error('expected baseline migration');
+    await database.connection.unsafe(
+      'alter table app.mileage_ocr_jobs drop column lease_expires_at',
+    );
+    await database.connection`
+      delete from app.__drizzle_migrations where id = ${latest.id}
+    `;
+    await database.connection.unsafe(`
+      insert into app.logistics_companies (
+        id, business_name, business_number, corporate_registration_number,
+        business_address, manager_name, manager_phone, bank_code, account_number, account_holder
+      ) values ('lease-company', '회사', '123', '456', '주소', '담당자', '010', '001', '1234', '예금주');
+      insert into app.users (
+        id, role, email, password_hash, name, phone, logistics_company_id,
+        service_terms_consent, privacy_terms_consent
+      ) values ('lease-driver', 'driver', 'lease@example.com', 'hash', '기사', '01012345678', 'lease-company', true, true);
+      insert into app.mileage_applications (id, user_id, logistics_company_id, idempotency_key)
+      values ('lease-application', 'lease-driver', 'lease-company', 'lease-key');
+      insert into app.mileage_ocr_jobs (
+        id, application_id, source_version, extractor_version, status,
+        luna_reserved_at, luna_retry_reserved_at, result_json, error_code
+      ) values
+        ('lease-queued', 'lease-application', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'extractor', 'queued', null, null, null, null),
+        ('lease-running', 'lease-application', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'extractor', 'running', '2026-09-27T00:00:00.000Z', null, null, null),
+        ('lease-completed', 'lease-application', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'extractor', 'completed', '2026-09-27T00:01:00.000Z', '2026-09-27T00:02:00.000Z', '{"provider":"paid"}'::jsonb, 'LUNA_HTTP');
+    `);
+    const before = await database.connection<
+      {
+        id: string;
+        status: string;
+        luna_reserved_at: string | null;
+        luna_retry_reserved_at: string | null;
+        result_json: string | null;
+        error_code: string | null;
+      }[]
+    >`
+      select id, status, luna_reserved_at, luna_retry_reserved_at,
+             result_json::text as result_json, error_code
+      from app.mileage_ocr_jobs
+      order by id
+    `;
+
+    await migrateDatabase(database.connection);
+    const afterFirstMigration = await database.connection`
+      select id from app.__drizzle_migrations order by id
+    `;
+    await migrateDatabase(database.connection);
+
+    const [column] = await database.connection<
+      { is_nullable: string; data_type: string }[]
+    >`
+      select is_nullable, data_type
+      from information_schema.columns
+      where table_schema = 'app'
+        and table_name = 'mileage_ocr_jobs'
+        and column_name = 'lease_expires_at'
+    `;
+    expect(column).toEqual({
+      is_nullable: 'YES',
+      data_type: 'timestamp with time zone',
+    });
+    const after = await database.connection<
+      {
+        id: string;
+        status: string;
+        luna_reserved_at: string | null;
+        luna_retry_reserved_at: string | null;
+        result_json: string | null;
+        error_code: string | null;
+        lease_expires_at: Date | null;
+      }[]
+    >`
+      select id, status, luna_reserved_at, luna_retry_reserved_at,
+             result_json::text as result_json, error_code, lease_expires_at
+      from app.mileage_ocr_jobs
+      order by id
+    `;
+    expect(
+      after.map((record) => ({
+        id: record.id,
+        status: record.status,
+        luna_reserved_at: record.luna_reserved_at,
+        luna_retry_reserved_at: record.luna_retry_reserved_at,
+        result_json: record.result_json,
+        error_code: record.error_code,
+      })),
+    ).toEqual(before);
+    expect(after.map(({ lease_expires_at }) => lease_expires_at)).toEqual([
+      null,
+      null,
+      null,
+    ]);
+    const migrations = await database.connection`
+      select id from app.__drizzle_migrations order by id
+    `;
+    expect(migrations).toEqual(afterFirstMigration);
   });
 
   it('rejects the Supabase transaction pooler that cannot preserve query pipelining', () => {
@@ -173,7 +278,7 @@ describe('DatabaseService', () => {
     } finally {
       if (previous === undefined) delete process.env.VERCEL;
       else process.env.VERCEL = previous;
-      await remote.onModuleDestroy();
+      await remote.onApplicationShutdown();
     }
   });
 });

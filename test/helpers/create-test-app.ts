@@ -31,7 +31,7 @@ export async function createTestApp(
     return app;
   } catch (error) {
     await app?.close();
-    if (!app) await testDatabase.onModuleDestroy();
+    if (!app) await testDatabase.onApplicationShutdown();
     throw error;
   }
 }

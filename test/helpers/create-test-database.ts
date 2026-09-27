@@ -16,10 +16,10 @@ class TestDatabaseService extends DatabaseService {
     super(databaseUrl);
   }
 
-  override async onModuleDestroy() {
+  override async onApplicationShutdown() {
     if (this.closed) return;
     this.closed = true;
-    await super.onModuleDestroy();
+    await super.onApplicationShutdown();
 
     const admin = postgres(this.adminDatabaseUrl, { prepare: false, max: 1 });
     try {
@@ -57,7 +57,7 @@ export async function createTestDatabase(): Promise<DatabaseService> {
     await migrateDatabase(database.connection);
     return database;
   } catch (error) {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
     throw error;
   }
 }

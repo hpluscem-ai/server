@@ -111,7 +111,7 @@ describe('Admin mileage reads and review (e2e)', () => {
   });
   afterEach(async () => {
     await app?.close();
-    await database?.onModuleDestroy();
+    await database?.onApplicationShutdown();
   });
 
   async function addCompany() {
@@ -621,18 +621,13 @@ describe('Admin mileage reads and review (e2e)', () => {
   async function ocrJob() {
     const repository = app.get(MileageRepository);
     const record = (await repository.findOne(userId, applicationId))!;
-    return (
-      await database.db
-        .insert(mileageOcrJobs)
-        .values({
-          id: randomUUID(),
-          applicationId,
-          sourceVersion: repository.submissionVersion(record),
-          extractorVersion: OCR_VERSION,
-          status: 'running',
-        })
-        .returning()
-    )[0];
+    await database.db.insert(mileageOcrJobs).values({
+      id: randomUUID(),
+      applicationId,
+      sourceVersion: repository.submissionVersion(record),
+      extractorVersion: OCR_VERSION,
+    });
+    return (await repository.claimOcrJob())!;
   }
 
   const reading = {

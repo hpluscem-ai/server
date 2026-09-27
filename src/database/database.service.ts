@@ -2,7 +2,7 @@ import { databaseSsl } from './connection-options';
 import {
   Inject,
   Injectable,
-  OnModuleDestroy,
+  OnApplicationShutdown,
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
@@ -13,7 +13,7 @@ import postgres, { type Sql } from 'postgres';
 export const DATABASE_URL = 'DATABASE_URL';
 
 @Injectable()
-export class DatabaseService implements OnModuleInit, OnModuleDestroy {
+export class DatabaseService implements OnApplicationShutdown, OnModuleInit {
   readonly connection: Sql;
   readonly db: PostgresJsDatabase;
 
@@ -38,7 +38,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     await this.db.execute(sql`select 1`);
   }
 
-  async onModuleDestroy() {
+  async onApplicationShutdown() {
     await this.connection.end({ timeout: 5 });
   }
 }

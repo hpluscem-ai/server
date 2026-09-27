@@ -1,6 +1,6 @@
 import sharp from 'sharp';
 import { randomUUID } from 'node:crypto';
-import { eq, or } from 'drizzle-orm';
+import { eq, or, sql } from 'drizzle-orm';
 import { DatabaseService } from '../database/database.service';
 import {
   logisticsCompanies,
@@ -113,9 +113,10 @@ describe('MileageOcrWorkerService', () => {
   });
 
   afterEach(async () => {
+    await worker?.onModuleDestroy();
     delete process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
     jest.useRealTimers();
-    if (database) await database.onModuleDestroy();
+    if (database) await database.onApplicationShutdown();
     delete process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT;
     delete process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT;
     jest.restoreAllMocks();
@@ -326,12 +327,11 @@ describe('MileageOcrWorkerService', () => {
     },
   );
 
-  it('reserves each provider once and stops at the daily call limit', async () => {
+  it('reserves each provider once under concurrent jobs at the daily call limit', async () => {
     process.env.MILEAGE_OCR_CLOVA_DAILY_LIMIT = '1';
     process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT = '1';
     await createApplication('b'.repeat(64));
-    await worker.processOne();
-    await worker.processOne();
+    await Promise.all([worker.processOne(), worker.processOne()]);
     expect(receiptCall).toHaveBeenCalledTimes(1);
     expect(meterCall).toHaveBeenCalledTimes(1);
     expect(
@@ -341,17 +341,155 @@ describe('MileageOcrWorkerService', () => {
     ).toEqual(['completed', 'failed']);
   });
 
-  it('keeps an interrupted running call unknown instead of recharging it', async () => {
+  it.each([true, false])(
+    'preserves another worker response when a second worker starts (enabled %s)',
+    async (enabled) => {
+      let release!: () => void;
+      const responseReady = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const requestSent = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const result = validResult();
+      const call = jest
+        .spyOn(ocr, 'readApplication')
+        .mockImplementation(async () => {
+          entered();
+          await responseReady;
+          return {
+            reading: {
+              receipt: result.receipt!,
+              meter: result.meter!,
+              mirroredImages: [false, false],
+            },
+            durationMs: 1,
+          };
+        });
+      const processing = worker.processOne();
+      await requestSent;
+      const secondOcr = new MileageOcrService();
+      jest.spyOn(secondOcr, 'isConfigured').mockReturnValue(enabled);
+      const secondCall = jest.spyOn(secondOcr, 'readApplication');
+      const secondWorker = new MileageOcrWorkerService(
+        new MileageRepository(database),
+        secondOcr,
+        { get: jest.fn() } as unknown as PhotoStorageService,
+      );
+      try {
+        await secondWorker.onModuleInit();
+        expect(
+          (await database.db.select().from(mileageOcrJobs))[0].status,
+        ).toBe('running');
+        release();
+        await processing;
+        expect(
+          (await database.db.select().from(mileageOcrJobs))[0].status,
+        ).toBe('completed');
+        expect(await application()).toMatchObject({
+          receiptAmount: 11700,
+          meterAmount: 11700,
+        });
+        expect(call).toHaveBeenCalledTimes(1);
+        expect(secondCall).not.toHaveBeenCalled();
+      } finally {
+        release();
+        await processing;
+        await secondWorker.onModuleDestroy();
+      }
+    },
+  );
+
+  it('claims distinct jobs concurrently and renews only a live database-clock lease', async () => {
+    await createApplication('b'.repeat(64));
+    const jobs = await Promise.all([
+      repository.claimOcrJob(),
+      repository.claimOcrJob(),
+    ]);
+    expect(new Set(jobs.map((job) => job!.id)).size).toBe(2);
+    for (const job of jobs) {
+      expect(
+        job!.leaseExpiresAt!.getTime() - Date.parse(job!.startedAt!),
+      ).toBeCloseTo(120000, -1);
+    }
+    const job = jobs[0]!;
+    await database.db
+      .update(mileageOcrJobs)
+      .set({ leaseExpiresAt: sql`clock_timestamp() + interval '20 seconds'` })
+      .where(eq(mileageOcrJobs.id, job.id));
+    expect(await repository.renewOcrLease(job.id)).toBe(true);
+    const [lease] = await database.connection<{ live: boolean }[]>`
+      select lease_expires_at > clock_timestamp() + interval '110 seconds' as live
+      from app.mileage_ocr_jobs where id = ${job.id}
+    `;
+    expect(lease.live).toBe(true);
+    await repository.interruptExpiredOcrJobs();
+    expect(
+      (await database.db.select().from(mileageOcrJobs)).every(
+        (row) => row.status === 'running',
+      ),
+    ).toBe(true);
+  });
+
+  it.each(['expired', 'legacy'])(
+    'blocks %s leases before cleanup from renewal, paid calls and late approval',
+    async (kind) => {
+      process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+      const job = (await repository.claimOcrJob())!;
+      await database.db
+        .update(mileageOcrJobs)
+        .set({
+          leaseExpiresAt:
+            kind === 'legacy'
+              ? null
+              : sql`clock_timestamp() - interval '1 second'`,
+        })
+        .where(eq(mileageOcrJobs.id, job.id));
+      expect(await repository.renewOcrLease(job.id)).toBe(false);
+      expect(await repository.ocrSource(job)).toBeNull();
+      expect(await repository.reserveOcrCall(job.id, 10)).toBe(false);
+      await repository.finishOcrJob(job, validResult());
+      expect(await application()).toMatchObject({
+        approvalStatus: 'pending',
+        receiptAmount: null,
+        mileageAmount: null,
+      });
+      await repository.interruptExpiredOcrJobs();
+      expect(
+        (await database.db.select().from(mileageOcrJobs))[0],
+      ).toMatchObject({
+        status: 'unknown',
+        errorCode: 'INTERRUPTED',
+        result: null,
+      });
+    },
+  );
+
+  it('keeps an expired paid call unknown and preserves its daily reservation', async () => {
     const job = (await repository.claimOcrJob())!;
     expect(await repository.reserveOcrCall(job.id, 10)).toBe(true);
-    await repository.interruptRunningOcrJobs();
+    const reserved = (await database.db.select().from(mileageOcrJobs))[0]
+      .lunaReservedAt;
+    await database.db
+      .update(mileageOcrJobs)
+      .set({ leaseExpiresAt: sql`clock_timestamp() - interval '1 second'` })
+      .where(eq(mileageOcrJobs.id, job.id));
+    expect(await repository.reserveOcrCall(job.id, 10, true)).toBe(false);
+    await repository.interruptExpiredOcrJobs();
+    await repository.finishOcrJob(job, validResult());
     expect(await worker.processOne()).toBe(false);
     expect(
       (await database.db.select().from(mileageOcrJobs).limit(1))[0],
     ).toMatchObject({
       status: 'unknown',
       errorCode: 'INTERRUPTED',
+      lunaReservedAt: reserved,
+      result: null,
     });
+    await createApplication('b'.repeat(64));
+    const next = (await repository.claimOcrJob())!;
+    expect(await repository.reserveOcrCall(next.id, 1)).toBe(false);
     expect(receiptCall).not.toHaveBeenCalled();
   });
 

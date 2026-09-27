@@ -11,7 +11,7 @@ describe('PostgreSQL settlement schema', () => {
   });
 
   afterEach(async () => {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
   });
 
   test('installs the immutable snapshot and completion records with their settlement protections', async () => {

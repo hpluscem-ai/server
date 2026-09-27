@@ -5,7 +5,11 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { MileageRepository, type OcrResult } from './mileage.repository';
+import {
+  MileageRepository,
+  type OcrJob,
+  type OcrResult,
+} from './mileage.repository';
 import {
   MileageOcrService,
   OcrFailure,
@@ -29,6 +33,8 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MileageOcrWorkerService.name);
   private timer?: NodeJS.Timeout;
   private draining?: Promise<void>;
+  private readonly running = new Set<Promise<void>>();
+  private stopping = false;
 
   constructor(
     private readonly repository: MileageRepository,
@@ -37,17 +43,17 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    // A previous process may have sent a paid request before its response was lost.
-    await this.repository.interruptRunningOcrJobs();
     if (!this.ocr.isConfigured()) return;
     this.timer = setInterval(() => void this.drain(), 5000);
     this.timer.unref();
-    void this.drain();
+    await this.drain();
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     await this.draining;
+    await Promise.all(this.running);
   }
 
   private drain(): Promise<void> {
@@ -60,21 +66,61 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
 
   private async runDrain(): Promise<void> {
     try {
-      while (await this.processOne()) continue;
+      if (this.stopping || !this.ocr.isConfigured()) return;
+      // A lost paid response must stay unknown, while healthy workers retain their leases.
+      await this.repository.interruptExpiredOcrJobs();
+      while (!this.stopping && this.running.size < 2) {
+        const runner = this.runWorker().finally(() => {
+          this.running.delete(runner);
+        });
+        this.running.add(runner);
+      }
+    } catch {
+      this.logger.error('Mileage OCR polling failed');
+    }
+  }
+
+  private async runWorker(): Promise<void> {
+    try {
+      while (!this.stopping && (await this.processOne())) continue;
     } catch {
       this.logger.error('Mileage OCR worker stopped after an internal error');
     }
   }
 
   async processOne(): Promise<boolean> {
-    if (!this.ocr.isConfigured()) return false;
+    if (this.stopping || !this.ocr.isConfigured()) return false;
     const job = await this.repository.claimOcrJob();
     if (!job) return false;
+    let renewing: Promise<void> | undefined;
+    const heartbeat = setInterval(() => {
+      if (renewing) return;
+      renewing = this.repository
+        .renewOcrLease(job.id)
+        .then(() => undefined)
+        .catch(() => {
+          this.logger.error('Mileage OCR lease renewal failed');
+        })
+        .finally(() => {
+          renewing = undefined;
+        });
+    }, 10000);
+    heartbeat.unref();
+    try {
+      await this.processJob(job);
+      return true;
+    } finally {
+      clearInterval(heartbeat);
+      await renewing;
+    }
+  }
+
+  private async processJob(job: OcrJob): Promise<void> {
     const result = emptyResult();
     const source = await this.repository.ocrSource(job);
     if (!source) {
       await this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
-      return true;
+      return;
     }
     let images: Buffer[];
     try {
@@ -85,11 +131,11 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
       );
     } catch {
       await this.repository.finishOcrJob(job, result, 'PHOTO_READ_FAILED');
-      return true;
+      return;
     }
     if (!(await this.repository.ocrSource(job))) {
       await this.repository.finishOcrJob(job, result, 'STALE_SOURCE');
-      return true;
+      return;
     }
     const lunaLimit = positiveLimit(process.env.MILEAGE_OCR_LUNA_DAILY_LIMIT);
     if (
@@ -97,7 +143,7 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
       !(await this.repository.reserveOcrCall(job.id, lunaLimit))
     ) {
       await this.repository.finishOcrJob(job, result, 'DAILY_LIMIT_REACHED');
-      return true;
+      return;
     }
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -138,7 +184,6 @@ export class MileageOcrWorkerService implements OnModuleInit, OnModuleDestroy {
       result.lunaError = errorCode(error, 'LUNA_FAILED');
     }
     await this.repository.finishOcrJob(job, result);
-    return true;
   }
 }
 

@@ -1,0 +1,1 @@
+ALTER TABLE "app"."mileage_ocr_jobs" ADD COLUMN "lease_expires_at" timestamp with time zone;

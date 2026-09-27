@@ -425,15 +425,20 @@ export class MileageRepository {
     });
   }
 
-  async interruptRunningOcrJobs(): Promise<void> {
+  async interruptExpiredOcrJobs(): Promise<void> {
     await this.database.db
       .update(ocrJobs)
       .set({
         status: 'unknown',
         errorCode: 'INTERRUPTED',
-        finishedAt: new Date().toISOString(),
+        finishedAt: utcClockNow(),
       })
-      .where(eq(ocrJobs.status, 'running'));
+      .where(
+        and(
+          eq(ocrJobs.status, 'running'),
+          sql`(${ocrJobs.leaseExpiresAt} IS NULL OR ${ocrJobs.leaseExpiresAt} <= clock_timestamp())`,
+        ),
+      );
   }
 
   async claimOcrJob(): Promise<OcrJob | undefined> {
@@ -459,7 +464,8 @@ export class MileageRepository {
           .update(ocrJobs)
           .set({
             status: 'running',
-            startedAt: new Date().toISOString(),
+            startedAt: utcClockNow(),
+            leaseExpiresAt: sql`clock_timestamp() + interval '2 minutes'`,
           })
           .where(and(eq(ocrJobs.id, job.id), eq(ocrJobs.status, 'queued')))
           .returning()
@@ -467,16 +473,40 @@ export class MileageRepository {
     });
   }
 
+  async renewOcrLease(jobId: string): Promise<boolean> {
+    const renewed = await this.database.db
+      .update(ocrJobs)
+      .set({ leaseExpiresAt: sql`clock_timestamp() + interval '2 minutes'` })
+      .where(
+        and(
+          eq(ocrJobs.id, jobId),
+          eq(ocrJobs.status, 'running'),
+          sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
+        ),
+      )
+      .returning({ id: ocrJobs.id });
+    return renewed.length === 1;
+  }
+
   async ocrSource(
     job: OcrJob,
   ): Promise<{ receiptKey: string; meterKey: string } | null> {
     return this.database.db.transaction(async (tx) => {
       const current = (
-        await tx.select().from(ocrJobs).where(eq(ocrJobs.id, job.id)).limit(1)
+        await tx
+          .select()
+          .from(ocrJobs)
+          .where(
+            and(
+              eq(ocrJobs.id, job.id),
+              eq(ocrJobs.status, 'running'),
+              sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
+            ),
+          )
+          .limit(1)
       )[0];
       if (
         !current ||
-        current.status !== 'running' ||
         current.applicationId !== job.applicationId ||
         current.sourceVersion !== job.sourceVersion ||
         current.extractorVersion !== job.extractorVersion ||
@@ -523,11 +553,20 @@ export class MileageRepository {
     if (!Number.isSafeInteger(lunaLimit) || lunaLimit <= 0) return false;
     return this.database.db.transaction(async (tx) => {
       const job = (
-        await tx.select().from(ocrJobs).where(eq(ocrJobs.id, jobId)).limit(1)
+        await tx
+          .select()
+          .from(ocrJobs)
+          .where(
+            and(
+              eq(ocrJobs.id, jobId),
+              eq(ocrJobs.status, 'running'),
+              sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
+            ),
+          )
+          .limit(1)
       )[0];
       if (
         !job ||
-        job.status !== 'running' ||
         job.extractorVersion !== OCR_VERSION ||
         (retry
           ? !job.lunaReservedAt || Boolean(job.lunaRetryReservedAt)
@@ -558,6 +597,7 @@ export class MileageRepository {
           and(
             eq(ocrJobs.id, jobId),
             eq(ocrJobs.status, 'running'),
+            sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
             retry
               ? isNull(ocrJobs.lunaRetryReservedAt)
               : isNull(ocrJobs.lunaReservedAt),
@@ -584,11 +624,20 @@ export class MileageRepository {
         sql`SELECT ${ocrJobs.id} FROM ${ocrJobs} WHERE ${ocrJobs.id} = ${job.id} FOR UPDATE`,
       );
       const current = (
-        await tx.select().from(ocrJobs).where(eq(ocrJobs.id, job.id)).limit(1)
+        await tx
+          .select()
+          .from(ocrJobs)
+          .where(
+            and(
+              eq(ocrJobs.id, job.id),
+              eq(ocrJobs.status, 'running'),
+              sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
+            ),
+          )
+          .limit(1)
       )[0];
       if (
         !current ||
-        current.status !== 'running' ||
         current.applicationId !== job.applicationId ||
         current.sourceVersion !== job.sourceVersion ||
         current.extractorVersion !== job.extractorVersion
@@ -747,7 +796,28 @@ export class MileageRepository {
         process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED === 'true'
           ? amounts
           : null;
-      const now = new Date().toISOString();
+      const now = utcClockNow();
+      const completed = await tx
+        .update(ocrJobs)
+        .set({
+          status: failed ? 'failed' : 'completed',
+          result,
+          errorCode: errorCode ?? result.clovaError ?? result.lunaError,
+          clovaDurationMs: result.clovaDurationMs,
+          lunaDurationMs: result.lunaDurationMs,
+          lunaInputTokens: result.lunaInputTokens,
+          lunaOutputTokens: result.lunaOutputTokens,
+          finishedAt: now,
+        })
+        .where(
+          and(
+            eq(ocrJobs.id, job.id),
+            eq(ocrJobs.status, 'running'),
+            sql`${ocrJobs.leaseExpiresAt} > clock_timestamp()`,
+          ),
+        )
+        .returning({ id: ocrJobs.id });
+      if (completed.length !== 1) return;
       if (stillCurrent && application) {
         const status = duplicate
           ? 'duplicate_suspected'
@@ -782,21 +852,12 @@ export class MileageRepository {
             ),
           );
       }
-      await tx
-        .update(ocrJobs)
-        .set({
-          status: failed ? 'failed' : 'completed',
-          result,
-          errorCode: errorCode ?? result.clovaError ?? result.lunaError,
-          clovaDurationMs: result.clovaDurationMs,
-          lunaDurationMs: result.lunaDurationMs,
-          lunaInputTokens: result.lunaInputTokens,
-          lunaOutputTokens: result.lunaOutputTokens,
-          finishedAt: now,
-        })
-        .where(and(eq(ocrJobs.id, job.id), eq(ocrJobs.status, 'running')));
     });
   }
+}
+
+function utcClockNow() {
+  return sql`to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
 }
 
 function photoVersion(

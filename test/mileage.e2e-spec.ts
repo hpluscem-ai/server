@@ -156,7 +156,7 @@ describe('Mileage applications (e2e)', () => {
   afterEach(() => jest.restoreAllMocks());
   afterAll(async () => {
     await app.close();
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
     if (previousOrigin === undefined) delete process.env.WEB_ORIGINS;
     else process.env.WEB_ORIGINS = previousOrigin;
   });
