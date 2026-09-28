@@ -36,7 +36,7 @@ $ pnpm install
 Local and deployed servers use PostgreSQL through Drizzle and `postgres`. Copy `.env.example` to `.env` and set `DATABASE_URL`; there is no local file database fallback. Existing Nest authentication and API contracts are unchanged; Supabase Auth and the browser Data API are not used.
 
 - Runtime: use the Supabase Session pooler URL (port 5432) with this Postgres.js driver. Supabase warns that Postgres.js pipelining is incompatible with its shared Transaction pooler (port 6543), which the server rejects. Vercel uses one connection per warm instance; a persistent server uses a pool of five. Prepared statements remain disabled. A persistent server can also use a Direct URL.
-- Remote runtime and migration connections require TLS with certificate and hostname verification; only loopback development connections use plaintext. The public Supabase Root 2021 CA from the official Dashboard download is bundled for Supabase database hosts. Other PostgreSQL hosts use Node's trusted roots; a private CA can be supplied with `NODE_EXTRA_CA_CERTS` before starting the process. Do not disable certificate verification.
+- Remote runtime and migration connections require TLS with certificate and hostname verification; only loopback development connections use plaintext. The public Supabase Root 2021 CA from the official Dashboard download is bundled for Supabase database hosts. Other PostgreSQL hosts use Node's trusted roots by default. Set `DATABASE_CA_CERT` to a private root CA PEM for Railway internal PostgreSQL; the runtime, migration command and transfer verifier share this setting. Supabase hosts continue using the bundled Supabase CA. Do not disable certificate verification.
 - Migrations: set `DATABASE_MIGRATION_URL` to a Direct or Session pooler connection, then run `pnpm db:migrate` before starting the server. Startup does not create or migrate tables. The initial migration targets an empty application schema; it does not import legacy data.
 - Application tables live in the private `app` schema. Do not expose this schema through the Supabase Data API or grant `anon` / `authenticated` access. Database credentials stay on the API server.
 - Tests: set `TEST_DATABASE_URL` to a dedicated local PostgreSQL database with permission to create databases. Each test application gets its own randomly named database, migrates it, and drops only that database on close. Tests never use `DATABASE_URL`.
@@ -51,6 +51,107 @@ pnpm exec jest --config test/jest-e2e.json --runInBand --watchman=false
 Keep existing database files and photo objects until a separate data transfer has reconciled record counts, financial totals, relationships and photo keys. Changing configuration does not transfer data. For a cutover, stop writes or reconcile changes made after the snapshot before switching the API connection.
 
 See the official [PostgreSQL connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres) and [S3 configuration guide](https://supabase.com/docs/guides/storage/s3/authentication).
+
+## Supabase DB → Railway DB 이전
+
+DB만 옮긴다. Supabase Storage의 버킷·사진 객체·`SUPABASE_S3_*`·`SUPABASE_STORAGE_BUCKET` 설정은 유지한다. DB 이전으로 사진이 복사되지 않으며, Storage를 쓰는 동안 Supabase 프로젝트를 삭제하지 않는다. 연결 주소·비밀번호 입력과 실제 운영 백업/복원은 운영자가 실행한다.
+
+### 연결 준비
+
+- Railway API와 PostgreSQL을 **같은 리전·프로젝트 환경**에 둔다. 서버의 `DATABASE_URL`과 `DATABASE_MIGRATION_URL`은 PostgreSQL의 내부 주소를 사용한다. 내부 DNS는 로컬 PC/빌드 단계에서 접근할 수 없으므로 마이그레이션은 해당 환경의 실행 단계에서 한다.
+- Railway 공식 SSL 이미지의 루트 인증서 **`/var/lib/postgresql/data/certs/root.crt` 내용만** API의 `DATABASE_CA_CERT`에 실제 여러 줄 PEM으로 설정한다. 개인 키(`root.key`, `server.key`)를 복사하지 않는다. 현재 공식 이미지의 서버 인증서에는 내부 호스트 SAN이 포함되지만 실제 배포 인증서도 확인한다. 인증서 갱신 시 신뢰 CA도 확인한다. 인증서 오류가 나면 검증을 끄지 말고 CA/호스트를 맞춘다.
+- API 인증/SMS/OCR/스토리지 관련 기존 비밀값은 유지한다. 복원 계정이 `app` 객체의 소유자가 되므로 런타임과 마이그레이션도 그 역할로 접속한다. 별도 역할을 쓸 때는 기존 RLS와 소유권 정책을 먼저 검토한다.
+- 백업 도구와 원본/대상 PostgreSQL major 버전을 확인한다. 우선 같은 major 버전으로 옮기며 대상이 더 오래된 버전이면 진행하지 않는다. 로컬에 해당 버전의 `pg_dump`, `pg_restore`, `psql`, Node 및 이 저장소의 `pnpm install` 의존성이 필요하다.
+
+2026-09-28 합성 DB로 PostgreSQL 17.11 → 18.6 이전도 검증했다. 클라이언트 18.6으로 현재 `app` 스키마를 덤프·복원한 뒤 전체 대조를 통과했다. PostgreSQL 18에서 추가된 NOT NULL 제약조건 카탈로그 행은 기존 열의 `attnotnull`로 비교하며, CHECK/FK의 적용 여부도 확인한다. 실제 운영 원본의 버전·확장과 데이터는 별도로 확인해야 한다.
+
+로컬 작업에서는 Railway DB 서비스로 인증된 SSH 터널을 연다. Railway CLI에 키를 등록한 뒤 대시보드의 **Copy Service Instance ID** 값을 사용한다(일반 Service ID와 다름). 별도 터미널에서 아래 연결을 유지한다. 15432는 비어 있는 로컬 포트여야 한다.
+
+```sh
+ssh -N -L 127.0.0.1:15432:127.0.0.1:5432 "${RAILWAY_DB_INSTANCE_ID:?}@ssh.railway.com"
+```
+
+운영자는 작업 터미널에 다음 환경변수를 직접 설정한다. 값을 채팅·Git·공유 로그에 붙이지 않는다. URL에 `sslmode` 등 연결 옵션을 넣지 않는다.
+
+| 변수 | 용도 |
+| --- | --- |
+| `SOURCE_DATABASE_URL` | Supabase Direct 또는 Session pooler(5432) URL |
+| `TARGET_DATABASE_URL` | Railway 계정/DB를 사용하되 호스트 `127.0.0.1`, 포트 `15432`인 터널 URL |
+
+PostgreSQL 도구용으로 저장소 밖에 권한 `0600`인 연결 서비스 파일을 준비하고, 그 절대 경로를 `PGSERVICEFILE`로 설정한다. 아래 빈 값은 운영자가 채운다. `source`/`target`은 위 URL과 각각 같은 DB여야 한다. 비밀번호는 URL 인코딩하지 않은 실제 값을 입력한다. 명령 인수에 비밀번호가 들어간 URL을 전달하지 않는다.
+
+```ini
+[source]
+host=
+port=5432
+dbname=
+user=
+password=
+sslmode=verify-full
+sslrootcert=
+
+[target]
+host=127.0.0.1
+port=15432
+dbname=
+user=
+password=
+sslmode=disable
+```
+
+`source.sslrootcert`에는 Supabase 대시보드에서 받은 루트 인증서 파일의 절대 경로를 넣는다. 아래 복원 명령의 `sslmode=disable`은 이 **인증된 SSH 터널의 루프백 연결에만** 해당한다. 운영 API의 Railway 내부 연결은 위의 `DATABASE_CA_CERT`로 TLS 및 호스트 이름을 검증한다. 공개 TCP 프록시로 바꾸거나 인증서 검증을 생략하는 용도로 사용하지 않는다.
+
+### 쓰기 중지 → 최종 백업 → 빈 DB 복원
+
+먼저 별도 빈 DB에 리허설한다. 복사본에 연결된 API/OCR 워커는 시작하지 않는다. 최종 전환 때는 아래 순서를 지킨다.
+
+1. 새 요청을 막고 현재 업로드·OCR 처리·정산 작업이 끝날 때까지 기다린다. Vercel, Railway, 로컬 등 원본에 연결하는 모든 API/워커를 중지한다. 조회 API도 세션의 `last_used_at`을 갱신하므로 GET 요청까지 멈춰야 한다.
+2. 중지 상태에서 아래 최종 백업을 만든다. `app` 스키마 전체를 복사하므로 세션·OCR 대기 작업·사진 키·정산 트리거·시퀀스·`__drizzle_migrations`도 포함된다. Supabase의 `auth`/`storage` 스키마와 시스템 역할은 복사하지 않는다.
+3. 대상은 `app` 스키마가 없는 빈 DB여야 한다. **복원 전에 `pnpm db:migrate`를 실행하지 않는다.** 기존 DB를 지우는 `--clean` 옵션은 사용하지 않는다.
+
+각 블록이 성공한 뒤 다음 블록을 실행한다. 실패한 덤프는 복원하지 않는다. 덤프에는 개인정보/인증정보가 포함되므로 저장소 밖의 접근 제한 디렉터리에 보관한다.
+
+```sh
+umask 077
+TRANSFER_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hpluseco-transfer.XXXXXX")
+export TRANSFER_DUMP="$TRANSFER_DIR/app.dump"
+(
+  set -eu
+  export PGSERVICEFILE="${PGSERVICEFILE:?}"
+  test "$(psql --dbname=service=source -X -A -t -v ON_ERROR_STOP=1 -c "SELECT to_regclass('app.__drizzle_migrations') IS NOT NULL")" = t
+  pg_dump --dbname=service=source --format=custom --schema=app --strict-names --file="$TRANSFER_DUMP"
+  pg_restore --list "$TRANSFER_DUMP" >/dev/null
+)
+```
+
+```sh
+(
+  set -eu
+  export PGSERVICEFILE="${PGSERVICEFILE:?}"
+  test -f "${TRANSFER_DUMP:?}"
+  test "$(psql --dbname=service=target -X -A -t -v ON_ERROR_STOP=1 -c "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'app')")" = t
+  pg_restore --no-owner --no-privileges --single-transaction --exit-on-error --dbname=service=target "$TRANSFER_DUMP"
+  psql --dbname=service=target -X -v ON_ERROR_STOP=1 -c 'ANALYZE'
+)
+```
+
+복원은 한 트랜잭션으로 처리한다. 실패했거나 `app`이 이미 있다면 원인을 확인하고 새 빈 대상에서 재시도한다. 대상 운영 데이터를 삭제해서 재시도하지 않는다.
+
+### 데이터 대조 및 전환
+
+API/워커를 멈춘 상태에서 저장소 루트에서 실행한다. 이 명령은 `.env`를 자동으로 읽지 않는다. 읽기 전용 스냅샷으로 전체 행과 구조를 대조하며 원문 행/연결 주소를 출력하지 않는다. 원본과 대상은 서로 다른 DB여야 한다.
+
+```sh
+node -r ts-node/register scripts/verify-db-transfer.ts
+```
+
+`Database transfer verification passed`와 종료 코드 0을 모두 확인한다. 테이블·행 수·전체 데이터 해시(마이그레이션 이력/사진 키/금액 포함), 열·제약조건·인덱스·RLS·트리거·함수·시퀀스를 비교한다. 데이터 양에 따라 시간이 걸리며 양쪽 DB에 쓰기가 계속되면 전환 근거로 사용할 수 없다. 스토리지 객체의 실재 여부, 새 런타임 계정 권한 및 운영 TLS 연결은 이 대조만으로 검증되지 않는다.
+
+운영자가 Railway API의 두 DB URL과 `DATABASE_CA_CERT`를 새 내부 DB로 설정한다. **검증 중에는 `MILEAGE_OCR_ENABLED=false`로 설정하고 일반 사용자 트래픽을 차단한 상태로** 같은 코드 버전을 시작한다. 복원된 마이그레이션 이력을 유지하고 이후 코드에 새 마이그레이션이 있을 때만 평소대로 `pnpm db:migrate`를 적용한다. 새 연결에서 서버 시작/인증서 검증, 로그인·세션 복원·내정보·마일리지·어드민 조회·기존 사진 읽기를 확인하고 `/users/me`, `/mileage/summary` 응답 시간을 이전과 비교한다. 최종 검증 후 트래픽을 열고 기록해 둔 기존 OCR 설정을 복구해 승인·정산 흐름도 확인한다. 구 서버 워커는 계속 중지해 둔다.
+
+**롤백:** 새 DB에 쓰기가 발생하기 전에는 서버를 중지하고 이전 URL로 되돌릴 수 있다. 인증 조회의 세션 갱신도 새 쓰기다. 새 DB를 사용한 뒤에는 두 DB가 갈라지므로 모든 쓰기를 멈추고 변경분을 대조/복구한 다음 되돌린다. 단순히 예전 URL로 바꾸면 신규 신청·정산·정보 변경이 유실될 수 있다. 원본 DB와 최종 덤프는 대조 및 운영 확인이 끝날 때까지 보존한다.
+
+공식 문서: [PostgreSQL pg_dump](https://www.postgresql.org/docs/current/app-pgdump.html), [pg_restore](https://www.postgresql.org/docs/current/app-pgrestore.html), [Railway SSH](https://docs.railway.com/cli/ssh), [Railway SSL 이미지](https://github.com/railwayapp-templates/postgres-ssl).
 
 ## Compile and run the project
 

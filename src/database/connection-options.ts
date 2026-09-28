@@ -38,5 +38,7 @@ export function databaseSsl(databaseUrl: string) {
   ) {
     return { ca: SUPABASE_CA, rejectUnauthorized: true };
   }
+  const ca = process.env.DATABASE_CA_CERT?.trim();
+  if (ca) return { ca, rejectUnauthorized: true };
   return true;
 }
