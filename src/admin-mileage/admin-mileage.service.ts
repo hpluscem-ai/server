@@ -30,6 +30,7 @@ import {
   AdminMileageQueryDto,
   AdminMileageResponseDto,
   ApproveAdminMileageDto,
+  PendingAdminMileageDto,
   RejectAdminMileageDto,
 } from './admin-mileage.dto';
 
@@ -90,11 +91,23 @@ export class AdminMileageService {
     });
   }
 
+  async pending(
+    id: string,
+    input: PendingAdminMileageDto,
+  ): Promise<AdminMileageResponseDto> {
+    return this.review(id, input, {
+      approvalStatus: 'pending',
+      rejectionReason: null,
+      finalAmount: null,
+      mileageAmount: null,
+    });
+  }
+
   private async review(
     id: string,
     input: Pick<RejectAdminMileageDto, 'reviewVersion'>,
     decision: {
-      approvalStatus: 'approved' | 'rejected';
+      approvalStatus: 'pending' | 'approved' | 'rejected';
       rejectionReason: string | null;
       finalAmount: number | null;
       mileageAmount: number | null;
@@ -140,7 +153,7 @@ export class AdminMileageService {
             requestVersion: input.reviewVersion,
             resultVersion: '',
           },
-          decidedAt: now,
+          decidedAt: decision.approvalStatus === 'pending' ? null : now,
           updatedAt: now,
         })
         .where(

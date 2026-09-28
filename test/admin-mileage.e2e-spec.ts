@@ -384,6 +384,12 @@ describe('Admin mileage reads and review (e2e)', () => {
       .set('Authorization', auth)
       .send(input);
   }
+  function pending(input: object, auth = authorization) {
+    return request(app.getHttpServer())
+      .post(`${URL}/${applicationId}/pending`)
+      .set('Authorization', auth)
+      .send(input);
+  }
 
   async function adminSessionDiagnostic() {
     const token = authorization.slice('Bearer '.length);
@@ -564,6 +570,77 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(await snapshot()).toEqual(third);
   });
 
+  it('supports all six transitions, preserving evidence and clearing decisions on pending', async () => {
+    await database.db
+      .update(mileageApplications)
+      .set({
+        receiptAmount: 10000,
+        meterAmount: 10000,
+        matchStatus: 'matched',
+        receiptAt: '2026-09-22T00:00:00Z',
+      })
+      .where(eq(mileageApplications.id, applicationId));
+    const original = await snapshot();
+    let current = original;
+    const versions = new Set([current.reviewVersion]);
+    for (const action of [
+      'approve',
+      'pending',
+      'reject',
+      'approve',
+      'reject',
+      'pending',
+    ] as const) {
+      const input = { reviewVersion: current.reviewVersion };
+      const send = () =>
+        action === 'approve'
+          ? approve({ ...input, finalAmount: 10000, liters: '5' })
+          : action === 'reject'
+            ? reject(input)
+            : pending(input);
+      current = (await send().expect(200)).body as AdminMileageResponseDto;
+      expect(current.status).toBe(
+        action === 'approve'
+          ? 'approved'
+          : action === 'reject'
+            ? 'rejected'
+            : 'pending',
+      );
+      expect(current.photos).toEqual(original.photos);
+      expect(current.receiptAmount).toBe(original.receiptAmount);
+      expect(current.meterAmount).toBe(original.meterAmount);
+      expect(current.matchStatus).toBe(original.matchStatus);
+      expect(current.receiptAt).toBe(original.receiptAt);
+      expect(await app.get(SettlementsService).balance(userId)).toEqual({
+        accumulatedMileage: action === 'approve' ? 100 : 0,
+      });
+      if (action === 'pending') {
+        const [stored] = await database.db
+          .select()
+          .from(mileageApplications)
+          .where(eq(mileageApplications.id, applicationId));
+        expect(stored).toMatchObject({
+          finalAmount: null,
+          mileageAmount: null,
+          rejectionReason: null,
+          decidedAt: null,
+        });
+      }
+      await send().expect(200).expect(current);
+      expect(versions.has(current.reviewVersion)).toBe(false);
+      versions.add(current.reviewVersion);
+      await reject({ reviewVersion: original.reviewVersion }).expect(409);
+    }
+    expect(await database.db.select().from(mileageOcrJobs)).toHaveLength(0);
+    for (const input of [
+      {},
+      { reviewVersion: 'wrong' },
+      { reviewVersion: current.reviewVersion, finalAmount: 1 },
+    ]) {
+      await pending(input).expect(400);
+    }
+  });
+
   it('does not replay a decision after its photo evidence changes', async () => {
     const before = await snapshot();
     const input = {
@@ -595,6 +672,8 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(captured.settlementId).not.toBeNull();
     await reject({ reviewVersion: before.reviewVersion }).expect(409);
     await reject({ reviewVersion: captured.reviewVersion }).expect(409);
+    await pending({ reviewVersion: before.reviewVersion }).expect(409);
+    await pending({ reviewVersion: captured.reviewVersion }).expect(409);
     expect(await snapshot()).toEqual(captured);
     expect(await app.get(SettlementsService).balance(userId)).toEqual({
       accumulatedMileage: 100,
@@ -610,11 +689,10 @@ describe('Admin mileage reads and review (e2e)', () => {
         liters: '5',
       }).expect(200)
     ).body as AdminMileageResponseDto;
-    const responses = await Promise.all(
-      ['사유 A', '사유 B'].map((rejectionReason) =>
-        reject({ reviewVersion: approved.reviewVersion, rejectionReason }),
-      ),
-    );
+    const responses = await Promise.all([
+      reject({ reviewVersion: approved.reviewVersion }),
+      pending({ reviewVersion: approved.reviewVersion }),
+    ]);
     expect(responses.map((response) => response.status).sort()).toEqual([
       200, 409,
     ]);
@@ -822,6 +900,39 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect((await snapshot()).meterAmount).toBeNull();
   });
 
+  it.each(['approve', 'reject'])(
+    'keeps manual pending after %s when late OCR completes',
+    async (action) => {
+      const repository = app.get(MileageRepository);
+      const job = await ocrJob();
+      expect(await repository.ocrSource(job)).not.toBeNull();
+      const { reviewVersion } = await snapshot();
+      const decided = (
+        await (
+          action === 'approve'
+            ? approve({ reviewVersion, finalAmount: 10000, liters: '5' })
+            : reject({ reviewVersion })
+        ).expect(200)
+      ).body as AdminMileageResponseDto;
+      const input = { reviewVersion: decided.reviewVersion };
+      const current = (await pending(input).expect(200))
+        .body as AdminMileageResponseDto;
+      expect(await repository.ocrSource(job)).toBeNull();
+      const previous = process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
+      process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
+      try {
+        await repository.finishOcrJob(job, reading);
+      } finally {
+        if (previous === undefined)
+          delete process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED;
+        else process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = previous;
+      }
+      expect(await snapshot()).toEqual(current);
+      await pending(input).expect(200).expect(current);
+      expect(await repository.claimOcrJob()).toBeUndefined();
+    },
+  );
+
   it('requires a nonblank reason of at most 150 characters and stores trimmed multiline text', async () => {
     const { reviewVersion } = await snapshot();
     for (const input of [
@@ -889,15 +1000,18 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(await snapshot()).toEqual(before);
   });
 
-  it.each(['approve', 'reject'])(
+  it.each(['approve', 'reject', 'pending'])(
     'requires administrator authentication and exact Origin for cookie %s',
     async (action) => {
       const { reviewVersion } = await snapshot();
       const body =
         action === 'approve'
           ? { reviewVersion, finalAmount: 10000, liters: '5' }
-          : { reviewVersion, rejectionReason: '금액 불일치' };
-      const send = action === 'approve' ? approve : reject;
+          : action === 'reject'
+            ? { reviewVersion, rejectionReason: '금액 불일치' }
+            : { reviewVersion };
+      const send =
+        action === 'approve' ? approve : action === 'reject' ? reject : pending;
       const token = randomBytes(32).toString('base64url');
       const now = new Date();
       await database.db.insert(authSessions).values({
@@ -1054,9 +1168,14 @@ describe('Admin mileage reads and review (e2e)', () => {
     }
   });
 
-  it.each(['approve', 'reject'])(
+  it.each(['approve', 'reject', 'pending'])(
     'rolls back database failures instead of reporting %s success',
     async (action) => {
+      if (action === 'pending') {
+        await reject({
+          reviewVersion: (await snapshot()).reviewVersion,
+        }).expect(200);
+      }
       const before = await snapshot();
       await database.connection.unsafe(
         `CREATE FUNCTION app.reject_failure() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1075,7 +1194,13 @@ describe('Admin mileage reads and review (e2e)', () => {
                 liters: '5',
               }
             : { reviewVersion: before.reviewVersion };
-        await (action === 'approve' ? approve(body) : reject(body)).expect(500);
+        await (
+          action === 'approve'
+            ? approve(body)
+            : action === 'reject'
+              ? reject(body)
+              : pending(body)
+        ).expect(500);
         expect(await snapshot()).toEqual(before);
       } finally {
         await database.connection.unsafe(
@@ -1086,7 +1211,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     },
   );
 
-  it('publishes read and both review contracts', async () => {
+  it('publishes read and all three review contracts', async () => {
     const swagger = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -1100,6 +1225,10 @@ describe('Admin mileage reads and review (e2e)', () => {
     ).toContain('image/jpeg');
     expect(document.paths[URL + '/{id}/reject']?.post).toBeDefined();
     expect(document.paths[URL + '/{id}/approve']?.post).toBeDefined();
+    expect(document.paths[URL + '/{id}/pending']?.post).toBeDefined();
+    expect(document.components?.schemas?.PendingAdminMileageDto).toMatchObject({
+      required: ['reviewVersion'],
+    });
     expect(document.components?.schemas?.RejectAdminMileageDto).toMatchObject({
       required: ['reviewVersion', 'rejectionReason'],
       properties: { rejectionReason: { minLength: 1, maxLength: 150 } },

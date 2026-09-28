@@ -409,6 +409,7 @@ export class MileageRepository {
           finalAmount: null,
           mileageAmount: null,
           rejectionReason: null,
+          reviewReplay: null,
           decidedAt: null,
           updatedAt: new Date().toISOString(),
         })
@@ -523,6 +524,7 @@ export class MileageRepository {
       if (
         !application ||
         application.approvalStatus !== 'pending' ||
+        application.reviewReplay !== null ||
         application.settlementId !== null
       )
         return null;
@@ -664,6 +666,7 @@ export class MileageRepository {
         (application?.photoMode === 'single' ||
           savedPhotos.some((photo) => photo.kind === 'meter')) &&
         application?.approvalStatus === 'pending' &&
+        application.reviewReplay === null &&
         application.settlementId === null &&
         photoVersion(application.requestHash, savedPhotos) ===
           job.sourceVersion;

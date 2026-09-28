@@ -57,6 +57,13 @@ export class RejectAdminMileageDto {
   rejectionReason!: string;
 }
 
+export class PendingAdminMileageDto {
+  @ApiProperty({ description: '대기로 변경할 신청의 최신 reviewVersion' })
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  reviewVersion!: string;
+}
+
 export class ApproveAdminMileageDto {
   @ApiProperty({ description: '관리자가 사진을 확인한 신청의 reviewVersion' })
   @IsString()

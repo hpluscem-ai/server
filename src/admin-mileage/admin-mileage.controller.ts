@@ -38,6 +38,7 @@ import {
   AdminMileageQueryDto,
   AdminMileageResponseDto,
   ApproveAdminMileageDto,
+  PendingAdminMileageDto,
   RejectAdminMileageDto,
 } from './admin-mileage.dto';
 import { AdminMileageService } from './admin-mileage.service';
@@ -147,6 +148,34 @@ export class AdminMileageController {
     @Body() body: RejectAdminMileageDto,
   ): Promise<AdminMileageResponseDto> {
     return this.mileage.reject(id, body);
+  }
+
+  @Post(':id/pending')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: '정산 미편입 신청 대기 전환',
+    description:
+      '최신 reviewVersion으로 승인·반려 신청을 대기로 변경합니다. 확정 금액·마일리지·반려 사유·결정 시각을 비우고 사진과 OCR 판독값은 보존합니다. OCR을 다시 실행하지 않으며 늦게 도착한 OCR이 수동 대기를 덮어쓰지 않습니다. 최신 처리의 동일 요청 재전송은 같은 결과를 반환합니다. 오래된 버전 또는 정산 편입 건은 409입니다.',
+  })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOkResponse({ type: AdminMileageResponseDto })
+  @ApiForbiddenResponse({
+    type: ApiErrorResponseDto,
+    description: 'WEB_ORIGIN_NOT_ALLOWED',
+  })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'MILEAGE_REVIEW_CONFLICT',
+  })
+  @ApiNotFoundResponse({
+    type: ApiErrorResponseDto,
+    description: 'MILEAGE_APPLICATION_NOT_FOUND',
+  })
+  async pending(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @Body() body: PendingAdminMileageDto,
+  ): Promise<AdminMileageResponseDto> {
+    return this.mileage.pending(id, body);
   }
 
   @Get(':id/photos/:kind')

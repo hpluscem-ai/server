@@ -245,6 +245,18 @@ describe('Mileage applications (e2e)', () => {
 
   it('resubmits only the selected photo, preserving originals, the first date and creation key', async () => {
     const original = await rejected();
+    await database.db
+      .update(mileageApplications)
+      .set({
+        reviewReplay: {
+          requestVersion: 'a'.repeat(64),
+          resultVersion: 'b'.repeat(64),
+        },
+      })
+      .where(eq(mileageApplications.id, original.id));
+    jest
+      .spyOn(app.get(MileageOcrService), 'isConfigured')
+      .mockReturnValue(true);
     const before = (
       await database.db.select().from(mileageApplications).limit(1)
     )[0];
@@ -272,6 +284,7 @@ describe('Mileage applications (e2e)', () => {
       finalAmount: null,
       mileageAmount: null,
       matchStatus: 'pending',
+      reviewReplay: null,
     });
     const after = await database.db.select().from(mileagePhotos);
     expect(after.find((photo) => photo.kind === 'meter')).toEqual(
@@ -293,6 +306,9 @@ describe('Mileage applications (e2e)', () => {
     expect(await database.db.select().from(mileageUploadAttempts)).toHaveLength(
       0,
     );
+    const repository = app.get(MileageRepository);
+    const job = (await repository.claimOcrJob())!;
+    expect(await repository.ocrSource(job)).not.toBeNull();
   });
 
   it('replays resubmissions without more uploads and rejects changed inputs and stale versions', async () => {
