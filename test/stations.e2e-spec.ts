@@ -98,10 +98,11 @@ describe('Stations (e2e)', () => {
       .set('Authorization', auth)
       .send(body);
   }
-  function remove(id: string, auth = authorization) {
+  function remove(id: string, auth = authorization, query: object = {}) {
     return request(app.getHttpServer())
       .delete(`${ADMIN_PATH}/${id}`)
-      .set('Authorization', auth);
+      .set('Authorization', auth)
+      .query(query);
   }
   function list(query: object = {}) {
     return request(app.getHttpServer())
@@ -448,6 +449,123 @@ describe('Stations (e2e)', () => {
     expect(final.stations[0].businessName).toBe(addition.model);
   });
 
+  it('rejects a stale station version without losing a concurrent device edit or addition', async () => {
+    const station = await saved({
+      ...input,
+      devices: [
+        input.devices[0],
+        { model: '기존 두번째', capacityLiters: 3000 },
+      ],
+    });
+    expect(station.version).toMatch(/^[a-f0-9]{64}$/);
+
+    const current = await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      businessName: '최신 변경',
+      devices: [
+        { ...editBody(station).devices[0], model: '최신 수정 모델' },
+        editBody(station).devices[1],
+        { model: '동시 추가 모델', capacityLiters: 500 },
+      ],
+    }).expect(200);
+    const currentStation = current.body as StationResponseDto;
+
+    await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      businessName: '오래된 변경',
+      devices: [{ ...editBody(station).devices[0], model: '오래된 모델' }],
+    })
+      .expect(409)
+      .expect(({ body }: { body: { code: string } }) =>
+        expect(body.code).toBe('STATION_VERSION_CONFLICT'),
+      );
+
+    const persisted = await request(app.getHttpServer())
+      .get(`${ADMIN_PATH}/${station.id}`)
+      .set('Authorization', authorization)
+      .expect(200)
+      .then((response) => response.body as StationResponseDto);
+    expect(persisted.businessName).toBe('최신 변경');
+    expect(persisted.version).toBe(currentStation.version);
+    expect(persisted.devices).toHaveLength(3);
+    expect(
+      persisted.devices
+        .map(({ id, model }) => ({ id, model }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    ).toEqual(
+      expect.arrayContaining([
+        { id: station.devices[0].id, model: '최신 수정 모델' },
+        { id: station.devices[1].id, model: '기존 두번째' },
+        expect.objectContaining({ model: '동시 추가 모델' }),
+      ]),
+    );
+  });
+
+  it('uses the current station version to remove exactly one omitted device', async () => {
+    const station = await saved({
+      ...input,
+      devices: [input.devices[0], { model: '삭제 대상', capacityLiters: 3000 }],
+    });
+
+    const response = await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      devices: [editBody(station).devices[0]],
+    }).expect(200);
+    const updated = response.body as StationResponseDto;
+
+    expect(updated.devices).toEqual([
+      expect.objectContaining({ id: station.devices[0].id }),
+    ]);
+    expect(updated.version).toMatch(/^[a-f0-9]{64}$/);
+    const state = await snapshot();
+    expect(state.stations).toHaveLength(1);
+    expect(state.devices).toHaveLength(1);
+    expect(state.devices[0].id).toBe(station.devices[0].id);
+  });
+
+  it('allows clearing both coordinates on update while registration still rejects null coordinates', async () => {
+    const station = await saved();
+    const response = await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      latitude: null,
+      longitude: null,
+    }).expect(200);
+    const updated = response.body as StationResponseDto;
+    expect(updated.latitude).toBeNull();
+    expect(updated.longitude).toBeNull();
+    expect(updated.coordinateVerified).toBe(false);
+    await create({
+      ...input,
+      businessName: '좌표 없는 신규 등록',
+      latitude: null,
+      longitude: null,
+    }).expect(400);
+    const state = await snapshot();
+    expect(state.stations).toHaveLength(1);
+    expect(state.stations[0].latitude).toBeNull();
+    expect(state.stations[0].longitude).toBeNull();
+  });
+
+  it.each([
+    { latitude: null, longitude: input.longitude },
+    { latitude: input.latitude, longitude: null },
+  ])('rejects half-null coordinates on update: %j', async (coordinates) => {
+    const station = await saved();
+    const before = await snapshot();
+
+    await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      ...coordinates,
+    }).expect(400);
+
+    expect(await snapshot()).toEqual(before);
+  });
+
   it.each(['roadAddress', 'latitude', 'longitude'])(
     'clears coordinate verification on %s changes',
     async (field) => {
@@ -788,7 +906,7 @@ describe('Stations (e2e)', () => {
       Object.keys(
         document.paths[`${ADMIN_PATH}/{id}`].delete!.responses,
       ).sort(),
-    ).toEqual(['204', '400', '401', '403', '404', '500']);
+    ).toEqual(['204', '400', '401', '403', '404', '409', '500']);
     const invalidIdResponse =
       document.paths[`${ADMIN_PATH}/{id}`]?.put?.responses?.['400'];
     expect(
@@ -867,6 +985,55 @@ describe('Stations (e2e)', () => {
     await remove('invalid').expect(400);
     await remove(randomUUID()).expect(404);
     expect(await snapshot()).toEqual(before);
+  });
+
+  it('rejects a stale station delete and preserves concurrently added devices', async () => {
+    const station = await saved();
+    const concurrent = await update(station.id, {
+      ...editBody(station),
+      expectedVersion: station.version,
+      devices: [
+        editBody(station).devices[0],
+        { model: '동시 추가 모델', capacityLiters: 500 },
+      ],
+    }).expect(200);
+    const current = concurrent.body as StationResponseDto;
+
+    await remove(station.id, authorization, {
+      expectedVersion: station.version,
+    })
+      .expect(409)
+      .expect(({ body }: { body: { code: string } }) =>
+        expect(body.code).toBe('STATION_VERSION_CONFLICT'),
+      );
+
+    const state = await snapshot();
+    expect(state.stations).toHaveLength(1);
+    expect(state.stations[0].id).toBe(station.id);
+    expect(state.devices).toHaveLength(2);
+    expect(state.devices.map(({ model }) => model).sort()).toEqual([
+      '동시 추가 모델',
+      input.devices[0].model,
+    ]);
+    await request(app.getHttpServer())
+      .get(`${ADMIN_PATH}/${station.id}`)
+      .set('Authorization', authorization)
+      .expect(200)
+      .expect(({ body }: { body: StationResponseDto }) =>
+        expect(body.version).toBe(current.version),
+      );
+  });
+
+  it('deletes a station when its expected version matches', async () => {
+    const station = await saved({
+      ...input,
+      devices: [input.devices[0], { model: '같이 삭제', capacityLiters: 500 }],
+    });
+
+    await remove(station.id, authorization, {
+      expectedVersion: station.version,
+    }).expect(204);
+    expect(await snapshot()).toEqual({ stations: [], devices: [] });
   });
 
   it.each(['installation_sites', 'installation_site_devices'])(

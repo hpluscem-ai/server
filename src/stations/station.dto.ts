@@ -121,7 +121,50 @@ export class CreateStationDto {
 
 export class UpdateStationDto extends OmitType(CreateStationDto, [
   'devices',
+  'latitude',
+  'longitude',
 ] as const) {
+  @ApiProperty({
+    description:
+      '입력한 WGS84 위도. 기존 좌표가 없는 주유소는 null을 유지할 수 있음',
+    minimum: -90,
+    maximum: 90,
+    nullable: true,
+  })
+  @ValidateIf(
+    (object: UpdateStationDto, value: unknown) =>
+      value !== null || object.longitude !== null,
+  )
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  latitude!: number | null;
+
+  @ApiProperty({
+    description:
+      '입력한 WGS84 경도. 기존 좌표가 없는 주유소는 null을 유지할 수 있음',
+    minimum: -180,
+    maximum: 180,
+    nullable: true,
+  })
+  @ValidateIf(
+    (object: UpdateStationDto, value: unknown) =>
+      value !== null || object.latitude !== null,
+  )
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  longitude!: number | null;
+
+  @ApiPropertyOptional({
+    description:
+      '조회 시 받은 주유소 버전. 전달하면 그 뒤 변경된 주유소·기기 상태에서는 저장을 거부',
+  })
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  expectedVersion?: string;
+
   @ApiProperty({
     description:
       '저장할 기기 전체: 기존 기기는 ID 포함, 추가 기기는 ID 생략. 빠진 기존 기기는 실제 삭제. 최소 1개 필수',
@@ -134,6 +177,17 @@ export class UpdateStationDto extends OmitType(CreateStationDto, [
   @ValidateNested({ each: true })
   @Type(() => UpdateStationDeviceDto)
   devices!: UpdateStationDeviceDto[];
+}
+
+export class StationVersionQueryDto {
+  @ApiPropertyOptional({
+    description:
+      '조회 시 받은 주유소 버전. 전달하면 그 뒤 변경된 주유소·기기 상태에서는 삭제를 거부',
+  })
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  expectedVersion?: string;
 }
 
 export class StationDeviceResponseDto extends CreateStationDeviceDto {
@@ -157,6 +211,12 @@ export class StationResponseDto extends OmitType(CreateStationDto, [
     format: 'uuid',
   })
   id!: string;
+
+  @ApiProperty({
+    description:
+      '수정 충돌 확인용 주유소 버전. 수정 요청의 expectedVersion으로 전달 가능',
+  })
+  version!: string;
 
   @ApiProperty({ description: '비고', type: String, nullable: true })
   note!: string | null;

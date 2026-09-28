@@ -35,6 +35,7 @@ import {
   CreateStationDto,
   StationBoundsQueryDto,
   StationResponseDto,
+  StationVersionQueryDto,
   UpdateStationDto,
 } from './station.dto';
 import { StationsService } from './stations.service';
@@ -110,7 +111,7 @@ export class AdminStationsController {
   @ApiOperation({
     summary: '주유소 및 설치 기기 수정',
     description:
-      '전체 입력 필드를 저장합니다. 비고 생략은 비고 없음으로 저장합니다. 유지할 기존 기기는 ID를 포함하고 추가 기기는 ID를 생략합니다. 목록에서 빠진 기존 기기는 실제 삭제하며 최소 1개의 기기가 필요합니다. 타 주유소 기기·중복 ID는 거부합니다. 동시 전체 수정은 마지막 저장된 기기 목록을 적용합니다. 주소·위도·경도 변경 시 기존 좌표 검증 정보를 해제합니다. 주유소와 기기의 변경·제거는 원자적입니다.',
+      '전체 입력 필드를 저장합니다. 비고 생략은 비고 없음으로 저장합니다. 유지할 기존 기기는 ID를 포함하고 추가 기기는 ID를 생략합니다. 목록에서 빠진 기존 기기는 실제 삭제하며 최소 1개의 기기가 필요합니다. 타 주유소 기기·중복 ID는 거부합니다. expectedVersion을 전달하면 조회 뒤 변경된 주유소·기기 상태에서는 저장을 거부합니다. 주소·위도·경도 변경 시 기존 좌표 검증 정보를 해제합니다. 주유소와 기기의 변경·제거는 원자적입니다.',
   })
   @ApiParam({ name: 'id', description: '주유소 식별자', format: 'uuid' })
   @ApiOkResponse({ type: StationResponseDto })
@@ -120,7 +121,8 @@ export class AdminStationsController {
   })
   @ApiConflictResponse({
     type: ApiErrorResponseDto,
-    description: 'UNKNOWN_DEVICE | DUPLICATE_DEVICE_ID',
+    description:
+      'UNKNOWN_DEVICE | DUPLICATE_DEVICE_ID | STATION_VERSION_CONFLICT',
   })
   update(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
@@ -138,7 +140,7 @@ export class AdminStationsController {
   @ApiOperation({
     summary: '주유소 및 종속 기기 삭제',
     description:
-      '주유소와 해당 주유소의 모든 기기를 함께 실제 삭제합니다. 다른 주유소·기사·영수·정산은 변경하지 않습니다. 없는 주유소와 반복 삭제는 404입니다. 복구 API는 제공하지 않습니다.',
+      '주유소와 해당 주유소의 모든 기기를 함께 실제 삭제합니다. expectedVersion을 전달하면 조회 뒤 변경된 주유소·기기 상태에서는 삭제를 거부합니다. 다른 주유소·기사·영수·정산은 변경하지 않습니다. 없는 주유소와 반복 삭제는 404입니다. 복구 API는 제공하지 않습니다.',
   })
   @ApiParam({ name: 'id', description: '삭제할 주유소 식별자', format: 'uuid' })
   @ApiNoContentResponse({ description: '주유소 및 종속 기기 삭제 완료' })
@@ -146,10 +148,15 @@ export class AdminStationsController {
     type: ApiErrorResponseDto,
     description: 'STATION_NOT_FOUND',
   })
+  @ApiConflictResponse({
+    type: ApiErrorResponseDto,
+    description: 'STATION_VERSION_CONFLICT',
+  })
   remove(
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @Query() query: StationVersionQueryDto,
   ): Promise<void> {
-    return this.stations.remove(id);
+    return this.stations.remove(id, query.expectedVersion);
   }
 }
 

@@ -17,7 +17,9 @@ import {
   StationDevicesConflictError,
   StationNotFoundError,
   StationRecord,
+  StationVersionConflictError,
   StationsRepository,
+  stationVersion,
 } from './stations.repository';
 
 @Injectable()
@@ -72,6 +74,12 @@ export class StationsService {
           code: error.reason,
           message: '이 주유소의 기기 식별자를 중복 없이 입력해 주세요.',
         });
+      if (error instanceof StationVersionConflictError)
+        throw new ConflictException({
+          code: 'STATION_VERSION_CONFLICT',
+          message:
+            '주유소 또는 기기 정보가 변경되었습니다. 최신 정보를 다시 조회해 주세요.',
+        });
       throw error;
     }
   }
@@ -83,8 +91,19 @@ export class StationsService {
     });
   }
 
-  async remove(id: string): Promise<void> {
-    if (!(await this.stations.remove(id))) throw this.notFound();
+  async remove(id: string, expectedVersion?: string): Promise<void> {
+    try {
+      if (!(await this.stations.remove(id, expectedVersion)))
+        throw this.notFound();
+    } catch (error) {
+      if (error instanceof StationVersionConflictError)
+        throw new ConflictException({
+          code: 'STATION_VERSION_CONFLICT',
+          message:
+            '주유소 또는 기기 정보가 변경되었습니다. 최신 정보를 다시 조회해 주세요.',
+        });
+      throw error;
+    }
   }
 
   private present(station: StationRecord): StationResponseDto {
@@ -103,6 +122,7 @@ export class StationsService {
       throw new Error('Invalid station timestamps');
     return {
       id: station.id,
+      version: stationVersion(station),
       pole: station.pole,
       businessName: station.businessName,
       roadAddress: station.roadAddress,

@@ -12,7 +12,7 @@ import {
   or,
   sql,
 } from 'drizzle-orm';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
 import { installationSites, installationSiteDevices } from '../database/schema';
 import {
@@ -30,6 +30,29 @@ export class StationDevicesConflictError extends Error {
   constructor(readonly reason: 'UNKNOWN_DEVICE' | 'DUPLICATE_DEVICE_ID') {
     super(reason);
   }
+}
+export class StationVersionConflictError extends Error {}
+
+export function stationVersion(station: StationRecord): string {
+  const editableState = {
+    pole: station.pole,
+    businessName: station.businessName,
+    roadAddress: station.roadAddress,
+    note: station.note,
+    latitude: station.latitude,
+    longitude: station.longitude,
+    devices: station.devices
+      .map(({ id, model, capacityLiters, active }) => ({
+        id,
+        model,
+        capacityLiters,
+        active,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id)),
+  };
+  return createHash('sha256')
+    .update(JSON.stringify(editableState))
+    .digest('hex');
 }
 
 @Injectable()
@@ -152,13 +175,32 @@ export class StationsRepository {
     });
   }
 
-  async remove(id: string): Promise<boolean> {
-    // FK ON DELETE CASCADE removes only this station's devices in the same statement.
-    const [station] = await this.database.db
-      .delete(installationSites)
-      .where(eq(installationSites.id, id))
-      .returning({ id: installationSites.id });
-    return station !== undefined;
+  async remove(id: string, expectedVersion?: string): Promise<boolean> {
+    return this.database.db.transaction(async (tx) => {
+      const [station] = await tx
+        .select()
+        .from(installationSites)
+        .where(eq(installationSites.id, id))
+        .for('update')
+        .limit(1);
+      if (!station) return false;
+      const devices = await tx
+        .select()
+        .from(installationSiteDevices)
+        .where(eq(installationSiteDevices.installationSiteId, id))
+        .for('update');
+      if (
+        expectedVersion !== undefined &&
+        expectedVersion !== stationVersion({ ...station, devices })
+      )
+        throw new StationVersionConflictError();
+      // FK ON DELETE CASCADE removes only this station's devices in the same statement.
+      const [deleted] = await tx
+        .delete(installationSites)
+        .where(eq(installationSites.id, id))
+        .returning({ id: installationSites.id });
+      return deleted !== undefined;
+    });
   }
 
   async update(id: string, input: UpdateStationDto): Promise<StationRecord> {
@@ -175,6 +217,12 @@ export class StationsRepository {
         .from(installationSiteDevices)
         .where(eq(installationSiteDevices.installationSiteId, id))
         .for('update');
+      if (
+        input.expectedVersion !== undefined &&
+        input.expectedVersion !==
+          stationVersion({ ...previous, devices: existing })
+      )
+        throw new StationVersionConflictError();
       const submittedIds = input.devices.flatMap((device) =>
         device.id === undefined ? [] : [device.id],
       );
@@ -188,7 +236,14 @@ export class StationsRepository {
         .filter((device) => !uniqueIds.has(device.id))
         .map((device) => device.id);
 
-      const { devices: inputs, note, ...fields } = input;
+      const { devices: inputs, note } = input;
+      const fields = {
+        pole: input.pole,
+        businessName: input.businessName,
+        roadAddress: input.roadAddress,
+        latitude: input.latitude,
+        longitude: input.longitude,
+      };
       const locationChanged =
         previous.roadAddress !== fields.roadAddress ||
         previous.latitude !== fields.latitude ||
