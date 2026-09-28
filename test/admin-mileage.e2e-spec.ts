@@ -434,8 +434,10 @@ describe('Admin mileage reads and review (e2e)', () => {
         meterAmount: 8000,
         matchStatus: 'mismatched',
         rejectionReason: null,
-        reviewVersion: before.reviewVersion,
       });
+      expect((result.body as AdminMileageResponseDto).reviewVersion).not.toBe(
+        before.reviewVersion,
+      );
       expect((result.body as AdminMileageResponseDto).decidedAt).not.toBeNull();
       expect(await snapshot()).toEqual(result.body);
       expect(await app.get(SettlementsService).balance(userId)).toEqual({
@@ -489,6 +491,139 @@ describe('Admin mileage reads and review (e2e)', () => {
     await approve({ ...body, liters: '10' }).expect(409);
     await reject({ reviewVersion }).expect(409);
     expect(await snapshot()).toEqual(responses[0].body);
+  });
+
+  it('reverses approval and rejection before settlement without replaying earlier decisions', async () => {
+    const original = await snapshot();
+    const firstInput = {
+      reviewVersion: original.reviewVersion,
+      finalAmount: 10000,
+      liters: '5',
+    };
+    const first = (await approve(firstInput).expect(200))
+      .body as AdminMileageResponseDto;
+    const rejectInput = {
+      reviewVersion: first.reviewVersion,
+      rejectionReason: '금액 재확인',
+    };
+    const rejected = (await reject(rejectInput).expect(200))
+      .body as AdminMileageResponseDto;
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      finalAmount: null,
+      mileageAmount: null,
+      rejectionReason: '금액 재확인',
+    });
+    expect(await app.get(SettlementsService).balance(userId)).toEqual({
+      accumulatedMileage: 0,
+    });
+    await reject(rejectInput).expect(200).expect(rejected);
+    await approve(firstInput).expect(409);
+    const secondInput = {
+      reviewVersion: rejected.reviewVersion,
+      finalAmount: 20000,
+      liters: '10',
+    };
+    const second = (await approve(secondInput).expect(200))
+      .body as AdminMileageResponseDto;
+    expect(second).toMatchObject({
+      status: 'approved',
+      finalAmount: 20000,
+      mileageAmount: 200,
+      rejectionReason: null,
+    });
+    expect(
+      new Set([
+        original.reviewVersion,
+        first.reviewVersion,
+        rejected.reviewVersion,
+        second.reviewVersion,
+      ]).size,
+    ).toBe(4);
+    expect(await app.get(SettlementsService).balance(userId)).toEqual({
+      accumulatedMileage: 200,
+    });
+    await approve(secondInput).expect(200).expect(second);
+    await reject(rejectInput).expect(409);
+    await approve(firstInput).expect(409);
+    await approve({
+      ...secondInput,
+      reviewVersion: second.reviewVersion,
+      finalAmount: 30000,
+    }).expect(409);
+    expect(await snapshot()).toEqual(second);
+    expect(second).not.toHaveProperty('reviewReplay');
+    const third = (
+      await reject({
+        reviewVersion: second.reviewVersion,
+        rejectionReason: '금액 재확인',
+      }).expect(200)
+    ).body as AdminMileageResponseDto;
+    await approve(secondInput).expect(409);
+    await reject(rejectInput).expect(409);
+    expect(await snapshot()).toEqual(third);
+  });
+
+  it('does not replay a decision after its photo evidence changes', async () => {
+    const before = await snapshot();
+    const input = {
+      reviewVersion: before.reviewVersion,
+      rejectionReason: '사진 확인',
+    };
+    await reject(input).expect(200);
+    await database.db
+      .update(mileagePhotos)
+      .set({ storageKey: 'private/replacement.jpg' })
+      .where(eq(mileagePhotos.storageKey, 'private/receipt.jpg'));
+    await reject(input).expect(409);
+  });
+
+  it('blocks reversal after the transfer file captures an approved application', async () => {
+    await database.db
+      .update(mileageApplications)
+      .set({
+        approvalStatus: 'approved',
+        finalAmount: 10000,
+        mileageAmount: 100,
+        decidedAt: '2020-09-22T00:00:00Z',
+      })
+      .where(eq(mileageApplications.id, applicationId));
+    const before = await snapshot();
+    const admin = await adminSessionDiagnostic();
+    await app.get(SettlementsService).export('2020-09', admin.userId);
+    const captured = await snapshot();
+    expect(captured.settlementId).not.toBeNull();
+    await reject({ reviewVersion: before.reviewVersion }).expect(409);
+    await reject({ reviewVersion: captured.reviewVersion }).expect(409);
+    expect(await snapshot()).toEqual(captured);
+    expect(await app.get(SettlementsService).balance(userId)).toEqual({
+      accumulatedMileage: 100,
+    });
+  });
+
+  it('serializes competing reversals and refuses the stale competing decision', async () => {
+    const initial = await snapshot();
+    const approved = (
+      await approve({
+        reviewVersion: initial.reviewVersion,
+        finalAmount: 10000,
+        liters: '5',
+      }).expect(200)
+    ).body as AdminMileageResponseDto;
+    const responses = await Promise.all(
+      ['사유 A', '사유 B'].map((rejectionReason) =>
+        reject({ reviewVersion: approved.reviewVersion, rejectionReason }),
+      ),
+    );
+    expect(responses.map((response) => response.status).sort()).toEqual([
+      200, 409,
+    ]);
+    expect(await snapshot()).toEqual(
+      responses.find((response) => response.status === 200)!.body,
+    );
+    expect(await app.get(SettlementsService).balance(userId)).toEqual({
+      accumulatedMileage: 0,
+    });
   });
 
   it('approves more concurrent reviews than the database pool has connections', async () => {
@@ -550,7 +685,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     }
   });
 
-  it('blocks stale, rejected, missing-photo and settlement-attached approval', async () => {
+  it('blocks stale, missing-photo and settlement-attached approval', async () => {
     const old = await snapshot();
     await database.db
       .update(mileagePhotos)
@@ -712,8 +847,8 @@ describe('Admin mileage reads and review (e2e)', () => {
       finalAmount: null,
       mileageAmount: null,
       settlementId: null,
-      reviewVersion,
     });
+    expect(body.reviewVersion).not.toBe(reviewVersion);
     expect(Date.parse(body.decidedAt!)).toBeLessThanOrEqual(Date.now());
     await reject({ reviewVersion, rejectionReason }).expect(200).expect(body);
     await reject({ reviewVersion, rejectionReason: '다른 사유' }).expect(409);
@@ -877,7 +1012,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     }).expect(200);
   });
 
-  it('never changes approved or settlement-attached applications', async () => {
+  it('never changes applications from a stale decision or after settlement attachment', async () => {
     const old = await snapshot();
     await database.db
       .update(mileageApplications)

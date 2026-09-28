@@ -207,6 +207,10 @@ export const mileageApplications = appSchema.table('mileage_applications', {
     .notNull()
     .default('pending'),
   rejectionReason: text('rejection_reason'),
+  reviewReplay: jsonb('review_replay').$type<{
+    requestVersion: string;
+    resultVersion: string;
+  }>(),
   settlementId: text('settlement_id'),
   submittedAt: text('submitted_at')
     .notNull()

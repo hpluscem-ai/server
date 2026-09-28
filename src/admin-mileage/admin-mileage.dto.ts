@@ -37,7 +37,7 @@ export class AdminMileageQueryDto {
 export class RejectAdminMileageDto {
   @ApiProperty({
     description:
-      '조회한 신청·사진의 reviewVersion. 인증 토큰이 아닌 변경 감지 값입니다.',
+      '조회한 신청·사진·심사 결과의 최신 reviewVersion. 심사 성공 시 갱신되는 변경 감지 값입니다.',
   })
   @IsString()
   @Matches(/^[a-f0-9]{64}$/)

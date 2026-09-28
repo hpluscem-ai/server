@@ -96,9 +96,9 @@ export class AdminMileageController {
   @Post(':id/approve')
   @HttpCode(200)
   @ApiOperation({
-    summary: '대기 신청 수동 승인',
+    summary: '정산 미편입 신청 수동 승인·재승인',
     description:
-      '관리자가 두 사진을 확인한 확정 금액과 계기판 주유량(L), reviewVersion을 제출합니다. 서버가 리터×20을 정확한 십진 연산으로 반올림하여 승인·확정 금액·마일리지·결정 시각을 원자적으로 저장합니다. OCR 원본 판독값은 보존하며 클라이언트 마일리지는 받지 않습니다. 같은 버전·확정 금액·계산 마일리지 재전송은 기존 결과와 결정 시각을 유지합니다. 사진/판독값 변경·다른 결정·정산 편입은 409입니다.',
+      '관리자가 두 사진을 확인한 확정 금액과 계기판 주유량(L), 최신 reviewVersion을 제출합니다. 정산 미편입 대기·반려 신청을 승인하며 서버가 리터×20을 반올림해 상태·확정 금액·마일리지·새 결정 시각을 원자적으로 저장합니다. 재승인 시점이 정산 기준 승인일입니다. OCR 원본은 보존하며 클라이언트 마일리지는 받지 않습니다. 성공 응답은 새 reviewVersion을 반환합니다. 최신 처리의 동일 요청 재전송은 결과와 결정 시각을 유지합니다. 오래된 버전·정산 편입·승인 상태의 금액 수정은 409입니다.',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiOkResponse({ type: AdminMileageResponseDto })
@@ -124,9 +124,9 @@ export class AdminMileageController {
   @Post(':id/reject')
   @HttpCode(200)
   @ApiOperation({
-    summary: '대기 신청 반려',
+    summary: '정산 미편입 신청 반려·승인 취소',
     description:
-      '조회 시 reviewVersion과 필수 반려 사유 rejectionReason(앞뒤 공백 제거 후 1~150자)을 제출합니다. 대기·정산 미편입 신청만 원자적으로 반려합니다. 같은 버전·같은 사유의 재전송은 기존 결과와 decidedAt을 유지하며 다른 사유·심사 결과·사진/입력 변경 또는 정산 편입은 409입니다. 임의 금액은 입력받지 않습니다.',
+      '최신 reviewVersion과 필수 반려 사유 rejectionReason(앞뒤 공백 제거 후 1~150자)을 제출합니다. 정산 미편입 대기·승인 신청을 반려하며 확정 금액·마일리지를 비워 잔액과 정산 대상에서 제외합니다. 성공 응답은 새 reviewVersion을 반환합니다. 최신 처리의 동일 요청 재전송은 결과와 decidedAt을 유지합니다. 오래된 버전·정산 편입·반려 상태의 사유 수정은 409입니다. 임의 금액은 입력받지 않습니다.',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiOkResponse({ type: AdminMileageResponseDto })

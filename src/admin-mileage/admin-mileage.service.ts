@@ -100,26 +100,32 @@ export class AdminMileageService {
       mileageAmount: number | null;
     },
   ): Promise<AdminMileageResponseDto> {
-    const retained = await this.database.db.transaction(async (tx) => {
-      await tx.execute(
-        sql`SELECT ${applications.id} FROM ${applications} WHERE ${applications.id} = ${id} FOR UPDATE`,
-      );
+    return this.database.db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select({ replay: applications.reviewReplay })
+        .from(applications)
+        .where(eq(applications.id, id))
+        .for('update');
       const current = await this.detail(id, tx);
-      if (
-        current.settlementId !== null ||
-        current.reviewVersion !== input.reviewVersion
-      ) {
-        throw this.conflict();
-      }
-      // A lost response can be retried without rewriting the decision or its timestamp.
-      if (
+      if (current.settlementId !== null) throw this.conflict();
+      const sameDecision =
         current.status === decision.approvalStatus &&
         current.rejectionReason === decision.rejectionReason &&
         current.finalAmount === decision.finalAmount &&
-        current.mileageAmount === decision.mileageAmount
-      )
-        return current;
-      if (current.status !== 'pending') throw this.conflict();
+        current.mileageAmount === decision.mileageAmount;
+      if (current.reviewVersion !== input.reviewVersion) {
+        // Only the latest unchanged result can replay a lost response.
+        if (
+          sameDecision &&
+          locked.replay?.requestVersion === input.reviewVersion &&
+          locked.replay.resultVersion === current.reviewVersion
+        )
+          return current;
+        throw this.conflict();
+      }
+      if (sameDecision) return current;
+      // Re-review changes the status; editing an existing decision is separate.
+      if (current.status === decision.approvalStatus) throw this.conflict();
       if (
         decision.approvalStatus === 'approved' &&
         (!current.photos.receipt || !current.photos.meter)
@@ -130,21 +136,34 @@ export class AdminMileageService {
         .update(applications)
         .set({
           ...decision,
+          reviewReplay: {
+            requestVersion: input.reviewVersion,
+            resultVersion: '',
+          },
           decidedAt: now,
           updatedAt: now,
         })
         .where(
           and(
             eq(applications.id, id),
-            eq(applications.approvalStatus, 'pending'),
+            eq(applications.approvalStatus, current.status),
             isNull(applications.settlementId),
           ),
         )
         .returning({ id: applications.id });
       if (!changed.length) throw this.conflict();
-      return null;
+      const result = await this.detail(id, tx);
+      await tx
+        .update(applications)
+        .set({
+          reviewReplay: {
+            requestVersion: input.reviewVersion,
+            resultVersion: result.reviewVersion,
+          },
+        })
+        .where(eq(applications.id, id));
+      return result;
     });
-    return retained ?? this.detail(id);
   }
 
   private conflict() {
@@ -217,6 +236,7 @@ export class AdminMileageService {
           matchStatus: applications.matchStatus,
           status: applications.approvalStatus,
           rejectionReason: applications.rejectionReason,
+          reviewReplay: applications.reviewReplay,
           submittedAt: applications.submittedAt,
           decidedAt: applications.decidedAt,
           settlementId: applications.settlementId,
@@ -255,6 +275,7 @@ export class AdminMileageService {
         requestHash,
         idempotencyKey,
         ocrEvidence,
+        reviewReplay,
         ...row
       }) => {
         for (const amount of [
@@ -284,6 +305,12 @@ export class AdminMileageService {
               receiptPhotoIdentity,
               meterPhotoIdentity,
               ocrEvidence,
+              row.status,
+              row.finalAmount,
+              row.mileageAmount,
+              row.rejectionReason,
+              row.decidedAt,
+              reviewReplay?.requestVersion ?? null,
             ]),
           )
           .digest('hex');
