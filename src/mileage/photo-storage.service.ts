@@ -21,11 +21,28 @@ export class PhotoStorageService implements OnApplicationShutdown {
 
   ensureConfigured(): void {
     if (this.client) return;
-    const endpoint = process.env.SUPABASE_S3_ENDPOINT?.trim();
-    const region = process.env.SUPABASE_S3_REGION?.trim();
-    const bucket = process.env.SUPABASE_STORAGE_BUCKET?.trim();
-    const accessKeyId = process.env.SUPABASE_S3_ACCESS_KEY_ID?.trim();
-    const secretAccessKey = process.env.SUPABASE_S3_SECRET_ACCESS_KEY?.trim();
+    const useGenericConfig = [
+      'S3_ENDPOINT',
+      'S3_REGION',
+      'S3_BUCKET',
+      'S3_ACCESS_KEY_ID',
+      'S3_SECRET_ACCESS_KEY',
+      'S3_FORCE_PATH_STYLE',
+    ].some((name) => process.env[name] !== undefined);
+    const prefix = useGenericConfig ? 'S3' : 'SUPABASE_S3';
+    const endpoint = process.env[`${prefix}_ENDPOINT`]?.trim();
+    const region = process.env[`${prefix}_REGION`]?.trim();
+    const bucket = (
+      useGenericConfig
+        ? process.env.S3_BUCKET
+        : process.env.SUPABASE_STORAGE_BUCKET
+    )?.trim();
+    const accessKeyId = process.env[`${prefix}_ACCESS_KEY_ID`]?.trim();
+    const secretAccessKey = process.env[`${prefix}_SECRET_ACCESS_KEY`]?.trim();
+    const style = useGenericConfig
+      ? (process.env.S3_FORCE_PATH_STYLE ?? 'false')
+      : 'true';
+    if (style !== 'true' && style !== 'false') throw this.unavailable();
     if (!endpoint || !region || !bucket || !accessKeyId || !secretAccessKey) {
       throw this.unavailable();
     }
@@ -53,7 +70,7 @@ export class PhotoStorageService implements OnApplicationShutdown {
     this.client = new S3Client({
       region,
       endpoint,
-      forcePathStyle: true,
+      forcePathStyle: style === 'true',
       credentials: { accessKeyId, secretAccessKey },
       maxAttempts: 1,
       requestChecksumCalculation: 'WHEN_REQUIRED',

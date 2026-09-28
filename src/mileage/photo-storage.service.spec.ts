@@ -22,10 +22,17 @@ describe('PhotoStorageService', () => {
     'SUPABASE_STORAGE_BUCKET',
     'SUPABASE_S3_ACCESS_KEY_ID',
     'SUPABASE_S3_SECRET_ACCESS_KEY',
+    'S3_ENDPOINT',
+    'S3_REGION',
+    'S3_BUCKET',
+    'S3_ACCESS_KEY_ID',
+    'S3_SECRET_ACCESS_KEY',
+    'S3_FORCE_PATH_STYLE',
   ];
   let previous: (string | undefined)[];
   beforeEach(() => {
     previous = names.map((name) => process.env[name]);
+    names.slice(5).forEach((name) => delete process.env[name]);
     process.env.SUPABASE_S3_ENDPOINT =
       'https://isolated-test.storage.supabase.co/storage/v1/s3';
     process.env.SUPABASE_S3_REGION = 'ap-northeast-2';
@@ -66,6 +73,55 @@ describe('PhotoStorageService', () => {
       }),
     );
   });
+  it('uses generic S3 settings in preference to the legacy Supabase settings', () => {
+    process.env.S3_ENDPOINT = 'https://objects.example.com';
+    process.env.S3_REGION = 'ap-southeast-1';
+    process.env.S3_BUCKET = 'private-photos';
+    process.env.S3_ACCESS_KEY_ID = 'generic-key';
+    process.env.S3_SECRET_ACCESS_KEY = 'generic-secret';
+    storage.ensureConfigured();
+    expect(S3Client).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'https://objects.example.com',
+        region: 'ap-southeast-1',
+        forcePathStyle: false,
+        credentials: {
+          accessKeyId: 'generic-key',
+          secretAccessKey: 'generic-secret',
+        },
+      }),
+    );
+  });
+  it('allows generic S3 path-style access only when explicitly enabled', () => {
+    process.env.S3_ENDPOINT = 'https://objects.example.com';
+    process.env.S3_REGION = 'ap-southeast-1';
+    process.env.S3_BUCKET = 'private-photos';
+    process.env.S3_ACCESS_KEY_ID = 'generic-key';
+    process.env.S3_SECRET_ACCESS_KEY = 'generic-secret';
+    process.env.S3_FORCE_PATH_STYLE = 'true';
+    storage.ensureConfigured();
+    expect(S3Client).toHaveBeenCalledWith(
+      expect.objectContaining({ forcePathStyle: true }),
+    );
+  });
+  it('fails closed rather than mixing partial generic settings with legacy credentials', () => {
+    process.env.S3_ENDPOINT = 'https://objects.example.com';
+    expect(() => storage.ensureConfigured()).toThrow();
+    expect(S3Client).not.toHaveBeenCalled();
+  });
+  it.each(['', 'yes', ' false', 'TRUE'])(
+    'rejects an invalid generic S3 path-style value: %s',
+    (value) => {
+      process.env.S3_ENDPOINT = 'https://objects.example.com';
+      process.env.S3_REGION = 'ap-southeast-1';
+      process.env.S3_BUCKET = 'private-photos';
+      process.env.S3_ACCESS_KEY_ID = 'generic-key';
+      process.env.S3_SECRET_ACCESS_KEY = 'generic-secret';
+      process.env.S3_FORCE_PATH_STYLE = value;
+      expect(() => storage.ensureConfigured()).toThrow();
+      expect(S3Client).not.toHaveBeenCalled();
+    },
+  );
   it.each([
     'not-a-url',
     'http://remote.example.com/storage/v1/s3',

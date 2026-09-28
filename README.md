@@ -31,11 +31,11 @@
 $ pnpm install
 ```
 
-## PostgreSQL and Supabase configuration
+## PostgreSQL and private S3 storage configuration
 
 Local and deployed servers use PostgreSQL through Drizzle and `postgres`. Copy `.env.example` to `.env` and set `DATABASE_URL`; there is no local file database fallback. Existing Nest authentication and API contracts are unchanged; Supabase Auth and the browser Data API are not used.
 
-- Runtime: use the Supabase Session pooler URL (port 5432) with this Postgres.js driver. Supabase warns that Postgres.js pipelining is incompatible with its shared Transaction pooler (port 6543), which the server rejects. Vercel uses one connection per warm instance; a persistent server uses a pool of five. Prepared statements remain disabled. A persistent server can also use a Direct URL.
+- Runtime: deployed Railway services use the PostgreSQL private URL in the same project/environment. For Supabase connections, use the Session pooler (5432) or Direct URL; its shared Transaction pooler (6543) is incompatible with Postgres.js pipelining and is rejected. Vercel uses one connection per warm instance; a persistent server uses a pool of five. Prepared statements remain disabled.
 - Remote runtime and migration connections require TLS with certificate and hostname verification; only loopback development connections use plaintext. The public Supabase Root 2021 CA from the official Dashboard download is bundled for Supabase database hosts. Other PostgreSQL hosts use Node's trusted roots by default. Set `DATABASE_CA_CERT` to a private root CA PEM for Railway internal PostgreSQL; the runtime, migration command and transfer verifier share this setting. Supabase hosts continue using the bundled Supabase CA. Do not disable certificate verification.
 - Migrations: set `DATABASE_MIGRATION_URL` to a Direct or Session pooler connection, then run `pnpm db:migrate` before starting the server. Startup does not create or migrate tables. The initial migration targets an empty application schema; it does not import legacy data.
 - Application tables live in the private `app` schema. Do not expose this schema through the Supabase Data API or grant `anon` / `authenticated` access. Database credentials stay on the API server.
@@ -231,15 +231,30 @@ Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
 
 The same user/key/original bytes replay the existing application. Different original bytes with the same key return `409 IDEMPOTENCY_CONFLICT`. Keys remain with application records. Concurrent processing can return `503`; retry with the same key and the same original bytes. Photo acceptance does not promise approval; OCR uses the asynchronous worker described below.
 
-Set `SUPABASE_S3_ENDPOINT`, `SUPABASE_S3_REGION`, `SUPABASE_STORAGE_BUCKET`, `SUPABASE_S3_ACCESS_KEY_ID`, and `SUPABASE_S3_SECRET_ACCESS_KEY` for an existing private Supabase Storage bucket. Copy the endpoint, region and generated S3 key pair from Storage > S3; Auth/service-role keys are not S3 credentials. S3 keys bypass RLS and must remain server-only; existing Nest session and photo ownership checks still protect access. Missing or invalid configuration fails photo operations with `503`. The server never provisions a bucket or enables public access. API tests replace the storage boundary and do not contact hosted storage.
+Set `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` for an existing private S3-compatible bucket. Set `S3_FORCE_PATH_STYLE=false` (the default) for new Railway buckets; use `true` only when the bucket's Credentials tab specifies path-style URLs. Values other than the exact strings `true` and `false` are rejected. Use the provider's actual S3 bucket name and signing region, not its display name or the API server's region. Credentials remain server-only; existing Nest session and photo ownership checks still protect access. Missing or invalid configuration fails photo operations with `503`. The server never provisions a bucket or enables public access. API tests replace the storage boundary and do not contact hosted storage.
 
-Set both the project and bucket upload limits to allow the existing exact maximum of 52,428,800 bytes (50 MiB) per photo. Use HTTPS for hosted storage. Local Supabase can use `http://127.0.0.1:54321/storage/v1/s3` and region `local` outside production. Preserve every original and normalized object key when transferring existing photos. A storage migration alone does not bypass Vercel's 4.5 MB function request limit; large multipart uploads and the persistent OCR worker still require the separately planned API hosting change.
+For deployment compatibility, the old `SUPABASE_S3_ENDPOINT`, `SUPABASE_S3_REGION`, `SUPABASE_STORAGE_BUCKET`, `SUPABASE_S3_ACCESS_KEY_ID`, and `SUPABASE_S3_SECRET_ACCESS_KEY` bundle remains supported with path-style URLs only when **none** of the six generic `S3_*` settings exists. Even a blank or partial generic configuration selects the new bundle and fails closed instead of mixing credentials from two stores.
+
+Allow the existing exact maximum of 52,428,800 bytes (50 MiB) per photo in any provider upload limits. Use HTTPS for hosted storage. Local Supabase can use `http://127.0.0.1:54321/storage/v1/s3`, region `local`, and path-style URLs outside production. Preserve every original and normalized object key when transferring existing photos. A storage migration alone does not bypass Vercel's 4.5 MB function request limit; the production API now runs on Railway.
 
 Originals and normalized copies remain private. Normalization corrects orientation, converts to sRGB JPEG quality 90, limits the long edge to 4096px and removes EXIF/GPS. Image decoding runs in a timed worker with bounded pixel/memory use; one decoder and at most two multipart requests run per server process. Excess concurrent requests return a retryable `503`. HEIC decoding uses ImageMagick WASM, retaining its source color profile through conversion to sharp. The worker asset is copied by the Nest build.
 
 The PostgreSQL schema includes request fingerprints, original-photo metadata and `mileage_upload_attempts`. An attempt with all candidate storage keys is recorded before remote writes. Application/photo metadata and removal of the attempt commit together. Failed attempts retain their records, including ambiguous remote writes; cleanup only targets that attempt's uncommitted objects. A process interruption may leave an attempt requiring manual reconciliation. There is no automatic retention or deletion job, and accepted application/settlement records are preserved.
 
-The committed HEIC test fixture is a generated solid-color image, not a user receipt. Hosted Supabase credentials, bucket configuration and hosted upload/read validation are separate from the isolated tests.
+The committed HEIC test fixture is a generated solid-color image, not a user receipt. Hosted credentials, bucket configuration and hosted upload/read validation are separate from the isolated tests.
+
+### Supabase Storage → Railway Bucket 이전
+
+1. Deploy the compatible server code while only the old Supabase settings exist. Create a private Railway bucket in Singapore (`sin`), matching the API region. Keep the original bucket and its credentials during the transfer.
+2. The operator stages the six `S3_*` settings on the API service with `railway variable set --skip-deploys`. Map the bucket's `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, and `SECRET_ACCESS_KEY` through Railway variable references. Use the Credentials tab's URL style. Do not deploy the new settings before copying the objects.
+3. Stop new requests, let uploads/OCR finish, and stop the API/worker. Check that running OCR jobs and unreconciled upload attempts are zero in the Railway DB. Keep writers stopped until copying and comparison finish.
+4. With both storage configurations supplied to the operator's local process, run `bash scripts/copy-photo-storage.sh`. It uses `rclone copy --immutable --metadata`, keeps the source, preserves object keys, and then uses `rclone check --download` to compare the actual bytes. It prints only counts and a result; detailed errors remain in a private local log. `rclone` must be installed separately. Never use `sync`, `purge`, or `delete` for this transfer.
+5. Compare the DB's `storage_key` and `original_storage_key` references with destination objects, then start the server with the new settings and OCR temporarily disabled. Verify an existing driver/admin photo plus a new upload/read/delete of a synthetic object. Restore the previous OCR setting after validation. Application and admin API paths remain unchanged; neither client receives storage credentials.
+6. Only after validation remove the old server-side Supabase storage settings. Keep the source while investigating any failure. After new uploads begin on Railway, changing back to Supabase without copying those new objects would leave broken DB references. Supabase project deletion is a separate action after both DB and Storage dependencies have been removed; check local development configuration separately.
+
+Run `python3 scripts/check-copy-photo-storage.py` for the transfer script's synthetic command-order and failure checks; it does not access hosted storage or real credentials.
+
+References: [Railway buckets](https://docs.railway.com/storage-buckets), [rclone copy](https://rclone.org/commands/rclone_copy/), [rclone check](https://rclone.org/commands/rclone_check/).
 
 ## OCR automatic approval (disabled by default)
 
