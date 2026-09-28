@@ -65,14 +65,35 @@ export class SettlementsService {
     return this.database.connection;
   }
 
-  async list(month: string) {
+  private eligibleApplications(month: string) {
     const before = monthEnd(month);
+    // Keep the original KST registration month unless that company's earlier
+    // monthly files are already frozen. A gap stops carryover at that month.
+    return this.db`
+      a.approval_status = 'approved' AND a.settlement_id IS NULL
+      AND a.submitted_at::timestamptz < ${before}::timestamptz
+      AND NOT EXISTS (
+        SELECT 1 FROM generate_series(
+          date_trunc('month', a.submitted_at::timestamptz AT TIME ZONE 'Asia/Seoul'),
+          ${`${month}-01`}::timestamp - interval '1 month', interval '1 month'
+        ) AS prior(month)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM app.settlements s
+          LEFT JOIN app.settlement_snapshots p ON p.settlement_id = s.id
+          WHERE s.logistics_company_id = a.logistics_company_id
+            AND s.settlement_month = to_char(prior.month, 'YYYY-MM')
+            AND (p.settlement_id IS NOT NULL OR s.transfer_status = 'completed')
+        )
+      )`;
+  }
+
+  async list(month: string) {
+    const eligible = this.eligibleApplications(month);
     const [candidates, existing, companies] = await Promise.all([
       this.db<{ id: string; amount: string | number }[]>`
         SELECT logistics_company_id AS id, SUM(mileage_amount)::text AS amount
-        FROM app.mileage_applications
-        WHERE approval_status = 'approved' AND settlement_id IS NULL
-          AND decided_at::timestamptz < ${before}::timestamptz
+        FROM app.mileage_applications a
+        WHERE ${eligible}
         GROUP BY logistics_company_id`,
       this.db<Settlement[]>`
         SELECT s.logistics_company_id AS id, s.transfer_status AS status, p.bank_code, p.account_number, p.account_holder,
@@ -122,7 +143,7 @@ export class SettlementsService {
   }
 
   async export(month: string, adminId: string) {
-    const before = monthEnd(month);
+    const eligible = this.eligibleApplications(month);
     return this.db.begin(async (tx) => {
       // This makes repeated exports of the same month one atomic capture.
       await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;
@@ -138,9 +159,8 @@ export class SettlementsService {
 
       const groups = await tx<{ id: string }[]>`
         SELECT logistics_company_id AS id
-        FROM app.mileage_applications
-        WHERE approval_status = 'approved' AND settlement_id IS NULL
-          AND decided_at::timestamptz < ${before}::timestamptz
+        FROM app.mileage_applications a
+        WHERE ${eligible}
         GROUP BY logistics_company_id`;
       for (const group of groups) {
         const existing = await tx<{ id: string }[]>`
@@ -166,12 +186,10 @@ export class SettlementsService {
             id, logistics_company_id, settlement_month, transfer_status, created_at, updated_at
           ) VALUES (${id}, ${company.id}, ${month}, 'pending', ${now}, ${now})`;
         const captured = await tx<Amount[]>`
-          UPDATE app.mileage_applications
+          UPDATE app.mileage_applications a
           SET settlement_id = ${id}
           WHERE logistics_company_id = ${company.id}
-            AND approval_status = 'approved'
-            AND settlement_id IS NULL
-            AND decided_at::timestamptz < ${before}::timestamptz
+            AND ${eligible}
           RETURNING mileage_amount::text AS amount`;
         const amount = integer(
           captured

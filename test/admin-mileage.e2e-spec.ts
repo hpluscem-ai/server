@@ -662,6 +662,7 @@ describe('Admin mileage reads and review (e2e)', () => {
         approvalStatus: 'approved',
         finalAmount: 10000,
         mileageAmount: 100,
+        submittedAt: '2020-09-22T00:00:00Z',
         decidedAt: '2020-09-22T00:00:00Z',
       })
       .where(eq(mileageApplications.id, applicationId));

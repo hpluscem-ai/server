@@ -230,14 +230,66 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       'settlements-2026-08.xls',
     );
   });
-  test('KST cutoff, late approvals, pending and rejected amounts are distinct', async () => {
-    await addApplication(companyId, userId, 700, '2026-08-31T15:00:00.000Z');
+  test('KST registration month excludes adjacent registrations but includes later approvals', async () => {
+    const late = await addApplication(
+      companyId,
+      userId,
+      700,
+      '2026-09-01T00:00:00Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      100,
+      undefined,
+      'approved',
+      'matched',
+      '2026-07-31T15:00:00Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      200,
+      undefined,
+      'approved',
+      'matched',
+      '2026-08-31T14:59:59.999Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      400,
+      '2026-09-01T00:00:00Z',
+      'approved',
+      'matched',
+      '2026-08-31T15:00:00Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      600,
+      undefined,
+      'approved',
+      'matched',
+      '2026-07-31T14:59:59.999Z',
+    );
     await addApplication(companyId, userId, 900, undefined, 'pending');
     await addApplication(companyId, userId, 800, undefined, 'rejected');
-    expect((await service.list(month))[0].mileage).toBe(3000);
+    const response = await request(app.getHttpServer())
+      .get(`${root}?month=${month}`)
+      .set('Authorization', authorization)
+      .expect(200);
+    expect((response.body as { mileage: number }[])[0].mileage).toBe(4000);
+    expect((await service.list('2026-07'))[0].mileage).toBe(600);
+    expect((await service.list('2026-09'))[0].mileage).toBe(400);
     await service.export(month, adminId);
-    expect((await snapshots())[0].mileage_amount).toBe(3000);
-    expect((await service.list('2026-09'))[0].mileage).toBe(700);
+    expect((await snapshots())[0].mileage_amount).toBe(4000);
+    expect(
+      (
+        await db()`SELECT settlement_id FROM app.mileage_applications WHERE id = ${late}`
+      )[0].settlement_id,
+    ).toBe((await snapshots())[0].settlement_id);
+    expect((await service.list('2026-09'))[0].mileage).toBe(400);
   });
   test('first download freezes applications and accounts; later candidates carry into next month', async () => {
     await service.export(month, adminId);
@@ -253,6 +305,10 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       bankCode: '4',
     });
     expect((await service.list('2026-09'))[0].mileage).toBe(500);
+    expect((await service.list('2026-10'))[0].mileage).toBe(0);
+    await service.export('2026-09', adminId);
+    expect((await service.list('2026-09'))[0].mileage).toBe(500);
+    expect((await service.list('2026-10'))[0].mileage).toBe(0);
     await expect(
       db()`UPDATE app.mileage_applications SET mileage_amount = 1 WHERE id = ${applicationId}`,
     ).rejects.toThrow(/captured/);
@@ -265,6 +321,119 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     await expect(
       db()`UPDATE app.settlements SET settlement_month = '2026-07'`,
     ).rejects.toThrow();
+  });
+  test('late registrations carry only across consecutive frozen months of their own company', async () => {
+    await service.export(month, adminId);
+    const original = (await snapshots())[0];
+    await addApplication(
+      companyId,
+      userId,
+      100,
+      '2026-10-02T00:00:00Z',
+      'approved',
+      'matched',
+      '2026-10-01T00:00:00Z',
+    );
+    await service.export('2026-10', adminId);
+    const late = await addApplication(
+      companyId,
+      userId,
+      500,
+      '2026-11-02T00:00:00Z',
+    );
+    const otherCompany = await addCompany('81', '002222');
+    await addApplication(
+      otherCompany,
+      await addUser(otherCompany),
+      900,
+      '2026-11-02T00:00:00Z',
+    );
+    expect(
+      (await service.list('2026-09')).find((r) => r.id === companyId)?.mileage,
+    ).toBe(500);
+    expect(
+      (await service.list('2026-09')).find((r) => r.id === otherCompany)
+        ?.mileage,
+    ).toBe(0);
+    expect(
+      (await service.list(month)).find((r) => r.id === otherCompany)?.mileage,
+    ).toBe(900);
+    expect(
+      (await service.list('2026-11')).find((r) => r.id === companyId)?.mileage,
+    ).toBe(0);
+    await service.export('2026-09', adminId);
+    expect(
+      (
+        await db()`SELECT s.settlement_month FROM app.mileage_applications a JOIN app.settlements s ON s.id = a.settlement_id WHERE a.id = ${late}`
+      )[0].settlement_month,
+    ).toBe('2026-09');
+    const latest = await addApplication(
+      companyId,
+      userId,
+      700,
+      '2026-11-03T00:00:00Z',
+    );
+    expect(
+      (await service.list('2026-11')).find((r) => r.id === companyId)?.mileage,
+    ).toBe(700);
+    await service.export('2026-11', adminId);
+    expect(
+      (
+        await db()`SELECT s.settlement_month FROM app.mileage_applications a JOIN app.settlements s ON s.id = a.settlement_id WHERE a.id = ${latest}`
+      )[0].settlement_month,
+    ).toBe('2026-11');
+    expect(
+      (await snapshots()).find(
+        (s) => s.settlement_id === original.settlement_id,
+      ),
+    ).toEqual(original);
+  });
+  test('a legacy pending month without a snapshot cannot move registrations into another month', async () => {
+    await db()`INSERT INTO app.settlements(id, logistics_company_id, settlement_month, transfer_status) VALUES (${randomUUID()}, ${companyId}, ${month}, 'pending')`;
+    expect((await service.list('2026-09'))[0].mileage).toBe(0);
+    await expect(service.export('2026-09', adminId)).rejects.toThrow();
+    expect(await snapshots()).toHaveLength(0);
+  });
+  test('a completed legacy month preserves its amount and carries only new unassigned registrations forward', async () => {
+    const legacyId = randomUUID();
+    await db()`INSERT INTO app.settlements(id, logistics_company_id, settlement_month) VALUES (${legacyId}, ${companyId}, ${month})`;
+    await db()`UPDATE app.mileage_applications SET settlement_id = ${legacyId} WHERE id = ${applicationId}`;
+    await db()`UPDATE app.settlements SET transfer_status = 'completed', transferred_at = '2026-09-01T00:00:00Z' WHERE id = ${legacyId}`;
+    const original = (
+      await db()`SELECT * FROM app.settlements WHERE id = ${legacyId}`
+    )[0];
+    await addApplication(companyId, userId, 500, '2026-09-02T00:00:00Z');
+    expect((await service.list(month))[0]).toMatchObject({
+      mileage: 3000,
+      transferStatus: 'completed',
+    });
+    expect((await service.list('2026-09'))[0].mileage).toBe(500);
+    await service.export('2026-09', adminId);
+    expect((await snapshots())[0].mileage_amount).toBe(500);
+    expect(
+      (await db()`SELECT * FROM app.settlements WHERE id = ${legacyId}`)[0],
+    ).toEqual(original);
+  });
+  test('concurrent adjacent-month exports capture a late registration only in its first unfrozen month', async () => {
+    await service.export(month, adminId);
+    const late = await addApplication(
+      companyId,
+      userId,
+      500,
+      '2026-10-02T00:00:00Z',
+    );
+    const outcomes = await Promise.allSettled([
+      service.export('2026-09', adminId),
+      service.export('2026-10', adminId),
+    ]);
+    expect(outcomes.map((r) => r.status)).toEqual(['fulfilled', 'rejected']);
+    expect(
+      (
+        await db()`SELECT s.settlement_month FROM app.mileage_applications a JOIN app.settlements s ON s.id = a.settlement_id WHERE a.id = ${late}`
+      )[0].settlement_month,
+    ).toBe('2026-09');
+    expect(await snapshots()).toHaveLength(2);
+    expect((await service.list('2026-10'))[0].mileage).toBe(0);
   });
   test.each(['biff8', 'xlsx'] as const)(
     '%s valid uploaded paid rows complete once and identical reupload keeps timestamp',
@@ -396,7 +565,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await completed()).toBe(1);
   });
   test('same bank, recipient, and amount across months is ambiguous even with CMS', async () => {
-    await db()`UPDATE app.mileage_applications SET decided_at = '2026-07-31T00:00:00Z' WHERE id = ${applicationId}`;
+    await db()`UPDATE app.mileage_applications SET submitted_at = '2026-07-20T00:00:00Z', decided_at = '2026-07-31T00:00:00Z' WHERE id = ${applicationId}`;
     await service.export('2026-07', adminId);
     const previous = (await snapshots())[0];
     await upload(workbook([row(previous)]), '2026-07').expect(200);
@@ -777,15 +946,49 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3250 });
   });
   test('no approved record is dropped at the leap-day and year KST boundaries', async () => {
-    await addApplication(companyId, userId, 10, '2024-02-29T14:59:59.999Z');
-    await addApplication(companyId, userId, 20, '2024-02-29T15:00:00Z');
-    await addApplication(companyId, userId, 30, '2024-12-31T14:59:59.999Z');
-    await addApplication(companyId, userId, 40, '2024-12-31T15:00:00Z');
+    await addApplication(
+      companyId,
+      userId,
+      10,
+      '2024-02-29T14:59:59.999Z',
+      'approved',
+      'matched',
+      '2024-02-29T14:59:59.999Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      20,
+      '2024-02-29T15:00:00Z',
+      'approved',
+      'matched',
+      '2024-02-29T15:00:00Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      30,
+      '2024-12-31T14:59:59.999Z',
+      'approved',
+      'matched',
+      '2024-12-31T14:59:59.999Z',
+    );
+    await addApplication(
+      companyId,
+      userId,
+      40,
+      '2024-12-31T15:00:00Z',
+      'approved',
+      'matched',
+      '2024-12-31T15:00:00Z',
+    );
     expect((await service.list('2024-02'))[0].mileage).toBe(10);
     expect(
       (await service.dashboard('2024-02-29', '2024-02-29')).accumulatedMileage,
     ).toBe(10);
-    expect((await service.list('2024-12'))[0].mileage).toBe(60);
+    expect((await service.list('2024-03'))[0].mileage).toBe(20);
+    expect((await service.list('2024-12'))[0].mileage).toBe(30);
+    expect((await service.list('2025-01'))[0].mileage).toBe(40);
   });
   test('Swagger publishes all three settlement endpoints, dashboard and full balance contract', async () => {
     const res = await request(app.getHttpServer())

@@ -91,7 +91,7 @@ export class SettlementsController {
   @ApiOperation({
     summary: '월별 물류사 정산 조회',
     description:
-      'KST 월말까지 승인된 미정산 건. 첫 다운로드에 대상·마일리지(1=1원)·계좌를 고정. 비활성 물류사의 정산 이력도 보존.',
+      'KST 최초 신청 등록월 기준 승인·미정산 건. 해당 물류사의 등록월 파일이 이미 고정된 경우 다음 미확정 월로 이월하며, 미확정 월을 건너뛰지 않음. 첫 다운로드에 대상·마일리지(1=1원)·계좌를 고정하고 기존 정산 이력을 보존.',
   })
   list(@Query() query: MonthQuery) {
     return this.service.list(query.month);
@@ -102,7 +102,7 @@ export class SettlementsController {
   @ApiOperation({
     summary: '대량이체 XLS 다운로드 및 정산 대상 확정',
     description:
-      '월 마감 전에도 다운로드 가능. 첫 다운로드에 정산 대상을 확정하며 다운로드는 지급 완료가 아님. 재다운로드는 동일한 미완료 대상. CMS코드에 정산 식별키 포함.',
+      '조회와 같은 KST 등록월·이월 조건으로 대상 확정. 월 마감 전에도 다운로드 가능. 물류사별 첫 다운로드에 정산 대상을 고정하며 다운로드는 지급 완료가 아님. 이후 추가 승인 건은 다음 미확정 월로 이월. 재다운로드는 동일한 미완료 대상. CMS코드에 정산 식별키 포함.',
   })
   @ApiProduces('application/vnd.ms-excel')
   @ApiOkResponse({ schema: { type: 'string', format: 'binary' } })
