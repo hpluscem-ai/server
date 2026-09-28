@@ -21,6 +21,7 @@ type Snapshot = {
   reference: string;
   bank_code: string;
   account_number: string;
+  account_holder: string;
   mileage_amount: number;
 };
 function workbook(
@@ -88,7 +89,7 @@ function row(s: Snapshot): unknown[] {
     s.bank_code.padStart(3, '0'),
     s.account_number,
     s.mileage_amount,
-    '',
+    s.account_holder,
     '',
     s.reference,
     '',
@@ -129,7 +130,11 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
           WHERE transfer_status = 'completed'`
       )[0].count,
     );
-  async function addCompany(bank = '4', account = '001234567890') {
+  async function addCompany(
+    bank = '4',
+    account = '001234567890',
+    accountHolder = '예금주',
+  ) {
     const id = randomUUID();
     await db()`
       INSERT INTO app.logistics_companies(
@@ -138,7 +143,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         account_number, account_holder
       ) VALUES (
         ${id}, ${'테스트 물류'}, ${id}, ${id}, ${'서울'}, ${'담당자'},
-        ${'01012345678'}, ${bank}, ${account}, ${'예금주'}
+        ${'01012345678'}, ${bank}, ${account}, ${accountHolder}
       )`;
     return id;
   }
@@ -336,13 +341,13 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     ['formula text amount', 2, '=3000'],
     ['scientific amount', 2, '3e3'],
     ['empty amount', 2, ''],
-    ['wrong account', 1, '991234567890'],
-    ['masked account', 1, '**********'],
-    ['numeric account', 1, 1234567890],
     ['empty bank', 0, ''],
     ['wrong bank', 0, '081'],
-    ['wrong reference', 5, '1111111111'],
-    ['invalid reference', 5, 'abc'],
+    ['empty recipient', 3, ''],
+    ['whitespace recipient', 3, '   '],
+    ['numeric recipient', 3, 1],
+    ['long recipient', 3, 'a'.repeat(101)],
+    ['wrong recipient', 3, '다른 예금주'],
   ])('reject %s without mutation', async (_name, column, value) => {
     await service.export(month, adminId);
     const r = row((await snapshots())[0]);
@@ -350,6 +355,21 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     await upload(workbook([r])).expect(400);
     expect(await completed()).toBe(0);
   });
+  test.each([
+    ['masked account and blank CMS', '**********', ''],
+    ['blank account and irrelevant CMS', '', '은행 결과 코드'],
+    ['different numeric account and CMS', 1234567890, 9876543210],
+  ])(
+    '%s still matches bank, recipient, and amount',
+    async (_name, account, cms) => {
+      await service.export(month, adminId);
+      const r = row((await snapshots())[0]);
+      r[1] = account;
+      r[5] = cms;
+      await upload(workbook([r])).expect(200);
+      expect(await completed()).toBe(1);
+    },
+  );
   test('duplicate rows reject the whole file, including equivalent bank code/name forms', async () => {
     await service.export(month, adminId);
     const a = row((await snapshots())[0]);
@@ -361,14 +381,21 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     );
     expect(await completed()).toBe(0);
   });
-  test('missing CMS is accepted only when bank/account/amount is globally unique', async () => {
+  test('blank CMS is accepted when bank, recipient, and amount are globally unique', async () => {
     await service.export(month, adminId);
     const r = row((await snapshots())[0]);
     r[5] = '';
     await upload(workbook([r])).expect(200);
     expect(await completed()).toBe(1);
   });
-  test('same account and amount across months require CMS; old file cannot complete the next month', async () => {
+  test('trimmed recipient matches the captured account holder', async () => {
+    await service.export(month, adminId);
+    const r = row((await snapshots())[0]);
+    r[3] = `  ${String(r[3])}  `;
+    await upload(workbook([r])).expect(200);
+    expect(await completed()).toBe(1);
+  });
+  test('same bank, recipient, and amount across months is ambiguous even with CMS', async () => {
     await db()`UPDATE app.mileage_applications SET decided_at = '2026-07-31T00:00:00Z' WHERE id = ${applicationId}`;
     await service.export('2026-07', adminId);
     const previous = (await snapshots())[0];
@@ -378,13 +405,12 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     const current = (await snapshots()).find(
       (s) => s.settlement_id !== previous.settlement_id,
     )!;
-    const noCms = row(current);
-    noCms[5] = '';
-    await upload(workbook([noCms])).expect(400);
+    const result = row(current);
+    result[1] = '**********';
+    result[5] = current.reference;
+    await upload(workbook([result])).expect(400);
     await upload(workbook([row(previous)])).expect(400);
     expect(await completed()).toBe(1);
-    await upload(workbook([row(current)])).expect(200);
-    expect(await completed()).toBe(2);
   });
   test.each(['2026-07', '2026-09'])(
     'wrong selected month %s refuses an otherwise valid file',
@@ -404,14 +430,17 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     await upload(workbook((await snapshots()).map(row))).expect(200);
     expect(await completed()).toBe(1);
   });
-  test('same destination across companies requires CMS', async () => {
-    const other = await addCompany();
+  test('same bank, recipient, and amount across companies rejects the whole file', async () => {
+    const other = await addCompany('4', '000222');
     await addApplication(other, await addUser(other));
     await service.export(month, adminId);
-    const r = row((await snapshots())[0]);
-    r[5] = '';
-    await upload(workbook([r])).expect(400);
+    await upload(workbook((await snapshots()).map(row))).expect(400);
     expect(await completed()).toBe(0);
+  });
+  test('same bank and amount with different recipients completes independently', async () => {
+    const other = await addCompany('4', '000222', '다른 예금주');
+    await addApplication(other, await addUser(other));
+    await service.export(month, adminId);
     await upload(workbook((await snapshots()).map(row))).expect(200);
     expect(await completed()).toBe(2);
   });
@@ -734,14 +763,13 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     ).rejects.toThrow();
     await expect(service.export(month, adminId)).rejects.toThrow();
   });
-  test('changing account information after export does not accept payment to the new account', async () => {
+  test('changed account information after export does not affect payment matching', async () => {
     await service.export(month, adminId);
     const r = row((await snapshots())[0]);
     await db()`UPDATE app.logistics_companies SET account_number = '009999' WHERE id = ${companyId}`;
     r[1] = '009999';
-    await upload(workbook([r])).expect(400);
-    expect(await completed()).toBe(0);
-    await upload(workbook((await snapshots()).map(row))).expect(200);
+    await upload(workbook([r])).expect(200);
+    expect(await completed()).toBe(1);
   });
   test('all-month balance exceeds a single page and isolates the current driver', async () => {
     for (let i = 0; i < 25; i++) await addApplication(companyId, userId, 10);

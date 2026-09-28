@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import * as XLSX from 'xlsx';
-import { invalid, integer, account } from './settlement-policy';
+import { invalid, integer } from './settlement-policy';
 
 export const uploadHeaders = [
   '입금은행',
@@ -28,9 +28,8 @@ let runningParsers = 0;
 
 export type TransferRow = {
   bank: string;
-  account: string;
+  accountHolder: string;
   amount: number;
-  reference: string;
 };
 export type ExportRow = {
   bank_code: string;
@@ -154,13 +153,13 @@ export async function importWorkbook(bytes: Buffer): Promise<TransferRow[]> {
       invalid();
     const bank = String(row[0]).trim();
     if (!bank || bank.length > 50) invalid();
-    const reference = row[5] === '' ? '' : String(row[5]);
-    if (reference && !/^\d{10}$/.test(reference)) invalid();
+    if (typeof row[3] !== 'string') invalid();
+    const accountHolder = row[3].trim();
+    if (!accountHolder || accountHolder.length > 100) invalid();
     return {
       bank,
-      account: account(row[1]),
+      accountHolder,
       amount: integer(row[2]),
-      reference,
     };
   });
 }

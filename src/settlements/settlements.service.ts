@@ -36,6 +36,8 @@ type Company = {
   active: boolean;
 };
 type Amount = { amount: string | number };
+const matchingKey = (accountHolder: string, amount: number) =>
+  JSON.stringify([accountHolder.trim(), amount]);
 type Settlement = {
   id: string;
   status: 'pending' | 'completed';
@@ -230,17 +232,9 @@ export class SettlementsService {
     snapshots: Map<string, Snapshot[]>,
     month: string,
   ): Snapshot {
-    const key = row.reference
-      ? `r:${row.reference}`
-      : `d:${row.account}:${row.amount}`;
-    const matches = (snapshots.get(key) ?? []).filter(
-      (snapshot) =>
-        (!row.reference || snapshot.reference === row.reference) &&
-        snapshot.account_number === row.account &&
-        integer(snapshot.mileage_amount) === row.amount &&
-        this.bankMatches(row.bank, snapshot.bank_code),
-    );
-    // Without CMS, match across all months so an old file cannot pay the next month's identical amount.
+    const matches = (
+      snapshots.get(matchingKey(row.accountHolder, row.amount)) ?? []
+    ).filter((snapshot) => this.bankMatches(row.bank, snapshot.bank_code));
     if (matches.length !== 1 || matches[0].settlement_month !== month)
       invalid('SETTLEMENT_ROW_MISMATCH');
     return matches[0];
@@ -262,14 +256,15 @@ export class SettlementsService {
         FOR UPDATE OF s`;
       const index = new Map<string, Snapshot[]>();
       for (const snapshot of snapshots) {
-        for (const key of [
-          `r:${snapshot.reference}`,
-          `d:${snapshot.account_number}:${snapshot.mileage_amount}`,
-        ]) {
-          const group = index.get(key);
-          if (group) group.push(snapshot);
-          else index.set(key, [snapshot]);
-        }
+        const accountHolder = snapshot.account_holder?.trim();
+        if (!accountHolder) continue;
+        const key = matchingKey(
+          accountHolder,
+          integer(snapshot.mileage_amount),
+        );
+        const group = index.get(key);
+        if (group) group.push(snapshot);
+        else index.set(key, [snapshot]);
       }
       const targets = rows.map((row) => this.resolveRow(row, index, month));
       if (
