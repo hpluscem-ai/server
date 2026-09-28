@@ -67,7 +67,7 @@ class DashboardQuery {
 @ApiBadRequestResponse({
   type: ApiErrorResponseDto,
   description:
-    'VALIDATION_ERROR | SETTLEMENT_FILE_INVALID | SETTLEMENT_ROW_MISMATCH | SETTLEMENT_DUPLICATE_ROW | SETTLEMENT_MONTH_NOT_CLOSED | SETTLEMENT_EXPORT_EMPTY | SETTLEMENT_SNAPSHOT_MISSING | SETTLEMENT_ACCOUNT_INVALID | SETTLEMENT_AMOUNT_INVALID | SETTLEMENT_IMPORT_BUSY',
+    'VALIDATION_ERROR | SETTLEMENT_FILE_INVALID | SETTLEMENT_ROW_MISMATCH | SETTLEMENT_DUPLICATE_ROW | SETTLEMENT_EXPORT_EMPTY | SETTLEMENT_SNAPSHOT_MISSING | SETTLEMENT_ACCOUNT_INVALID | SETTLEMENT_AMOUNT_INVALID | SETTLEMENT_IMPORT_BUSY',
 })
 @ApiUnauthorizedResponse({
   type: ApiErrorResponseDto,
@@ -102,7 +102,7 @@ export class SettlementsController {
   @ApiOperation({
     summary: '대량이체 XLS 다운로드 및 정산 대상 확정',
     description:
-      '마감된 월만 허용. 다운로드는 지급 완료가 아니며 재다운로드는 동일한 미완료 대상. CMS코드에 정산 식별키 포함.',
+      '월 마감 전에도 다운로드 가능. 첫 다운로드에 정산 대상을 확정하며 다운로드는 지급 완료가 아님. 재다운로드는 동일한 미완료 대상. CMS코드에 정산 식별키 포함.',
   })
   @ApiProduces('application/vnd.ms-excel')
   @ApiOkResponse({ schema: { type: 'string', format: 'binary' } })

@@ -123,7 +123,6 @@ export class SettlementsService {
 
   async export(month: string, adminId: string) {
     const before = monthEnd(month);
-    if (Date.parse(before) > Date.now()) invalid('SETTLEMENT_MONTH_NOT_CLOSED');
     return this.db.begin(async (tx) => {
       // This makes repeated exports of the same month one atomic capture.
       await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;

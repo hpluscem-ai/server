@@ -888,8 +888,25 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         .expect(400);
     },
   );
-  test('unclosed month export cannot capture records, and no eligible rows is an error rather than a completed payment', async () => {
-    await expect(service.export('9999-01', adminId)).rejects.toThrow();
+  test('an unclosed month exports once and repeated downloads preserve the captured targets without completing payment', async () => {
+    const clock = jest
+      .spyOn(Date, 'now')
+      .mockReturnValue(Date.parse('2026-08-31T14:59:59.999Z'));
+    try {
+      const bytes = await service.export(month, adminId);
+      expect(bytes.subarray(0, 8).toString('hex')).toBe('d0cf11e0a1b11ae1');
+      const captured = await snapshots();
+      expect(captured).toHaveLength(1);
+      await addApplication(companyId, userId, 100);
+      await service.export(month, adminId);
+      expect(await snapshots()).toEqual(captured);
+      expect(await completed()).toBe(0);
+      expect((await service.list(month))[0].mileage).toBe(3000);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  test('no eligible rows is an error rather than a completed payment', async () => {
     await expect(service.export('2026-01', adminId)).rejects.toThrow();
     expect(await snapshots()).toHaveLength(0);
   });
