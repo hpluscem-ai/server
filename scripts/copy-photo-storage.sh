@@ -48,6 +48,6 @@ rclone size --config /dev/null --log-file "$transfer_log" --json "$source_bucket
 rclone copy --config /dev/null --log-file "$transfer_log" --stats 0 \
   --immutable --metadata --transfers 2 --checkers 2 "$source_bucket" "$destination_bucket"
 rclone check --config /dev/null --log-file "$transfer_log" --stats 0 \
-  --download --checkers 2 "$source_bucket" "$destination_bucket"
+  --download --one-way --checkers 2 "$source_bucket" "$destination_bucket"
 rclone size --config /dev/null --log-file "$transfer_log" --json "$destination_bucket"
-printf 'Storage transfer verification passed.\n'
+printf 'Storage copy verification passed. Cutover verification is still required.\n'

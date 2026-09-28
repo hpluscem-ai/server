@@ -39,7 +39,7 @@ test "${FAIL_COMMAND:-}" != "$1"
                    for secret in ["source-secret", "destination-secret"])
         if not overrides:
             assert "--immutable --metadata" in commands[1]
-            assert "--download" in commands[2]
+            assert "--download --one-way" in commands[2]
             assert all("--config /dev/null" in line for line in commands)
             assert commands[1].endswith("source:old-photos destination:new-photos")
 print("Storage copy checks passed (synthetic, no network).")
