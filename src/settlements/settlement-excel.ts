@@ -88,12 +88,16 @@ try {
   for (const [i, name] of wb.SheetNames.entries()) {
     const s = wb.Sheets[name];
     const range = X.utils.decode_range(s['!fullref'] || s['!ref'] || 'A1');
-    if (range.e.r > workerData.maxRows || range.e.c > 6 || s['!merges']?.length || wb.Workbook?.Sheets?.[i]?.Hidden) throw 0;
+    if (range.e.r > workerData.maxRows || s['!merges']?.length || wb.Workbook?.Sheets?.[i]?.Hidden) throw 0;
     for (const [key, cell] of Object.entries(s)) if (!key.startsWith('!')) {
       if (cell.f || cell.F || cell.l || cell.t === 'e' || (i > 0 && cell.v !== undefined && cell.v !== '')) throw 0;
+      if (i === 0 && X.utils.decode_cell(key).c > 6 && cell.v !== undefined && cell.v !== '') throw 0;
     }
   }
-  parentPort.postMessage(X.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '', blankrows: false }));
+  // Bank sheets can format empty columns beyond G; only A:G contains payment data.
+  const range = X.utils.decode_range(sheet['!fullref'] || sheet['!ref'] || 'A1');
+  parentPort.postMessage(X.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '', blankrows: false,
+    range: X.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: range.e.r, c: 6 } }) }));
 } catch { parentPort.postMessage(null); }
 `;
 

@@ -279,7 +279,16 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .get(`${root}?month=${month}`)
       .set('Authorization', authorization)
       .expect(200);
-    expect((response.body as { mileage: number }[])[0].mileage).toBe(4000);
+    const rows = response.body as {
+      mileage: number;
+      registeredMileage: number;
+      additionalUnpaidMileage: number;
+    }[];
+    expect(rows[0]).toMatchObject({
+      mileage: 4000,
+      registeredMileage: 4000,
+      additionalUnpaidMileage: 0,
+    });
     expect((await service.list('2026-07'))[0].mileage).toBe(600);
     expect((await service.list('2026-09'))[0].mileage).toBe(400);
     await service.export(month, adminId);
@@ -291,6 +300,146 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     ).toBe((await snapshots())[0].settlement_id);
     expect((await service.list('2026-09'))[0].mileage).toBe(400);
   });
+  test('one approved application from each driver in one company becomes one monthly transfer row', async () => {
+    const secondUser = await addUser(companyId);
+    const secondApplication = await addApplication(companyId, secondUser, 1700);
+
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3000 });
+    expect(await service.balance(secondUser)).toEqual({
+      accumulatedMileage: 1700,
+    });
+    expect(await service.list(month)).toEqual([
+      expect.objectContaining({ id: companyId, mileage: 4700 }),
+    ]);
+
+    const bytes = await service.export(month, adminId);
+    expect(
+      XLSX.utils.sheet_to_json(XLSX.read(bytes).Sheets.Sheet1, { header: 1 }),
+    ).toHaveLength(2);
+    const [snapshot] = await snapshots();
+    expect(snapshot).toMatchObject({ mileage_amount: 4700 });
+    const assignments = await Promise.all(
+      [applicationId, secondApplication].map(async (id) => {
+        const [application] = await db()<{ settlement_id: string }[]>`
+            SELECT settlement_id FROM app.mileage_applications WHERE id = ${id}`;
+        return application.settlement_id;
+      }),
+    );
+    expect(assignments).toEqual([
+      snapshot.settlement_id,
+      snapshot.settlement_id,
+    ]);
+
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 0 });
+    expect(await service.balance(secondUser)).toEqual({
+      accumulatedMileage: 0,
+    });
+  });
+  test('multiple approved applications from each driver in one company remain one monthly transfer row', async () => {
+    const secondUser = await addUser(companyId);
+    const applicationIds = [
+      applicationId,
+      await addApplication(companyId, userId, 200),
+      await addApplication(companyId, secondUser, 500),
+      await addApplication(companyId, secondUser, 700),
+    ];
+
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3200 });
+    expect(await service.balance(secondUser)).toEqual({
+      accumulatedMileage: 1200,
+    });
+    expect(await service.list(month)).toEqual([
+      expect.objectContaining({ id: companyId, mileage: 4400 }),
+    ]);
+
+    await service.export(month, adminId);
+    const [snapshot] = await snapshots();
+    expect(await snapshots()).toHaveLength(1);
+    expect(snapshot).toMatchObject({ mileage_amount: 4400 });
+    const assignments = await Promise.all(
+      applicationIds.map(async (id) => {
+        const [application] = await db()<{ settlement_id: string }[]>`
+            SELECT settlement_id FROM app.mileage_applications WHERE id = ${id}`;
+        return application.settlement_id;
+      }),
+    );
+    expect(assignments).toEqual(
+      Array(applicationIds.length).fill(snapshot.settlement_id),
+    );
+
+    await upload(workbook((await snapshots()).map(row))).expect(200);
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 0 });
+    expect(await service.balance(secondUser)).toEqual({
+      accumulatedMileage: 0,
+    });
+  });
+  test('late approved registrations stay visible in their KST month without changing a completed transfer', async () => {
+    const september = '2026-09';
+    await addApplication(
+      companyId,
+      userId,
+      400,
+      '2026-09-06T00:00:00Z',
+      'approved',
+      'matched',
+      '2026-09-05T00:00:00Z',
+    );
+    await service.export(september, adminId);
+    const [original] = await snapshots();
+    await upload(workbook([row(original)]), september).expect(200);
+
+    const secondUser = await addUser(companyId);
+    await addApplication(
+      companyId,
+      userId,
+      500,
+      '2026-10-02T00:00:00Z',
+      'approved',
+      'matched',
+      '2026-09-20T00:00:00Z',
+    );
+    await addApplication(
+      companyId,
+      secondUser,
+      700,
+      '2026-10-02T00:00:00Z',
+      'approved',
+      'matched',
+      '2026-09-21T00:00:00Z',
+    );
+    expect((await service.list(september))[0]).toMatchObject({
+      mileage: 400,
+      registeredMileage: 1600,
+      additionalUnpaidMileage: 1200,
+      transferStatus: 'completed',
+    });
+    expect((await service.list('2026-10'))[0]).toMatchObject({
+      mileage: 1200,
+      registeredMileage: 0,
+    });
+    await expect(service.export(september, adminId)).rejects.toThrow();
+    expect(
+      (await snapshots()).find(
+        (item) => item.settlement_id === original.settlement_id,
+      ),
+    ).toEqual(original);
+
+    await service.export('2026-10', adminId);
+    expect((await service.list(september))[0].additionalUnpaidMileage).toBe(
+      1200,
+    );
+    const october = (await snapshots()).find(
+      (item) => item.mileage_amount === 1200,
+    )!;
+    await upload(workbook([row(october)]), '2026-10').expect(200);
+    expect((await service.list(september))[0]).toMatchObject({
+      mileage: 400,
+      registeredMileage: 1600,
+      additionalUnpaidMileage: 0,
+      transferStatus: 'completed',
+    });
+  });
   test('first download freezes applications and accounts; later candidates carry into next month', async () => {
     await service.export(month, adminId);
     const original = (await snapshots())[0];
@@ -301,6 +450,8 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect((await snapshots())[0]).toEqual(original);
     expect((await service.list(month))[0]).toMatchObject({
       mileage: 3000,
+      registeredMileage: 3500,
+      additionalUnpaidMileage: 500,
       accountNumber: '001234567890',
       bankCode: '4',
     });
@@ -455,6 +606,18 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       );
     },
   );
+  test('blank formatted columns beyond G do not invalidate a seven-column bank result', async () => {
+    await service.export(month, adminId);
+    const bytes = workbook((await snapshots()).map(row), 'xlsx', (wb) => {
+      const sheet = wb.Sheets.Sheet1;
+      sheet['!ref'] = 'A1:GG11';
+      sheet.H2 = { t: 'z' };
+      sheet.GG11 = { t: 'z' };
+    });
+    expect(XLSX.read(bytes).Sheets.Sheet1['!ref']).toBe('A1:GG11');
+    await upload(bytes).expect(200);
+    expect(await completed()).toBe(1);
+  });
   test('two admins uploading the same file concurrently cannot complete twice', async () => {
     await service.export(month, adminId);
     const bytes = workbook((await snapshots()).map(row));
@@ -617,6 +780,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     'formula',
     'link',
     'extra-column',
+    'extra-column-zero',
     'changed-header',
     'extra-sheet',
     'hidden',
@@ -635,6 +799,10 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
           (s.B2 as XLSX.CellObject).l = { Target: 'https://example.invalid/' };
         if (hazard === 'extra-column') {
           s.H2 = { t: 's', v: 'extra' };
+          s['!ref'] = 'A1:H2';
+        }
+        if (hazard === 'extra-column-zero') {
+          s.H2 = { t: 'n', v: 0 };
           s['!ref'] = 'A1:H2';
         }
         if (hazard === 'changed-header') (s.C1 as XLSX.CellObject).v = '입금액';

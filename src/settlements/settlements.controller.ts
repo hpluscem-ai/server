@@ -91,7 +91,7 @@ export class SettlementsController {
   @ApiOperation({
     summary: '월별 물류사 정산 조회',
     description:
-      'KST 최초 신청 등록월 기준 승인·미정산 건. 해당 물류사의 등록월 파일이 이미 고정된 경우 다음 미확정 월로 이월하며, 미확정 월을 건너뛰지 않음. 첫 다운로드에 대상·마일리지(1=1원)·계좌를 고정하고 기존 정산 이력을 보존.',
+      'registeredMileage는 선택한 KST 월에 최초 등록된 모든 승인 신청의 합계이며 이후 다른 월에 지급돼도 등록월에 남음. mileage와 transferStatus는 선택 월의 이체 대상·상태. 파일 고정 뒤 추가 승인된 등록 건은 additionalUnpaidMileage로 구분하며 지급 완료 시 0이 됨. 지급 대상은 다음 미확정 월로 이월하고 기존 이체 파일은 변경하지 않음.',
   })
   list(@Query() query: MonthQuery) {
     return this.service.list(query.month);

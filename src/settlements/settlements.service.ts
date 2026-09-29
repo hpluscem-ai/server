@@ -89,12 +89,24 @@ export class SettlementsService {
 
   async list(month: string) {
     const eligible = this.eligibleApplications(month);
-    const [candidates, existing, companies] = await Promise.all([
+    const [candidates, registered, existing, companies] = await Promise.all([
       this.db<{ id: string; amount: string | number }[]>`
         SELECT logistics_company_id AS id, SUM(mileage_amount)::text AS amount
         FROM app.mileage_applications a
         WHERE ${eligible}
         GROUP BY logistics_company_id`,
+      this.db<{ id: string; amount: string; unpaidOutsideMonth: string }[]>`
+        SELECT a.logistics_company_id AS id, SUM(a.mileage_amount)::text AS amount,
+          COALESCE(SUM(a.mileage_amount) FILTER (
+            WHERE (s.id IS NULL OR s.settlement_month <> ${month})
+              AND s.transfer_status IS DISTINCT FROM 'completed'
+          ), 0)::text AS "unpaidOutsideMonth"
+        FROM app.mileage_applications a
+        LEFT JOIN app.settlements s ON s.id = a.settlement_id
+        WHERE a.approval_status = 'approved'
+          AND a.submitted_at::timestamptz >= ${dayStart(`${month}-01`)}::timestamptz
+          AND a.submitted_at::timestamptz < ${monthEnd(month)}::timestamptz
+        GROUP BY a.logistics_company_id`,
       this.db<Settlement[]>`
         SELECT s.logistics_company_id AS id, s.transfer_status AS status, p.bank_code, p.account_number, p.account_holder,
           COALESCE(p.mileage_amount, (
@@ -110,12 +122,22 @@ export class SettlementsService {
     const candidateAmounts = new Map(
       candidates.map((row) => [row.id, integer(row.amount)]),
     );
+    const registeredAmounts = new Map(
+      registered.map((row) => [
+        row.id,
+        {
+          amount: integer(row.amount),
+          unpaidOutsideMonth: integer(row.unpaidOutsideMonth),
+        },
+      ]),
+    );
     const savedSettlements = new Map(existing.map((row) => [row.id, row]));
     return companies
       .filter(
         (company) =>
           company.active ||
           candidateAmounts.has(company.id) ||
+          registeredAmounts.has(company.id) ||
           savedSettlements.has(company.id),
       )
       .map((company) => {
@@ -135,6 +157,10 @@ export class SettlementsService {
           mileage: saved
             ? integer(saved.amount)
             : (candidateAmounts.get(company.id) ?? 0),
+          registeredMileage: registeredAmounts.get(company.id)?.amount ?? 0,
+          additionalUnpaidMileage: saved
+            ? (registeredAmounts.get(company.id)?.unpaidOutsideMonth ?? 0)
+            : 0,
           transferStatus:
             saved?.status ??
             (candidateAmounts.has(company.id) ? 'pending' : null),
