@@ -20,7 +20,7 @@ export class PasswordResetEmailResponseDto {
 
 export class MyPasswordResetEmailResponseDto {
   @ApiProperty({
-    description: 'SMS 재인증 후 재설정 메일 발송이 접수된 본인의 이메일',
+    description: '재설정 메일 발송이 접수된 본인의 이메일',
   })
   email!: string;
 }

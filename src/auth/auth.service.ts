@@ -221,25 +221,31 @@ export class AuthService {
   }
 
   async requestPasswordResetEmail(
-    input: RequestPasswordResetEmailDto,
-    session?: AuthenticatedSession,
-  ): Promise<void> {
+    input: RequestPasswordResetEmailDto | AuthenticatedSession,
+  ): Promise<string> {
     const configuration = this.emailService.getResetConfiguration();
+    let session: AuthenticatedSession | undefined;
     let recipient: Awaited<
       ReturnType<AuthRepository['claimPasswordResetEmail']>
     >;
     try {
-      recipient = await this.authRepository.claimPasswordResetEmail(
-        session?.user.email ?? input.email,
-        input.phone,
-        createHash('sha256').update(input.verificationProof).digest('hex'),
-        this.resetEmailSession(session),
-      );
+      if ('user' in input) {
+        session = input;
+        recipient = await this.authRepository.findMyPasswordResetEmailRecipient(
+          this.resetEmailSession(session)!,
+        );
+      } else {
+        recipient = await this.authRepository.claimPasswordResetEmail(
+          input.email,
+          input.phone,
+          createHash('sha256').update(input.verificationProof).digest('hex'),
+        );
+      }
     } catch (error) {
-      if (error instanceof LoginUnavailableError) this.throwSessionInvalid();
       this.throwIfDomainError(error);
       throw error;
     }
+    if (!recipient && session) this.throwSessionInvalid();
     if (!recipient) {
       throw new NotFoundException({
         code: 'ACCOUNT_NOT_FOUND',
@@ -251,6 +257,7 @@ export class AuthService {
       configuration,
       recipient.email,
       token,
+      Boolean(session),
     );
     if (
       !(await this.authRepository.activatePasswordResetEmail(
@@ -262,10 +269,10 @@ export class AuthService {
     ) {
       throw new BadRequestException({
         code: 'PASSWORD_RESET_REQUEST_INVALID',
-        message:
-          '계정 정보나 로그인 상태가 변경되었습니다. 휴대폰 인증 후 다시 요청해 주세요.',
+        message: `계정 정보나 로그인 상태가 변경되었습니다. ${session ? '' : '휴대폰 인증 후 '}다시 요청해 주세요.`,
       });
     }
+    return recipient.email;
   }
 
   private resetEmailSession(session?: AuthenticatedSession) {

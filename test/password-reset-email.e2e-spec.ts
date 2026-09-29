@@ -126,15 +126,11 @@ describe('Resend password reset email (e2e)', () => {
       .post(path)
       .send({ email, phone, verificationProof: value, ...overrides });
   }
-  function sendMine(
-    value: string,
-    token = sessionToken,
-    overrides: object = {},
-  ) {
-    return request(app.getHttpServer())
+  function sendMine(token = sessionToken, overrides?: object) {
+    const call = request(app.getHttpServer())
       .post(mine)
-      .set('Authorization', `Bearer ${token}`)
-      .send({ phone, verificationProof: value, ...overrides });
+      .set('Authorization', `Bearer ${token}`);
+    return overrides ? call.send(overrides) : call;
   }
   function reset(token: string) {
     return request(app.getHttpServer())
@@ -231,11 +227,12 @@ describe('Resend password reset email (e2e)', () => {
     expect(await argon2.verify(saved.passwordHash!, oldPassword)).toBe(false);
   });
 
-  it('returns only the current user email for an authenticated SMS-proven request', async () => {
-    expect((await sendMine((await proof()).value).expect(200)).body).toEqual({
+  it('sends to the current user email with only a valid session', async () => {
+    expect((await sendMine().expect(200)).body).toEqual({
       email,
     });
     expect(payload().to).toEqual([email]);
+    expect(await links()).toHaveLength(1);
   });
 
   it.each([
@@ -243,9 +240,6 @@ describe('Resend password reset email (e2e)', () => {
     ['public', 'ÉLODIE@example.com', 'ÉLODIE@example.com'],
     ['public', 'ÉLODIE@example.com', 'élodie@example.com'],
     ['public', 'driver@EXÄMPLE.com', 'driver@exämple.com'],
-    ['mine', 'ÉLODIE@example.com', 'ÉLODIE@example.com'],
-    ['mine', 'ÉLODIE@example.com', 'élodie@example.com'],
-    ['mine', 'driver@EXÄMPLE.com', 'driver@exämple.com'],
   ])(
     'connects SMS → %s email → reset for %s entered as %s',
     async (mode, storedEmail, inputEmail) => {
@@ -283,16 +277,24 @@ describe('Resend password reset email (e2e)', () => {
         .expect(200);
       const value = (confirmation.body as { verificationProof: string })
         .verificationProof;
-      if (mode === 'mine')
-        expect((await sendMine(value).expect(200)).body).toEqual({
-          email: storedEmail,
-        });
-      else await send(value, { email: inputEmail }).expect(202);
+      await send(value, { email: inputEmail }).expect(202);
       expect(payload().to).toEqual([storedEmail]);
       await reset(sentToken()).expect(204);
       expect((await storedProof(id)).consumedAt).not.toBeNull();
     },
   );
+
+  it('uses the current stored email for MyPage, including its casing', async () => {
+    await database.db
+      .update(users)
+      .set({ email: 'ÉLODIE@example.com' })
+      .where(eq(users.id, userId));
+    expect((await sendMine().expect(200)).body).toEqual({
+      email: 'ÉLODIE@example.com',
+    });
+    expect(payload().to).toEqual(['ÉLODIE@example.com']);
+    await reset(sentToken()).expect(204);
+  });
 
   it('preserves another drivers reset links when reissuing this drivers link', async () => {
     const otherId = randomUUID();
@@ -753,54 +755,46 @@ describe('Resend password reset email (e2e)', () => {
         await database.db
           .update(users)
           .set({ deactivatedAt: '2026-01-01 00:00:00' });
-      const item = await proof();
-      await sendMine(item.value, kind === 'missing' ? '' : sessionToken)
+      await sendMine(kind === 'missing' ? '' : sessionToken)
         .expect('Cache-Control', 'no-store')
         .expect(401);
       expect(fetchMock).not.toHaveBeenCalled();
-      expect((await storedProof(item.id)).consumedAt).toBeNull();
     },
   );
-  it('does not allow MyPage to choose the recipient, use another email proof, or skip SMS', async () => {
-    const item = await proof();
-    await sendMine(item.value, sessionToken, {
+  it('never lets the MyPage request body choose the recipient', async () => {
+    await sendMine(sessionToken, {
       email: 'other@example.com',
-    }).expect(400);
-    await sendMine(item.value, sessionToken, {
-      verificationProof: null,
-    }).expect(400);
-    await sendMine(
-      (await proof({ scopeEmail: 'other@example.com' })).value,
-    ).expect(400);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect((await storedProof(item.id)).consumedAt).toBeNull();
+      phone: '010-9999-9999',
+      verificationProof: 'other-proof',
+    }).expect(200);
+    expect(payload().to).toEqual([email]);
   });
 
-  it('rejects a MyPage proof for a phone that is not the current account phone', async () => {
-    const wrongPhone = '010-9999-9999';
-    const item = await proof({ phone: wrongPhone });
-    expect(
-      (
-        await sendMine(item.value, sessionToken, { phone: wrongPhone }).expect(
-          400,
-        )
-      ).body,
-    ).toMatchObject({ code: 'PHONE_VERIFICATION_INVALID' });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect((await storedProof(item.id)).consumedAt).toBeNull();
-    await request(app.getHttpServer())
-      .get('/api/v1/auth/me')
-      .set('Authorization', `Bearer ${sessionToken}`)
-      .expect(200);
+  it('reissues a MyPage link without SMS and invalidates the previous link', async () => {
+    await sendMine().expect(200);
+    const old = sentToken();
+    await sendMine().expect(200);
+    const current = sentToken();
+    expect(current).not.toBe(old);
+    await reset(old).expect(400);
+    await reset(current).expect(204);
   });
+
+  it('asks a MyPage user to retry a failed send without SMS', async () => {
+    fetchMock.mockRejectedValueOnce(new Error('provider unavailable'));
+    expect((await sendMine().expect(502)).body).toMatchObject({
+      code: 'PASSWORD_RESET_EMAIL_SEND_FAILED',
+      message: '메일 발송을 확인하지 못했습니다. 다시 요청해 주세요.',
+    });
+    expect(await links()).toEqual([]);
+  });
+
   it('does not activate after the requesting MyPage session logs out during delivery', async () => {
     fetchMock.mockImplementationOnce(async () => {
       await database.db.delete(authSessions);
       return Promise.resolve(accepted());
     });
-    expect(
-      (await sendMine((await proof()).value).expect(400)).body,
-    ).toMatchObject({
+    expect((await sendMine().expect(400)).body).toMatchObject({
       code: 'PASSWORD_RESET_REQUEST_INVALID',
     });
     expect(await links()).toEqual([]);
@@ -832,6 +826,10 @@ describe('Resend password reset email (e2e)', () => {
     ]);
     expect(docs.paths[path].post!.description).toContain('Resend');
     expect(docs.paths[mine].post!.description).toContain('Resend');
+    expect(docs.paths[mine].post!.description).toContain(
+      '유효한 기사 세션만으로',
+    );
+    expect(docs.paths[mine].post!.requestBody).toBeUndefined();
     expect(
       docs.components!.schemas!.RequestPasswordResetEmailDto,
     ).toMatchObject({ required: ['phone', 'verificationProof', 'email'] });

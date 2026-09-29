@@ -169,7 +169,6 @@ export class AuthRepository {
     email: string,
     phone: string,
     proofHash: string,
-    session?: ResetEmailSession,
   ): Promise<ResetEmailRecipient | undefined> {
     return this.database.db.transaction(async (transaction) => {
       const [proof] = await transaction
@@ -207,7 +206,6 @@ export class AuthRepository {
             eq(users.role, 'driver'),
             isNull(users.deactivatedAt),
             eq(logisticsCompanies.active, true),
-            session ? eq(users.id, session.userId) : undefined,
           ),
         );
       // SMS와 같은 소문자 비교를 사용한다. SQLite NOCASE는 비ASCII 문자를 접지 못한다.
@@ -216,29 +214,6 @@ export class AuthRepository {
         candidate?.email.toLowerCase() === email.toLowerCase()
           ? candidate
           : undefined;
-      if (session) {
-        const [validSession] = await transaction
-          .select({ id: users.id })
-          .from(authSessions)
-          .innerJoin(users, eq(authSessions.userId, users.id))
-          .innerJoin(
-            logisticsCompanies,
-            eq(users.logisticsCompanyId, logisticsCompanies.id),
-          )
-          .for('update', { of: [authSessions] })
-          .where(
-            and(
-              validDriverSession(
-                session.tokenHash,
-                session.now,
-                session.idleCutoff,
-              ),
-              eq(users.id, session.userId),
-            ),
-          );
-        if (!validSession) throw new LoginUnavailableError();
-        if (!user) throw new PhoneVerificationInvalidError();
-      }
       // 계정 불일치도 증명은 소비하며 서비스가 조회 실패로 안내한다.
       if (user && user.passwordHash === null)
         throw new Error('Active driver password invariant violated');
@@ -246,6 +221,38 @@ export class AuthRepository {
         ? { ...user, passwordHash: user.passwordHash, phone }
         : undefined;
     });
+  }
+
+  async findMyPasswordResetEmailRecipient(
+    session: ResetEmailSession,
+  ): Promise<ResetEmailRecipient | undefined> {
+    const [user] = await this.database.db
+      .select({
+        id: users.id,
+        email: users.email,
+        phone: users.phone,
+        passwordHash: users.passwordHash,
+      })
+      .from(authSessions)
+      .innerJoin(users, eq(authSessions.userId, users.id))
+      .innerJoin(
+        logisticsCompanies,
+        eq(users.logisticsCompanyId, logisticsCompanies.id),
+      )
+      .where(
+        and(
+          validDriverSession(
+            session.tokenHash,
+            session.now,
+            session.idleCutoff,
+          ),
+          eq(users.id, session.userId),
+        ),
+      );
+    if (!user) return undefined;
+    if (!user.passwordHash || !user.phone)
+      throw new Error('Active driver password invariant violated');
+    return { ...user, passwordHash: user.passwordHash, phone: user.phone };
   }
 
   activatePasswordResetEmail(

@@ -55,6 +55,7 @@ export class ResendEmailService {
     configuration: ReturnType<ResendEmailService['getResetConfiguration']>,
     recipient: string,
     token: string,
+    withoutPhoneVerification = false,
   ): Promise<void> {
     const resetUrl = new URL(configuration.resetUrl);
     resetUrl.searchParams.set('token', token);
@@ -82,8 +83,7 @@ export class ResendEmailService {
       // 응답 원문에는 주소·링크·키가 포함될 수 있다. 타임아웃도 자동 재발송하지 않는다.
       throw new BadGatewayException({
         code: 'PASSWORD_RESET_EMAIL_SEND_FAILED',
-        message:
-          '메일 발송을 확인하지 못했습니다. 휴대폰 인증 후 다시 요청해 주세요.',
+        message: `메일 발송을 확인하지 못했습니다. ${withoutPhoneVerification ? '' : '휴대폰 인증 후 '}다시 요청해 주세요.`,
       });
     }
   }

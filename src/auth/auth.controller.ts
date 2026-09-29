@@ -361,15 +361,14 @@ export class AuthController {
   @ApiCookieAuth('driver-session')
   @ApiBearerAuth()
   @ApiOperation({
-    summary: '마이페이지 SMS 재인증 후 본인 재설정 메일 요청',
+    summary: '마이페이지에서 본인 재설정 메일 요청',
     description:
-      '본인 이메일과 가입 연락처로 reset_password SMS를 발송·확인한 증명이 필요합니다. 수신 이메일은 기사 세션에서만 결정하며 요청에 이메일을 허용하지 않습니다. Resend 접수·토큰 저장 성공 시 본인 이메일을 반환합니다. 링크 30분·증명 일회용·기존 링크 무효화와 실패 정책은 공개 재설정 메일 API와 같습니다.',
+      '유효한 기사 세션만으로 본인 이메일에 재설정 메일을 요청합니다. 요청 본문은 없으며 수신 이메일은 서버의 현재 계정에서 결정합니다. Resend 접수·토큰 저장 성공 시 본인 이메일을 반환합니다. 링크는 30분간 유효하고 새 링크가 활성화되면 기존 링크를 무효화합니다.',
   })
   @ApiOkResponse({ type: MyPasswordResetEmailResponseDto })
   @ApiBadRequestResponse({
     type: ApiErrorResponseDto,
-    description:
-      'VALIDATION_ERROR | PHONE_VERIFICATION_INVALID | PASSWORD_RESET_REQUEST_INVALID',
+    description: 'PASSWORD_RESET_REQUEST_INVALID',
   })
   @ApiUnauthorizedResponse({
     type: ApiErrorResponseDto,
@@ -389,11 +388,8 @@ export class AuthController {
   })
   async requestMyPasswordResetEmail(
     @Req() request: AuthenticatedRequest,
-    @Body() input: FindEmailRequestDto,
   ): Promise<MyPasswordResetEmailResponseDto> {
-    const email = request.authSession.user.email;
-    await this.authService.requestPasswordResetEmail(
-      { ...input, email },
+    const email = await this.authService.requestPasswordResetEmail(
       request.authSession,
     );
     return { email };
