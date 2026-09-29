@@ -619,8 +619,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await completed()).toBe(1);
   });
   test('two admins uploading the same file concurrently cannot complete twice', async () => {
-    await service.export(month, adminId);
-    const bytes = workbook((await snapshots()).map(row));
+    const bytes = workbook([['004', '**********', 3000, '예금주', '', '', '']]);
     const second = await seedAdminSession(database);
     const results = await Promise.all([
       upload(bytes),
@@ -634,6 +633,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       results.map((r) => (r.body as { completed: number }).completed).sort(),
     ).toEqual([0, 1]);
     expect(await completed()).toBe(1);
+    expect(await snapshots()).toHaveLength(1);
   });
   test('simultaneous exports create one immutable batch', async () => {
     const replies = await Promise.all(
@@ -663,6 +663,44 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       completed: 1,
       alreadyCompleted: 1,
     });
+    expect(await completed()).toBe(2);
+  });
+  test('upload before download captures the month and rolls back on a mismatched row', async () => {
+    const good = ['004', '**********', 3000, '예금주', '', '', ''];
+    const bad = ['004', '**********', 3001, '예금주', '', '', ''];
+    const mismatch = await upload(workbook([good, bad])).expect(400);
+    expect((mismatch.body as { code: string }).code).toBe(
+      'SETTLEMENT_ROW_MISMATCH',
+    );
+    expect(await snapshots()).toHaveLength(0);
+    expect(await db()`SELECT id FROM app.settlements`).toHaveLength(0);
+    expect(await completed()).toBe(0);
+
+    expect((await upload(workbook([good])).expect(200)).body).toEqual({
+      completed: 1,
+      alreadyCompleted: 0,
+    });
+    expect(await snapshots()).toHaveLength(1);
+    expect(await completed()).toBe(1);
+    expect(
+      (
+        await db()`SELECT settlement_id FROM app.mileage_applications WHERE id = ${applicationId}`
+      )[0].settlement_id,
+    ).toBe((await snapshots())[0].settlement_id);
+
+    const other = await addCompany('81', '000222', '다른 예금주');
+    await addApplication(other, await addUser(other), 5000);
+    expect((await upload(workbook([good])).expect(200)).body).toEqual({
+      completed: 0,
+      alreadyCompleted: 1,
+    });
+    expect(await snapshots()).toHaveLength(1);
+    const otherRow = ['081', '**********', 5000, '다른 예금주', '', '', ''];
+    expect((await upload(workbook([otherRow])).expect(200)).body).toEqual({
+      completed: 1,
+      alreadyCompleted: 0,
+    });
+    expect(await snapshots()).toHaveLength(2);
     expect(await completed()).toBe(2);
   });
   test.each([

@@ -1,5 +1,6 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
+import type { TransactionSql } from 'postgres';
 import { AdminAuthRepository } from '../admin-auth';
 import { DatabaseService } from '../database/database.service';
 import { bankCodeOptions } from './bank-codes';
@@ -168,12 +169,9 @@ export class SettlementsService {
       });
   }
 
-  async export(month: string, adminId: string) {
+  private async capture(month: string, adminId: string, tx: TransactionSql) {
     const eligible = this.eligibleApplications(month);
-    return this.db.begin(async (tx) => {
-      // This makes repeated exports of the same month one atomic capture.
-      await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;
-      const legacy = await tx<{ id: string }[]>`
+    const legacy = await tx<{ id: string }[]>`
         SELECT s.id
         FROM app.settlements s
         LEFT JOIN app.settlement_snapshots p ON p.settlement_id = s.id
@@ -181,53 +179,53 @@ export class SettlementsService {
           AND s.transfer_status = 'pending'
           AND p.settlement_id IS NULL
         LIMIT 1`;
-      if (legacy.length) invalid('SETTLEMENT_SNAPSHOT_MISSING');
+    if (legacy.length) invalid('SETTLEMENT_SNAPSHOT_MISSING');
 
-      const groups = await tx<{ id: string }[]>`
+    const groups = await tx<{ id: string }[]>`
         SELECT logistics_company_id AS id
         FROM app.mileage_applications a
         WHERE ${eligible}
         GROUP BY logistics_company_id`;
-      for (const group of groups) {
-        const existing = await tx<{ id: string }[]>`
+    for (const group of groups) {
+      const existing = await tx<{ id: string }[]>`
           SELECT id FROM app.settlements
           WHERE logistics_company_id = ${group.id} AND settlement_month = ${month}
           FOR UPDATE`;
-        if (existing.length) continue;
+      if (existing.length) continue;
 
-        const companies = await tx<
-          Company[]
-        >`${tx.unsafe(companiesSql)} WHERE id = ${group.id}`;
-        const company = companies[0];
-        if (!company) continue;
-        const bank = bankCodeOptions.find(
-          (candidate) => Number(candidate.code) === Number(company.bankCode),
-        );
-        if (!bank || !company.accountHolder.trim())
-          invalid('SETTLEMENT_ACCOUNT_INVALID');
-        const id = randomUUID();
-        const now = new Date().toISOString();
-        await tx`
+      const companies = await tx<
+        Company[]
+      >`${tx.unsafe(companiesSql)} WHERE id = ${group.id}`;
+      const company = companies[0];
+      if (!company) continue;
+      const bank = bankCodeOptions.find(
+        (candidate) => Number(candidate.code) === Number(company.bankCode),
+      );
+      if (!bank || !company.accountHolder.trim())
+        invalid('SETTLEMENT_ACCOUNT_INVALID');
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      await tx`
           INSERT INTO app.settlements(
             id, logistics_company_id, settlement_month, transfer_status, created_at, updated_at
           ) VALUES (${id}, ${company.id}, ${month}, 'pending', ${now}, ${now})`;
-        const captured = await tx<Amount[]>`
+      const captured = await tx<Amount[]>`
           UPDATE app.mileage_applications a
           SET settlement_id = ${id}
           WHERE logistics_company_id = ${company.id}
             AND ${eligible}
           RETURNING mileage_amount::text AS amount`;
-        const amount = integer(
-          captured
-            .reduce((total, row) => total + BigInt(String(row.amount)), 0n)
-            .toString(),
-        );
-        if (!captured.length)
-          throw new Error('Settlement capture lost its eligible applications');
+      const amount = integer(
+        captured
+          .reduce((total, row) => total + BigInt(String(row.amount)), 0n)
+          .toString(),
+      );
+      if (!captured.length)
+        throw new Error('Settlement capture lost its eligible applications');
 
-        for (let attempt = 0; attempt < 10; attempt++) {
-          const reference = String(randomInt(1_000_000_000, 10_000_000_000));
-          const inserted = await tx<{ reference: string }[]>`
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const reference = String(randomInt(1_000_000_000, 10_000_000_000));
+        const inserted = await tx<{ reference: string }[]>`
             INSERT INTO app.settlement_snapshots(
               settlement_id, reference, bank_code, account_number, account_holder,
               mileage_amount, captured_at, captured_by
@@ -237,11 +235,17 @@ export class SettlementsService {
             )
             ON CONFLICT (reference) DO NOTHING
             RETURNING reference`;
-          if (inserted.length) break;
-          if (attempt === 9)
-            throw new Error('Unable to allocate settlement reference');
-        }
+        if (inserted.length) break;
+        if (attempt === 9)
+          throw new Error('Unable to allocate settlement reference');
       }
+    }
+  }
+
+  async export(month: string, adminId: string) {
+    return this.db.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;
+      await this.capture(month, adminId, tx);
       const rows = await tx<Snapshot[]>`
         ${tx.unsafe(snapshotSql)}
         WHERE s.settlement_month = ${month} AND s.transfer_status = 'pending'
@@ -270,14 +274,34 @@ export class SettlementsService {
     return aliases[code]?.includes(bank) ?? false;
   }
 
+  private indexSnapshots(snapshots: Snapshot[]) {
+    const index = new Map<string, Snapshot[]>();
+    for (const snapshot of snapshots) {
+      const accountHolder = snapshot.account_holder?.trim();
+      if (!accountHolder) continue;
+      const key = matchingKey(accountHolder, integer(snapshot.mileage_amount));
+      const group = index.get(key);
+      if (group) group.push(snapshot);
+      else index.set(key, [snapshot]);
+    }
+    return index;
+  }
+
+  private matches(
+    row: TransferRow,
+    snapshots: Map<string, Snapshot[]>,
+  ): Snapshot[] {
+    return (
+      snapshots.get(matchingKey(row.accountHolder, row.amount)) ?? []
+    ).filter((snapshot) => this.bankMatches(row.bank, snapshot.bank_code));
+  }
+
   private resolveRow(
     row: TransferRow,
     snapshots: Map<string, Snapshot[]>,
     month: string,
   ): Snapshot {
-    const matches = (
-      snapshots.get(matchingKey(row.accountHolder, row.amount)) ?? []
-    ).filter((snapshot) => this.bankMatches(row.bank, snapshot.bank_code));
+    const matches = this.matches(row, snapshots);
     if (matches.length !== 1 || matches[0].settlement_month !== month)
       invalid('SETTLEMENT_ROW_MISMATCH');
     return matches[0];
@@ -293,22 +317,21 @@ export class SettlementsService {
         message: '관리자 로그인이 필요합니다.',
       });
     return this.db.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('settlement:' || ${month}))`;
+      const existing = await tx<Snapshot[]>`${tx.unsafe(snapshotSql)}`;
+      const existingIndex = this.indexSnapshots(existing);
+      if (
+        rows.some((row) => {
+          const matches = this.matches(row, existingIndex);
+          return matches.length !== 1 || matches[0].settlement_month !== month;
+        })
+      )
+        await this.capture(month, admin.id, tx);
       // Lock the settlement rows before interpreting their completion state.
       const snapshots = await tx<Snapshot[]>`
         ${tx.unsafe(snapshotSql)}
         FOR UPDATE OF s`;
-      const index = new Map<string, Snapshot[]>();
-      for (const snapshot of snapshots) {
-        const accountHolder = snapshot.account_holder?.trim();
-        if (!accountHolder) continue;
-        const key = matchingKey(
-          accountHolder,
-          integer(snapshot.mileage_amount),
-        );
-        const group = index.get(key);
-        if (group) group.push(snapshot);
-        else index.set(key, [snapshot]);
-      }
+      const index = this.indexSnapshots(snapshots);
       const targets = rows.map((row) => this.resolveRow(row, index, month));
       if (
         new Set(targets.map((target) => target.settlement_id)).size !==
