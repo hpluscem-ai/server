@@ -111,6 +111,12 @@ export class AdminMileageResponseDto {
   @ApiProperty({ type: Number, nullable: true }) receiptAmount!: number | null;
   @ApiProperty({ type: Number, nullable: true }) meterAmount!: number | null;
   @ApiProperty({ type: Number, nullable: true }) finalAmount!: number | null;
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: '승인 시 확정한 주유량(L). 기존 기록은 null',
+  })
+  liters!: string | null;
   @ApiProperty({ type: Number, nullable: true }) mileageAmount!: number | null;
   @ApiProperty({ type: String, nullable: true, format: 'date-time' })
   receiptAt!: string | null;

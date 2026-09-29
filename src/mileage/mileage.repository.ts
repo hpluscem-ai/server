@@ -18,6 +18,7 @@ import type { MileageListQueryDto } from './mileage.dto';
 import {
   amountValue,
   automaticApprovalAmounts,
+  litersValue,
   transactionAt,
   OCR_VERSION,
   type MeterReading,
@@ -407,6 +408,7 @@ export class MileageRepository {
           meterAmount: null,
           receiptAt: null,
           finalAmount: null,
+          liters: null,
           mileageAmount: null,
           rejectionReason: null,
           reviewReplay: null,
@@ -841,6 +843,7 @@ export class MileageRepository {
             ...(approval
               ? {
                   ...approval,
+                  liters: litersValue(result.meter?.litersText ?? null),
                   approvalStatus: 'approved' as const,
                   decidedAt: now,
                 }

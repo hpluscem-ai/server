@@ -68,6 +68,7 @@ export class AdminMileageService {
       approvalStatus: 'rejected',
       rejectionReason: input.rejectionReason,
       finalAmount: null,
+      liters: null,
       mileageAmount: null,
     });
   }
@@ -87,6 +88,7 @@ export class AdminMileageService {
       approvalStatus: 'approved',
       rejectionReason: null,
       finalAmount: input.finalAmount,
+      liters: Number(input.liters).toFixed(3),
       mileageAmount,
     });
   }
@@ -99,6 +101,7 @@ export class AdminMileageService {
       approvalStatus: 'pending',
       rejectionReason: null,
       finalAmount: null,
+      liters: null,
       mileageAmount: null,
     });
   }
@@ -110,6 +113,7 @@ export class AdminMileageService {
       approvalStatus: 'pending' | 'approved' | 'rejected';
       rejectionReason: string | null;
       finalAmount: number | null;
+      liters: string | null;
       mileageAmount: number | null;
     },
   ): Promise<AdminMileageResponseDto> {
@@ -125,6 +129,7 @@ export class AdminMileageService {
         current.status === decision.approvalStatus &&
         current.rejectionReason === decision.rejectionReason &&
         current.finalAmount === decision.finalAmount &&
+        current.liters === decision.liters &&
         current.mileageAmount === decision.mileageAmount;
       if (current.reviewVersion !== input.reviewVersion) {
         // Only the latest unchanged result can replay a lost response.
@@ -244,6 +249,7 @@ export class AdminMileageService {
           receiptAmount: applications.receiptAmount,
           meterAmount: applications.meterAmount,
           finalAmount: applications.finalAmount,
+          liters: applications.liters,
           mileageAmount: applications.mileageAmount,
           receiptAt: applications.receiptAt,
           matchStatus: applications.matchStatus,
@@ -320,6 +326,7 @@ export class AdminMileageService {
               ocrEvidence,
               row.status,
               row.finalAmount,
+              row.liters,
               row.mileageAmount,
               row.rejectionReason,
               row.decidedAt,
@@ -335,6 +342,7 @@ export class AdminMileageService {
           decidedAt: row.decidedAt ? iso(row.decidedAt) : null,
           receiptAt: row.receiptAt ? iso(row.receiptAt) : null,
           finalAmount: row.status === 'approved' ? row.finalAmount : null,
+          liters: row.status === 'approved' ? row.liters : null,
           mileageAmount: row.status === 'approved' ? row.mileageAmount : null,
           rejectionReason:
             row.status === 'rejected' ? row.rejectionReason : null,

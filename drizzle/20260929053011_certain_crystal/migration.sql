@@ -1,0 +1,1 @@
+ALTER TABLE "app"."mileage_applications" ADD COLUMN "liters" numeric(8,3);

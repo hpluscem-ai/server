@@ -435,6 +435,7 @@ describe('Admin mileage reads and review (e2e)', () => {
       expect(result.body).toMatchObject({
         status: 'approved',
         finalAmount: 10000,
+        liters: Number(liters).toFixed(3),
         mileageAmount,
         receiptAmount: 10000,
         meterAmount: 8000,
@@ -493,6 +494,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(responses[0].body).toEqual(responses[1].body);
     await app.get(MileageRepository).finishOcrJob(job, reading);
     await approve(body).expect(200).expect(responses[0].body);
+    await approve({ ...body, liters: '5.126' }).expect(409);
     await approve({ ...body, finalAmount: 20000 }).expect(409);
     await approve({ ...body, liters: '10' }).expect(409);
     await reject({ reviewVersion }).expect(409);
@@ -517,6 +519,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(rejected).toMatchObject({
       status: 'rejected',
       finalAmount: null,
+      liters: null,
       mileageAmount: null,
       rejectionReason: '금액 재확인',
     });
@@ -535,6 +538,7 @@ describe('Admin mileage reads and review (e2e)', () => {
     expect(second).toMatchObject({
       status: 'approved',
       finalAmount: 20000,
+      liters: '10.000',
       mileageAmount: 200,
       rejectionReason: null,
     });

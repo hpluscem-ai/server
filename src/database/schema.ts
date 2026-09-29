@@ -5,6 +5,7 @@ import {
   doublePrecision,
   integer,
   jsonb,
+  numeric,
   pgSchema,
   text,
   timestamp,
@@ -188,6 +189,7 @@ export const mileageApplications = appSchema.table('mileage_applications', {
   receiptAmount: money('receipt_amount'),
   meterAmount: money('meter_amount'),
   finalAmount: money('final_amount'),
+  liters: numeric('liters', { precision: 8, scale: 3 }),
   mileageAmount: money('mileage_amount'),
   receiptAt: text('receipt_at'),
   matchStatus: text('match_status', {

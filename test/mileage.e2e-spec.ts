@@ -726,6 +726,7 @@ describe('Mileage applications (e2e)', () => {
       (await database.db.select().from(mileageApplications).limit(1))[0],
     ).toMatchObject({
       approvalStatus: 'approved',
+      liters: '10.000',
       mileageAmount: 200,
     });
     await expect(
@@ -813,6 +814,7 @@ describe('Mileage applications (e2e)', () => {
           matchStatus: 'matched',
           receiptAt: '2026-09-23T03:34:56.000Z',
           status: enabled ? 'approved' : 'pending',
+          liters: enabled ? '11.000' : null,
         });
         const userDetail = await get(URL + '/' + accepted.id).expect(200);
         expect(userDetail.body).toMatchObject({
