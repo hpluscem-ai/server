@@ -754,6 +754,11 @@ export class MileageRepository {
         errorCode !== undefined ||
         result.clovaError !== null ||
         result.lunaError !== null;
+      const mismatched =
+        !failed &&
+        receiptAmount !== null &&
+        meterAmount !== null &&
+        receiptAmount !== meterAmount;
       const amounts = automaticApprovalAmounts(result.receipt, result.meter);
       if (!duplicate && stillCurrent && application && !failed && amounts) {
         // Compare the immediately preceding result, not every earlier equal total.
@@ -824,12 +829,10 @@ export class MileageRepository {
         .returning({ id: ocrJobs.id });
       if (completed.length !== 1) return;
       if (stillCurrent && application) {
-        const status = duplicate
-          ? 'duplicate_suspected'
-          : receiptAmount !== null &&
-              meterAmount !== null &&
-              receiptAmount !== meterAmount
-            ? 'mismatched'
+        const status = mismatched
+          ? 'mismatched'
+          : duplicate
+            ? 'duplicate_suspected'
             : !failed && amounts !== null
               ? 'matched'
               : 'ocr_failed';
@@ -847,7 +850,17 @@ export class MileageRepository {
                   approvalStatus: 'approved' as const,
                   decidedAt: now,
                 }
-              : {}),
+              : mismatched
+                ? {
+                    approvalStatus: 'rejected' as const,
+                    rejectionReason:
+                      '영수증 금액과 계기판 금액이 일치하지 않습니다. 다시 확인 후, 등록해주세요.',
+                    finalAmount: null,
+                    liters: null,
+                    mileageAmount: null,
+                    decidedAt: now,
+                  }
+                : {}),
             updatedAt: now,
           })
           .where(

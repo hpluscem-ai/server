@@ -839,6 +839,60 @@ describe('Mileage applications (e2e)', () => {
     },
   );
 
+  it('shows an automatic mismatch rejection and accepts a new photo', async () => {
+    jest
+      .spyOn(app.get(MileageOcrService), 'isConfigured')
+      .mockReturnValue(true);
+    const original = await saved();
+    const repository = app.get(MileageRepository);
+    const job = (await repository.claimOcrJob())!;
+    await repository.finishOcrJob(job, {
+      receipt: {
+        amountText: '11700',
+        transactionDateText: null,
+        transactionTimeText: null,
+        quantityText: null,
+        quantityUnit: 'unknown',
+        unitPriceText: null,
+        documentKind: 'sale',
+        issues: [],
+      },
+      meter: {
+        amountText: '12000',
+        litersText: '11 L',
+        unitPriceText: null,
+        issues: [],
+      },
+      clovaError: null,
+      lunaError: null,
+      clovaDurationMs: 1,
+      lunaDurationMs: 1,
+      lunaInputTokens: 10,
+      lunaOutputTokens: 10,
+    });
+    const detail = (await get(`${URL}/${original.id}`).expect(200))
+      .body as MileageDetailDto;
+    expect(detail).toMatchObject({
+      status: 'rejected',
+      rejectionReason:
+        '영수증 금액과 계기판 금액이 일치하지 않습니다. 다시 확인 후, 등록해주세요.',
+      finalAmount: null,
+      mileageAmount: null,
+    });
+    await get('/api/v1/mileage/summary')
+      .expect(200)
+      .expect({ accumulatedMileage: 0 });
+    const next = await resubmit(detail, randomUUID(), receipt).expect(200);
+    expect(next.body).toMatchObject({
+      id: original.id,
+      status: 'pending',
+      rejectionReason: null,
+    });
+    expect((await repository.claimOcrJob())?.sourceVersion).toBe(
+      (next.body as MileageDetailDto).submissionVersion,
+    );
+  });
+
   it('decodes a synthetic real HEIC with an embedded color profile', async () => {
     const heic = await readFile(
       join(__dirname, 'fixtures/mileage-receipt.heic'),

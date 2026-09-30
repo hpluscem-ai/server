@@ -267,39 +267,50 @@ describe('MileageOcrWorkerService', () => {
     });
   });
 
-  it('keeps differing receipt and meter totals for manual review', async () => {
-    receiptCall.mockResolvedValue({
-      reading: {
-        amountText: '12650',
-        transactionDateText: '2026-09-23',
-        transactionTimeText: '12:34:56',
-        quantityText: null,
-        quantityUnit: 'unknown',
-        unitPriceText: null,
-        documentKind: 'sale',
-        issues: [],
-      },
-      durationMs: 1,
-    });
-    meterCall.mockResolvedValue({
-      reading: {
-        amountText: '7,356원',
-        litersText: '11.000 L',
-        unitPriceText: null,
-        issues: [],
-      },
-      durationMs: 1,
-    });
-    await worker.processOne();
-    expect(
-      (await database.db.select().from(mileageApplications).limit(1))[0],
-    ).toMatchObject({
-      receiptAmount: 12650,
-      meterAmount: 7356,
-      matchStatus: 'mismatched',
-      approvalStatus: 'pending',
-    });
-  });
+  it.each(['true', 'false'])(
+    'automatically rejects differing totals with auto approval set to %s',
+    async (flag) => {
+      process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = flag;
+      receiptCall.mockResolvedValue({
+        reading: {
+          amountText: '12650',
+          transactionDateText: '2026-09-23',
+          transactionTimeText: '12:34:56',
+          quantityText: null,
+          quantityUnit: 'unknown',
+          unitPriceText: null,
+          documentKind: 'sale',
+          issues: [],
+        },
+        durationMs: 1,
+      });
+      meterCall.mockResolvedValue({
+        reading: {
+          amountText: '7,356원',
+          litersText: '11.000 L',
+          unitPriceText: null,
+          issues: [],
+        },
+        durationMs: 1,
+      });
+      await worker.processOne();
+      expect(
+        (await database.db.select().from(mileageApplications).limit(1))[0],
+      ).toMatchObject({
+        receiptAmount: 12650,
+        meterAmount: 7356,
+        matchStatus: 'mismatched',
+        approvalStatus: 'rejected',
+        rejectionReason:
+          '영수증 금액과 계기판 금액이 일치하지 않습니다. 다시 확인 후, 등록해주세요.',
+        finalAmount: null,
+        liters: null,
+        mileageAmount: null,
+      });
+      expect((await application()).decidedAt).not.toBeNull();
+      expect(await balance()).toBe(0);
+    },
+  );
 
   it.each(['photo', 'extractor'])(
     'discards an obsolete %s before paying providers',
@@ -622,6 +633,38 @@ describe('MileageOcrWorkerService', () => {
     ).toBe('duplicate_suspected');
   });
 
+  it('rejects a mismatch even when the photos are also a suspected duplicate', async () => {
+    const result = validResult();
+    result.meter!.amountText = '12000';
+    await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+    const second = await createApplication();
+    await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+    expect(await repository.findOne(userId, second)).toMatchObject({
+      matchStatus: 'mismatched',
+      approvalStatus: 'rejected',
+    });
+  });
+
+  it('allows an admin to correct an automatic rejection', async () => {
+    const result = validResult();
+    result.meter!.amountText = '12000';
+    await repository.finishOcrJob((await repository.claimOcrJob())!, result);
+    const before = await review().detail(applicationId);
+    await review().approve(applicationId, {
+      reviewVersion: before.reviewVersion,
+      finalAmount: 11700,
+      liters: '11',
+    });
+    expect(await application()).toMatchObject({
+      matchStatus: 'mismatched',
+      approvalStatus: 'approved',
+      rejectionReason: null,
+      finalAmount: 11700,
+      mileageAmount: 220,
+    });
+    expect(await balance()).toBe(220);
+  });
+
   it('flags different photos with matching totals and printed transaction time', async () => {
     await worker.processOne();
     const second = await createApplication('b'.repeat(64));
@@ -760,7 +803,6 @@ describe('MileageOcrWorkerService', () => {
   );
 
   it.each([
-    'mismatch',
     'receiptAmount',
     'meterAmount',
     'liters',
@@ -770,10 +812,14 @@ describe('MileageOcrWorkerService', () => {
     'lunaError',
     'emptyError',
     'jobError',
+    'mismatchWithError',
   ])('keeps %s evidence pending', async (kind) => {
     process.env.MILEAGE_OCR_AUTO_APPROVE_ENABLED = 'true';
     const result = validResult();
-    if (kind === 'mismatch') result.meter!.amountText = '12000';
+    if (kind === 'mismatchWithError') {
+      result.meter!.amountText = '12000';
+      result.lunaError = 'LUNA_FAILED';
+    }
     if (kind === 'receiptAmount') result.receipt!.amountText = null;
     if (kind === 'meterAmount') result.meter!.amountText = null;
     if (kind === 'liters') result.meter!.litersText = '11';
@@ -796,6 +842,8 @@ describe('MileageOcrWorkerService', () => {
       mileageAmount: null,
       decidedAt: null,
     });
+    if (kind === 'mismatchWithError')
+      expect((await application()).matchStatus).toBe('ocr_failed');
     expect(await balance()).toBe(0);
   });
 
@@ -1004,7 +1052,9 @@ describe('MileageOcrWorkerService', () => {
         .where(eq(mileageOcrJobs.id, job.id));
     if (kind === 'jobIdentity') job.applicationId = randomUUID();
     const before = await application();
-    await repository.finishOcrJob(job, validResult());
+    const result = validResult();
+    result.meter!.amountText = '12000';
+    await repository.finishOcrJob(job, result);
     expect(await application()).toEqual(before);
   });
 
