@@ -50,6 +50,16 @@ pnpm exec jest --config test/jest-e2e.json --runInBand --watchman=false
 
 Keep existing database files and photo objects until a separate data transfer has reconciled record counts, financial totals, relationships and photo keys. Changing configuration does not transfer data. For a cutover, stop writes or reconcile changes made after the snapshot before switching the API connection.
 
+### Railway 테스트 데이터 초기화
+
+Railway `respectful-bravery` 프로젝트의 `production` Postgres에서 계정·물류사·로그인 세션·주유소·주입기·마이그레이션 이력을 남기고 마일리지 신청·사진 메타데이터·OCR·정산·SMS 인증·재설정 토큰을 비운다. 완료된 정산 기록도 삭제하므로 테스트 요청과 OCR 작업이 없는 때 실행한다. 사진 저장소의 실제 객체는 삭제하지 않는다.
+
+Railway 워크스페이스에 등록된 SSH 키를 `~/.ssh/hpluseco_railway`에 두고 서버 저장소에서 실행한다. 다른 경로라면 `HPLUSECO_RAILWAY_SSH_KEY`로 지정한다. 행 수를 보여주고 `app` 스키마 전체를 `~/hpluseco-db-backups`에 백업·검증한 다음 `RESET production` 입력을 받는다. 스키마에 새 테이블이 생기면 중단한다.
+
+```sh
+bash scripts/reset-railway-test-data.sh
+```
+
 See the official [PostgreSQL connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres) and [S3 configuration guide](https://supabase.com/docs/guides/storage/s3/authentication).
 
 ## Supabase DB → Railway DB 이전
