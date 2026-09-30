@@ -953,7 +953,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await snapshots()).toHaveLength(1);
     expect(await completed()).toBe(0);
   });
-  test('server aggregation uses approval dates for money, submission dates for counts, all companies and newest five', async () => {
+  test('server aggregation counts approval statuses by submission dates, uses approval dates for money, all companies and newest five', async () => {
     await addApplication(
       companyId,
       userId,
@@ -976,7 +976,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       999,
       undefined,
       'pending',
-      'ocr_failed',
+      'matched',
     );
     await addApplication(
       companyId,
@@ -997,8 +997,8 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(data).toMatchObject({
       accumulatedMileage: 3400,
       settlementMileage: 3500,
-      matchedCount: 2,
-      mismatchedCount: 1,
+      approvedCount: 4,
+      rejectedCount: 1,
     });
     expect(data.receipts).toHaveLength(5);
     expect(data.chart.reduce((sum, r) => sum + r.common, 0)).toBe(3400);
@@ -1013,7 +1013,43 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(after.accumulatedMileage).toBe(0);
     expect(after.settlementMileage).toBe(0);
     expect(after.chart).toEqual(data.chart);
-    expect(after.matchedCount).toBe(2);
+    expect(after.approvedCount).toBe(4);
+    expect(after.rejectedCount).toBe(1);
+  });
+  test('approved and rejected counts include KST submission boundaries and follow the current decision', async () => {
+    for (const status of ['approved', 'rejected']) {
+      for (const submitted of [
+        '2026-07-31T14:59:59.999Z',
+        '2026-07-31T15:00:00Z',
+        '2026-08-31T14:59:59.999Z',
+        '2026-08-31T15:00:00Z',
+      ]) {
+        await addApplication(
+          companyId,
+          userId,
+          0,
+          undefined,
+          status,
+          'pending',
+          submitted,
+        );
+      }
+    }
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/admin/dashboard?from=2026-08-01&through=2026-08-31')
+      .set('Authorization', authorization)
+      .expect(200);
+    expect(response.body).toMatchObject({ approvedCount: 3, rejectedCount: 2 });
+    await db()`UPDATE app.mileage_applications SET approval_status = 'rejected' WHERE id = ${applicationId}`;
+    expect(await service.dashboard('2026-08-01', '2026-08-31')).toMatchObject({
+      approvedCount: 2,
+      rejectedCount: 3,
+    });
+    await db()`UPDATE app.mileage_applications SET approval_status = 'pending' WHERE id = ${applicationId}`;
+    expect(await service.dashboard('2026-08-01', '2026-08-31')).toMatchObject({
+      approvedCount: 2,
+      rejectedCount: 2,
+    });
   });
   test('completed rows disappear from driver list and detail, pending/rejected stay visible', async () => {
     await addApplication(companyId, userId, 999, undefined, 'pending');
@@ -1323,8 +1359,8 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await service.dashboard('2025-01-01', '2025-01-31')).toMatchObject({
       accumulatedMileage: 0,
       settlementMileage: 0,
-      matchedCount: 0,
-      mismatchedCount: 0,
+      approvedCount: 0,
+      rejectedCount: 0,
       chart: [],
       receipts: [],
     });

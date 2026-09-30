@@ -163,7 +163,7 @@ export class SettlementsController {
   @ApiOperation({
     summary: '대시보드 전체 집합 집계',
     description:
-      'KST 일자 양끝 포함. 누적=기간 내 승인·미정산, 예정=종료일까지 승인·미정산, 차트=기간 내 승인일별 적립(정산 완료 포함), 일치/미일치=신청일·정확한 판독 상태, 최근=신청일 최신 5건. 소속은 신청에 고정된 물류사.',
+      'KST 일자 양끝 포함. 누적=기간 내 승인·미정산, 예정=종료일까지 승인·미정산, 차트=기간 내 승인일별 적립(정산 완료 포함), 승인/반려 건수=기간 내 신청일·현재 승인 상태(판독 상태와 무관, 대기 제외), 최근=신청일 최신 5건. 소속은 신청에 고정된 물류사.',
   })
   dashboard(@Query() query: DashboardQuery) {
     return this.service.dashboard(

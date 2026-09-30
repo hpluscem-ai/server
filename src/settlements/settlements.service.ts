@@ -393,14 +393,14 @@ export class SettlementsService {
             AND (s.id IS NULL OR s.transfer_status = 'pending')
             AND a.decided_at::timestamptz < ${before}::timestamptz
             THEN a.mileage_amount ELSE 0 END), 0)::text AS "settlementMileage",
-          COALESCE(SUM(CASE WHEN a.match_status = 'matched'
+          COALESCE(SUM(CASE WHEN a.approval_status = 'approved'
             AND a.submitted_at::timestamptz >= ${start}::timestamptz
             AND a.submitted_at::timestamptz < ${before}::timestamptz
-            THEN 1 ELSE 0 END), 0)::text AS "matchedCount",
-          COALESCE(SUM(CASE WHEN a.match_status = 'mismatched'
+            THEN 1 ELSE 0 END), 0)::text AS "approvedCount",
+          COALESCE(SUM(CASE WHEN a.approval_status = 'rejected'
             AND a.submitted_at::timestamptz >= ${start}::timestamptz
             AND a.submitted_at::timestamptz < ${before}::timestamptz
-            THEN 1 ELSE 0 END), 0)::text AS "mismatchedCount"
+            THEN 1 ELSE 0 END), 0)::text AS "rejectedCount"
         FROM app.mileage_applications a
         LEFT JOIN app.settlements s ON s.id = a.settlement_id`,
       this.db<
@@ -444,8 +444,8 @@ export class SettlementsService {
     return {
       accumulatedMileage: integer(totals.accumulatedMileage),
       settlementMileage: integer(totals.settlementMileage),
-      matchedCount: integer(totals.matchedCount ?? 0),
-      mismatchedCount: integer(totals.mismatchedCount ?? 0),
+      approvedCount: integer(totals.approvedCount ?? 0),
+      rejectedCount: integer(totals.rejectedCount ?? 0),
       chart: chart.map((row) => ({
         date: row.date,
         common: integer(row.common),

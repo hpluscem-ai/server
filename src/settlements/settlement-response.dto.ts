@@ -50,8 +50,8 @@ class AffiliationDto {
 export class DashboardResponseDto {
   @ApiProperty({ type: 'integer', minimum: 0 }) accumulatedMileage!: number;
   @ApiProperty({ type: 'integer', minimum: 0 }) settlementMileage!: number;
-  @ApiProperty({ type: 'integer', minimum: 0 }) matchedCount!: number;
-  @ApiProperty({ type: 'integer', minimum: 0 }) mismatchedCount!: number;
+  @ApiProperty({ type: 'integer', minimum: 0 }) approvedCount!: number;
+  @ApiProperty({ type: 'integer', minimum: 0 }) rejectedCount!: number;
   @ApiProperty({ type: [ChartPointDto] }) chart!: ChartPointDto[];
   @ApiProperty({ type: [RecentReceiptDto] }) receipts!: RecentReceiptDto[];
   @ApiProperty({ type: [AffiliationDto] }) affiliations!: AffiliationDto[];
