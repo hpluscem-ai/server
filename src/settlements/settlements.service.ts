@@ -2,10 +2,6 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import type { TransactionSql } from 'postgres';
 import { AdminAuthRepository } from '../admin-auth';
-import {
-  type DateRangeQueryDto,
-  normalizeDateRange,
-} from '../common/date-range-query';
 import { DatabaseService } from '../database/database.service';
 import { bankCodeOptions } from './bank-codes';
 import {
@@ -364,20 +360,14 @@ export class SettlementsService {
     });
   }
 
-  async balance(userId: string, query: DateRangeQueryDto = {}) {
-    const { createdFrom, createdBefore } = normalizeDateRange(query);
-    const from = createdFrom
-      ? this.db`AND a.submitted_at::timestamptz >= ${createdFrom}::timestamptz`
-      : this.db``;
-    const before = createdBefore
-      ? this.db`AND a.submitted_at::timestamptz < ${createdBefore}::timestamptz`
-      : this.db``;
+  async balance(userId: string) {
     const rows = await this.db<Amount[]>`
       SELECT COALESCE(SUM(a.mileage_amount), 0)::text AS amount
       FROM app.mileage_applications a
+      LEFT JOIN app.settlements s ON s.id = a.settlement_id
       WHERE a.user_id = ${userId}
         AND a.approval_status = 'approved'
-        ${from} ${before}`;
+        AND (s.id IS NULL OR s.transfer_status = 'pending')`;
     return { accumulatedMileage: integer(rows[0].amount) };
   }
 

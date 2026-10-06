@@ -11,7 +11,7 @@ import {
   uploadHeaders,
   downloadHeaders,
 } from '../src/settlements/settlement-excel';
-import { ADMIN_WEB_SESSION_COOKIE, WEB_SESSION_COOKIE } from '../src/auth';
+import { ADMIN_WEB_SESSION_COOKIE } from '../src/auth';
 import { createTestDatabase } from './helpers/create-test-database';
 
 const root = '/api/v1/admin/settlements';
@@ -184,18 +184,6 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       WHERE id = ${id}`;
     return id;
   }
-  async function driverToken(user = userId) {
-    const token = randomBytes(32).toString('base64url');
-    const now = Date.now();
-    await db()`
-      INSERT INTO app.auth_sessions(token_hash, user_id, created_at, last_used_at, expires_at)
-      VALUES (
-        ${createHash('sha256').update(token).digest('hex')}, ${user},
-        ${new Date(now).toISOString()}, ${new Date(now).toISOString()},
-        ${new Date(now + 600000).toISOString()}
-      )`;
-    return token;
-  }
   beforeEach(async () => {
     process.env.WEB_ORIGINS = 'http://localhost:5173';
     database = await createTestDatabase();
@@ -343,10 +331,9 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     ]);
 
     await upload(workbook((await snapshots()).map(row))).expect(200);
-    expect(await completed()).toBe(1);
-    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3000 });
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 0 });
     expect(await service.balance(secondUser)).toEqual({
-      accumulatedMileage: 1700,
+      accumulatedMileage: 0,
     });
   });
   test('multiple approved applications from each driver in one company remain one monthly transfer row', async () => {
@@ -382,10 +369,9 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     );
 
     await upload(workbook((await snapshots()).map(row))).expect(200);
-    expect(await completed()).toBe(1);
-    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3200 });
+    expect(await service.balance(userId)).toEqual({ accumulatedMileage: 0 });
     expect(await service.balance(secondUser)).toEqual({
-      accumulatedMileage: 1200,
+      accumulatedMileage: 0,
     });
   });
   test('late approved registrations stay visible in their KST month without changing a completed transfer', async () => {
@@ -1071,10 +1057,18 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       rejectedCount: 2,
     });
   });
-  test('completed rows remain in earned totals while list/detail omit them and pending/rejected stay visible', async () => {
+  test('completed rows disappear from driver list and detail, pending/rejected stay visible', async () => {
     await addApplication(companyId, userId, 999, undefined, 'pending');
     await addApplication(companyId, userId, 999, undefined, 'rejected');
-    const token = await driverToken();
+    const token = randomBytes(32).toString('base64url'),
+      now = Date.now();
+    await db()`
+      INSERT INTO app.auth_sessions(token_hash, user_id, created_at, last_used_at, expires_at)
+      VALUES (
+        ${createHash('sha256').update(token).digest('hex')}, ${userId},
+        ${new Date(now).toISOString()}, ${new Date(now).toISOString()},
+        ${new Date(now + 600000).toISOString()}
+      )`;
     const driver = request(app.getHttpServer());
     const before = await driver
       .get('/api/v1/mileage/applications?limit=1')
@@ -1100,7 +1094,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .get('/api/v1/mileage/summary')
       .set('Authorization', `Bearer ${token}`)
       .expect(200);
-    expect(balanceAfter.body).toEqual({ accumulatedMileage: 3000 });
+    expect(balanceAfter.body).toEqual({ accumulatedMileage: 0 });
     expect((after.body as { items: { status: string }[] }).items).toHaveLength(
       2,
     );
@@ -1199,103 +1193,6 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     await addApplication(companyId, await addUser(companyId), 700);
     expect(await service.balance(userId)).toEqual({ accumulatedMileage: 3250 });
   });
-  test('period totals use application dates, include completed earnings and sum beyond one page for only the current driver', async () => {
-    const range = {
-      createdFrom: '2026-08-01T00:00:00+09:00',
-      createdBefore: '2026-09-01T00:00:00+09:00',
-    };
-    const addAt = (amount: number, submitted: string, decided?: string) =>
-      addApplication(
-        companyId,
-        userId,
-        amount,
-        decided,
-        'approved',
-        'matched',
-        submitted,
-      );
-    await addAt(200, '2026-08-01T00:00:00+09:00');
-    await addAt(400, '2026-08-31T23:59:59.999+09:00', '2026-09-10T00:00:00Z');
-    for (let i = 0; i < 25; i++) await addApplication(companyId, userId, 10);
-    await addApplication(companyId, userId, 999, undefined, 'pending');
-    await addApplication(companyId, userId, 999, undefined, 'rejected');
-    await addAt(700, '2026-07-31T23:59:59.999+09:00');
-    await addAt(800, '2026-09-01T00:00:00+09:00');
-    const otherUser = await addUser(companyId);
-    await addApplication(companyId, otherUser, 900);
-    const token = await driverToken();
-    const summary = (query = range) =>
-      request(app.getHttpServer())
-        .get('/api/v1/mileage/summary')
-        .query(query)
-        .set('Authorization', `Bearer ${token}`);
-
-    await summary().expect(200).expect({ accumulatedMileage: 3850 });
-    await service.export(month, adminId);
-    await summary().expect(200).expect({ accumulatedMileage: 3850 });
-    const list = await request(app.getHttpServer())
-      .get('/api/v1/mileage/applications')
-      .query(range)
-      .set('Authorization', `Bearer ${token}`)
-      .expect(200);
-    expect((list.body as { items: unknown[] }).items).toHaveLength(20);
-    expect(
-      (list.body as { nextCursor: string | null }).nextCursor,
-    ).not.toBeNull();
-    await upload(workbook((await snapshots()).map(row))).expect(200);
-    expect(await completed()).toBe(1);
-    await summary().expect(200).expect({ accumulatedMileage: 3850 });
-    await request(app.getHttpServer())
-      .get('/api/v1/mileage/summary')
-      .query(range)
-      .set('Cookie', `${WEB_SESSION_COOKIE}=${token}`)
-      .expect(200)
-      .expect({ accumulatedMileage: 3850 });
-    await request(app.getHttpServer())
-      .get('/api/v1/mileage/summary')
-      .query(range)
-      .set('Authorization', `Bearer ${await driverToken(otherUser)}`)
-      .expect(200)
-      .expect({ accumulatedMileage: 900 });
-    await summary({ ...range, createdFrom: '2026-08-31T00:00:00+09:00' })
-      .expect(200)
-      .expect({ accumulatedMileage: 400 });
-    await summary({
-      createdFrom: '2026-06-01T00:00:00+09:00',
-      createdBefore: '2026-07-01T00:00:00+09:00',
-    })
-      .expect(200)
-      .expect({ accumulatedMileage: 0 });
-  });
-  test('summary rejects malformed and reversed ranges and requires a driver session', async () => {
-    const token = await driverToken();
-    for (const query of [
-      { createdFrom: '2026-08-01' },
-      { createdBefore: '2026-09-01T00:00:00' },
-      { createdFrom: '2026-02-30T00:00:00Z' },
-      {
-        createdFrom: '2026-09-01T00:00:00Z',
-        createdBefore: '2026-09-01T00:00:00Z',
-      },
-      {
-        createdFrom: '2026-09-02T00:00:00Z',
-        createdBefore: '2026-09-01T00:00:00Z',
-      },
-    ]) {
-      await request(app.getHttpServer())
-        .get('/api/v1/mileage/summary')
-        .query(query)
-        .set('Authorization', `Bearer ${token}`)
-        .expect(400);
-    }
-    await request(app.getHttpServer())
-      .get('/api/v1/mileage/summary')
-      .expect(401);
-    await request(app.getHttpServer())
-      .get('/api/v1/mileage/summary')
-      .set('Authorization', authorization)
-      .expect(401);
-  });
   test('no approved record is dropped at the leap-day and year KST boundaries', async () => {
     await addApplication(
       companyId,
@@ -1341,7 +1238,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect((await service.list('2024-12'))[0].mileage).toBe(30);
     expect((await service.list('2025-01'))[0].mileage).toBe(40);
   });
-  test('Swagger publishes settlement endpoints, dashboard and the application-date summary contract', async () => {
+  test('Swagger publishes all three settlement endpoints, dashboard and full balance contract', async () => {
     const res = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -1355,26 +1252,6 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       expect(
         (res.body as { paths: Record<string, unknown> }).paths[path],
       ).toBeDefined();
-    const summary = (
-      res.body as {
-        paths: Record<
-          string,
-          {
-            get: {
-              description: string;
-              parameters: { name: string; in: string }[];
-            };
-          }
-        >;
-      }
-    ).paths['/api/v1/mileage/summary'].get;
-    expect(summary.description).toContain('정산 완료 여부와 관계없이');
-    expect(summary.parameters).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ name: 'createdFrom', in: 'query' }),
-        expect.objectContaining({ name: 'createdBefore', in: 'query' }),
-      ]),
-    );
   });
 
   test('the current review rejection API refuses a captured approved application', async () => {
