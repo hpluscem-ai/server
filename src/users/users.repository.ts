@@ -18,6 +18,7 @@ import {
   adminSessions,
   authSessions,
   logisticsCompanies,
+  mileageApplications,
   passwordResetTokens,
   phoneVerifications,
   users,
@@ -38,6 +39,22 @@ export class UsersRepository {
   constructor(private readonly database: DatabaseService) {}
 
   async findDrivers(query: AdminDriverListQueryDto) {
+    const totals = this.database.db
+      .select({
+        userId: mileageApplications.userId,
+        totalAmount:
+          sql<string>`sum(${mileageApplications.finalAmount})::text`.as(
+            'total_amount',
+          ),
+        mileage:
+          sql<string>`sum(${mileageApplications.mileageAmount})::text`.as(
+            'total_mileage',
+          ),
+      })
+      .from(mileageApplications)
+      .where(eq(mileageApplications.approvalStatus, 'approved'))
+      .groupBy(mileageApplications.userId)
+      .as('driver_totals');
     return this.database.db
       .select({
         id: users.id,
@@ -47,12 +64,15 @@ export class UsersRepository {
         phone: users.phone,
         email: users.email,
         joinedAt: users.createdAt,
+        totalAmount: sql<string>`coalesce(${totals.totalAmount}, '0')`,
+        mileage: sql<string>`coalesce(${totals.mileage}, '0')`,
       })
       .from(users)
       .innerJoin(
         logisticsCompanies,
         eq(users.logisticsCompanyId, logisticsCompanies.id),
       )
+      .leftJoin(totals, eq(users.id, totals.userId))
       .where(
         and(
           eq(users.role, 'driver'),

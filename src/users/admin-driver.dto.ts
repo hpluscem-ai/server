@@ -41,4 +41,18 @@ export class AdminDriverResponseDto {
   email!: string;
   @ApiProperty({ description: '가입 시각(UTC)', format: 'date-time' })
   joinedAt!: string;
+  @ApiProperty({
+    description: '정산 여부와 관계없는 전체 기간 승인 확정 금액 누적(원)',
+    type: 'integer',
+    minimum: 0,
+    maximum: Number.MAX_SAFE_INTEGER,
+  })
+  totalAmount!: number;
+  @ApiProperty({
+    description: '정산 여부와 관계없는 전체 기간 승인 적립 마일리지 누적',
+    type: 'integer',
+    minimum: 0,
+    maximum: Number.MAX_SAFE_INTEGER,
+  })
+  mileage!: number;
 }

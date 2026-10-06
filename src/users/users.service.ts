@@ -30,8 +30,19 @@ export class UsersService {
     return rows.map((row) => {
       if (row.phone === null)
         throw new Error('Driver phone invariant violated');
+      const totalAmount = Number(row.totalAmount);
+      const mileage = Number(row.mileage);
+      if (
+        !Number.isSafeInteger(totalAmount) ||
+        totalAmount < 0 ||
+        !Number.isSafeInteger(mileage) ||
+        mileage < 0
+      )
+        throw new Error('Driver totals invariant violated');
       return {
         ...row,
+        totalAmount,
+        mileage,
         phone: row.phone,
         joinedAt: isoTimestamp(row.joinedAt),
       };
