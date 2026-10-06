@@ -395,9 +395,8 @@ export class SettlementsService {
       this.db<Record<string, string | number | null>[]>`
         SELECT
           COALESCE(SUM(CASE WHEN a.approval_status = 'approved'
-            AND (s.id IS NULL OR s.transfer_status = 'pending')
-            AND a.decided_at::timestamptz >= ${start}::timestamptz
-            AND a.decided_at::timestamptz < ${before}::timestamptz
+            AND a.submitted_at::timestamptz >= ${start}::timestamptz
+            AND a.submitted_at::timestamptz < ${before}::timestamptz
             THEN a.mileage_amount ELSE 0 END), 0)::text AS "accumulatedMileage",
           COALESCE(SUM(CASE WHEN a.approval_status = 'approved'
             AND (s.id IS NULL OR s.transfer_status = 'pending')

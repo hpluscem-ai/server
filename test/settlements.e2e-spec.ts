@@ -967,7 +967,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     expect(await snapshots()).toHaveLength(1);
     expect(await completed()).toBe(0);
   });
-  test('server aggregation counts approval statuses by submission dates, uses approval dates for money, all companies and newest five', async () => {
+  test('dashboard uses submission dates for earned mileage and preserves paid totals across all companies', async () => {
     await addApplication(
       companyId,
       userId,
@@ -1009,7 +1009,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
     );
     const data = await service.dashboard('2026-08-01', '2026-08-31', companyId);
     expect(data).toMatchObject({
-      accumulatedMileage: 3400,
+      accumulatedMileage: 3700,
       settlementMileage: 3500,
       approvedCount: 4,
       rejectedCount: 1,
@@ -1024,7 +1024,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       '2026-08-31',
       companyId,
     );
-    expect(after.accumulatedMileage).toBe(0);
+    expect(after.accumulatedMileage).toBe(3700);
     expect(after.settlementMileage).toBe(0);
     expect(after.chart).toEqual(data.chart);
     expect(after.approvedCount).toBe(4);
@@ -1041,7 +1041,7 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
         await addApplication(
           companyId,
           userId,
-          0,
+          10,
           undefined,
           status,
           'pending',
@@ -1053,14 +1053,20 @@ describe('Settlement upload, immutable snapshots and dashboard (real HTTP, isola
       .get('/api/v1/admin/dashboard?from=2026-08-01&through=2026-08-31')
       .set('Authorization', authorization)
       .expect(200);
-    expect(response.body).toMatchObject({ approvedCount: 3, rejectedCount: 2 });
+    expect(response.body).toMatchObject({
+      accumulatedMileage: 3020,
+      approvedCount: 3,
+      rejectedCount: 2,
+    });
     await db()`UPDATE app.mileage_applications SET approval_status = 'rejected' WHERE id = ${applicationId}`;
     expect(await service.dashboard('2026-08-01', '2026-08-31')).toMatchObject({
+      accumulatedMileage: 20,
       approvedCount: 2,
       rejectedCount: 3,
     });
     await db()`UPDATE app.mileage_applications SET approval_status = 'pending' WHERE id = ${applicationId}`;
     expect(await service.dashboard('2026-08-01', '2026-08-31')).toMatchObject({
+      accumulatedMileage: 20,
       approvedCount: 2,
       rejectedCount: 2,
     });
